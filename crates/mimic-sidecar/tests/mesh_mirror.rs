@@ -1965,7 +1965,7 @@ async fn rte_83_an_h2c_post_is_copied_with_its_body_and_trailers() {
 
 #[tokio::test]
 async fn rte_85_a_body_of_exactly_the_buffer_is_mirrored_byte_for_byte() {
-    let _logs = capture_logs();
+    let logs = capture_logs();
     let (primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 64 * 1024).await;
     let body = payload(64 * 1024);
     let mut client = H1Client::connect(f.addr).await;
@@ -1980,6 +1980,8 @@ async fn rte_85_a_body_of_exactly_the_buffer_is_mirrored_byte_for_byte() {
     assert_eq!(shadow.got()[0].body, body);
     assert_eq!(primary.got()[0].body, body);
     until("the buffer is given back", || buffer_bytes(&f) == 0.0).await;
+    let entry = &logs.access_exactly(1).await[0];
+    assert_eq!(entry["mirrored"], true, "{entry}");
 }
 
 #[tokio::test]
@@ -2010,7 +2012,7 @@ async fn rte_85_a_declared_body_over_the_buffer_is_skipped_at_the_head() {
 
 #[tokio::test]
 async fn rte_85_a_chunked_body_is_skipped_once_it_passes_the_buffer() {
-    let _logs = capture_logs();
+    let logs = capture_logs();
     let (primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 64 * 1024).await;
     let body = payload(80_000);
     let mut client = H1Client::connect(f.addr).await;
@@ -2029,6 +2031,8 @@ async fn rte_85_a_chunked_body_is_skipped_once_it_passes_the_buffer() {
     .await;
     assert_eq!(shadow.started(), 0);
     until("the buffer is given back", || buffer_bytes(&f) == 0.0).await;
+    let entry = &logs.access_exactly(1).await[0];
+    assert!(entry.get("mirrored").is_none(), "no copy was sent: {entry}");
 }
 
 #[tokio::test]
