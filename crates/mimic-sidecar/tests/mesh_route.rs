@@ -786,10 +786,15 @@ async fn rte_50_answers_of_the_sidecar_carry_no_modified_field_and_a_retry_adds_
         ],
     )]);
     parent.routes = &routes;
+    // Headless: after its one dead pod the sidecar answers at once. A ClusterIP fallback to
+    // 10.96.0.2 would wait out the 10 s cluster connect timeout where that address is not
+    // refused (CI runners), longer than the client's read.
+    let mut v2 = svc("shop/cart-v2", "10.96.0.2", 80, &[dead]);
+    v2.headless = true;
     let state = state_with(view(&[
         parent,
         svc("shop/cart-v1", "10.96.0.1", 80, &[dead, spy.addr]),
-        svc("shop/cart-v2", "10.96.0.2", 80, &[dead]),
+        v2,
     ]));
     let _ = &v1;
     let f = fixture_mesh(cluster_ip(), &state, None).await;
