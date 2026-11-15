@@ -3020,7 +3020,17 @@ no insignificant whitespace):
       its own with a uniform 64-bit value `r`: it is drawn when `⌊r × denominator / 2⁶⁴⌋ <
       numerator`, so 100/100 always, 0/100 never, and `n`/`d` for a share `n / d` of the
       requests. A mirror not drawn is not counted.
-    - **Slots**: a drawn mirror takes a slot of its mirror Service port at the request head; at
+    - **Start**: a drawn mirror is decided at the request head, but its copy **starts only once
+      the primary's response head arrived** (the final one: not the refusal of a try that is
+      retried), or the primary ended without one (failed, answered by the sidecar itself, cut by
+      a route timeout) or the client left. A copy never competes with the primary for the
+      workers, the network or the mirror's answer at the primary's critical moment: the
+      mirror's cost to the primary stays within RTE-94's budget. The price is that copies reach
+      the mirror later, by the primary's latency. A copy whose deadline ("Deadline" below)
+      passes before it could start is not sent and counted `result="error"`: a primary that
+      times out on the route's own timeout (the deadline's bound) never has its copy sent.
+    - **Slots**: a drawn mirror takes a slot of its mirror Service port at the request head and
+      keeps it while its copy waits for the primary; at
       most **256** copies are in flight per mirror Service port and **1024** for the sidecar
       in total (the `mirror_max_in_flight` and `mirror_max_in_flight_total` fields of the
       sidecar's `MeshConfig`, no `MIMIC_*` variable; M4 decides whether `circuitBreaker.
@@ -3039,7 +3049,8 @@ no insignificant whitespace):
       the copy's deadline (below), is skipped `skipped_body` and its bytes and slot are given
       back. Once the primary's response head came back the bytes stay held only for the copies
       still waiting for the body's end (no retry is possible any more). The copy is started
-      when the **end of the body was read from the app** (by the primary's try, at the pace the
+      when the **end of the body was read from the app** and the primary's head arrived ("Start"
+      above; by the primary's try, at the pace the
       primary pod reads it; trailers included): the primary is never slowed down, held back or
       made to wait for a mirror, and a copy never carries a body that looks complete but is
       not. With `MIMIC_MESH_RETRY_BUFFER` 0 only requests without a body are mirrored.
@@ -3062,8 +3073,8 @@ no insignificant whitespace):
     - **Deadline**: each copy ends, wherever it is (waiting for the body, connecting, sending,
       reading the response), at the earliest of **10 s** (the `mirror_timeout` field of
       `MeshConfig`) and the rule's non-zero `requestMs` and `backendRequestMs`, all counted
-      from the request head; an expiry is `result="error"` (or `skipped_body` while it still
-      waited for the body), the HTTP/1 pod connection closed, the HTTP/2 stream reset `CANCEL`.
+      from the request head; an expiry is `result="error"` (also while it still waits for the
+      primary's head), or `skipped_body` while it still waited for the body, the HTTP/1 pod connection closed, the HTTP/2 stream reset `CANCEL`.
       One timer per copy, in the copy's own task: with mirrors a request arms at most 2 timers
       (#449) plus one per copy in flight.
     - **Independence**: the copy runs in its own task and is never awaited; the primary's
@@ -3079,7 +3090,7 @@ no insignificant whitespace):
       `mimic_mesh_endpoint_in_flight` (the shared `in_flight`) and `mimic_mesh_retry_buffer_bytes`;
       it writes no access line and no log line, and discovery records the app's request once,
       never a copy (`mimic_discovery_exchanges_total` does not count copies). The primary's
-      access line has `mirrored: true` when, at the time the line is written, at least one copy was sent or failed (`sent` or `error` result): a copy of a request without a body counts from the decision, a copy with a body from the moment the body ended whole and held; a copy skipped (`skipped_body`, `skipped_limit`) or still waiting for the end of its body does not.
+      access line has `mirrored: true` when, at the time the line is written, at least one copy was sent or failed (`sent` or `error` result) after its start: a copy counts from the moment it starts (the primary's response head, or its end without one, with the body ended whole and held for a request with a body), not from the decision; a copy skipped (`skipped_body`, `skipped_limit`), not started yet (the primary's head is not there), past its deadline before it started or still waiting for the end of its body does not. The line of a response is written after its head, so a copy that started at the head is counted; the line of a request the sidecar answers itself or cuts may be written before its copy starts and then has no `mirrored`.
   - **Discovery** records the request as the app sent it (before the request modifier) and the
     response as the app received it (after the response modifier), under the app's authority:
     a value a route sets on a request is never recorded.
@@ -4757,12 +4768,15 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   `MIMIC_MESH_RETRY_BUFFER`, when the shared `MIMIC_MESH_RETRY_BUFFER_TOTAL` is in use (so
   mirrors and retries compete for it: heavy mirroring can make bodies streamed, hence not
   retried after a write), when the body has not ended within the copy's deadline (a long HTTP/2
-  or gRPC stream is never mirrored), or when the slots are full; copies in flight at the end of
+  or gRPC stream is never mirrored), or when the slots are full, or when the primary's response head comes after the copy's deadline (counted `error`); copies in flight at the end of
   the `SIGTERM` grace are dropped. `mimic_mesh_mirrored_total` counts every case; a mirror is
   not a delivery guarantee.
-- (M3, #450) **A mirror pod sees the copy late and alone.** A copy with a body starts once the
-  whole body was read from the app, so the mirror pod receives it after the primary pod began
-  (for a large upload, after it ended), and sees the primary's `Host`/`:authority`; over
+- (M3, #450) **A mirror pod sees the copy late and alone.** A copy starts once the primary's
+  response head arrived (by the primary's latency, so that the mirror never delays the
+  primary, RTE-94), and a copy with a body once the whole body was read from the app too, so
+  the mirror pod receives it after the primary pod answered; a copy whose 10 s deadline (or the
+  route's timeouts) passes while the primary waits, such as that of a primary cut by its own
+  route timeout, is not sent and counted `error`. The mirror pod sees the primary's `Host`/`:authority`; over
   intercepted TLS its pods must present a certificate valid for that name, else every copy is
   `error`.
 - (M3, #450) **Copies count in the shared `in_flight`.** A mirror pod that is also a backend
@@ -5827,7 +5841,7 @@ Design: `docs/design/mimic-mesh.md` §5, §10, §12, §14 (M3 row), §15. Spec t
 recorded on #450, as §12.19 "Mesh setups") and **D** (review). RTE-80 to RTE-99 are #450 (RTE-97
 to RTE-99 reserved). Decisions recorded on #450: until M4 the in-flight bound is a fixed 256
 copies per mirror Service port and 1024 per sidecar (no `MIMIC_*` variable); a copy with a body
-starts once the body's end was read from the app, never fed while it streams; the copy follows
+starts once the body's end was read from the app, never fed while it streams, and no copy starts before the primary's response head arrived (or its failure, or the client leaving; decision of 2026-11-15 after the RTE-94 bench); the copy follows
 the filter order for the request modifier (`beforeModifier`), keeps the app's `Host`/`:authority`
 and gets no marker field; one try, own pools, shared endpoint state, a deadline of 10 s or the
 rule's timeouts if shorter; only requests sent to a backend are mirrored. Out of scope:
@@ -5845,7 +5859,7 @@ on the median of 50 requests with a tolerance of 50 ms.
 | RTE-81 | **U** (`mesh::mirror`, decisions). For a rule's mirrors, their draws, the free slots per mirror Service port and in total, and the body state at the head (none, a declared length, unknown) with the request's share: a mirror not drawn gives nothing and takes no slot; a drawn one without a free slot of its port or of the total gives `SkipLimit`; with a slot, a declared length over the share gives `SkipBody` and gives the slot back; otherwise `Send` (no body) or `AwaitBody`; two drawn mirrors of the same port take two slots; slots taken never exceed 256 per port and 1024 in total. The deadline from the head is the minimum of `mirror_timeout` and the non-zero `requestMs` and `backendRequestMs` (`0` ignored; values up to 1 439 985 600 000 ms without overflow): 10 s with no timeouts, 300 ms with `requestMs` 300, 200 ms with `backendRequestMs` 200 and `requestMs` 0. |
 | RTE-82 | **U** (compile and `View::from_json`). A rule whose `filters` are `RequestMirror`, `RequestHeaderModifier`, `RequestMirror` compiles to two mirrors, the first with `"beforeModifier":true`, the second without; a rule with a mirror and no request modifier, or the mirror after it, has no `beforeModifier`; every RTE-01 view is byte for byte unchanged. `View::from_json` reads `beforeModifier` `true` and `false` (absent and `false` are the same) and refuses a non-boolean value; RTE-12 still holds. |
 | RTE-83 | **I** (the copy on the wire, HTTP/1 keep-alive and `h2c`). A rule to `shop/cart-v1:80` with a mirror 100/100 to `shop/cart-shadow:80` and a request modifier (`set x-env: prod`, `remove x-debug`): for a `GET` and a `POST` with a 1 KiB body (HTTP/1 with `content-length` and chunked; HTTP/2 with trailers), the mirror pod receives exactly one request with the same method, target, `Host`/`:authority`, the modified fields (HTTP/1: case and order of the others as sent), no added field, the same body bytes and the same trailers; with the mirror before the modifier in `filters` it receives the fields as the app sent them while the backend still receives the modified ones. The app gets the backend's response, never the mirror's (a mirror answering `500`, or `503` `overloaded` with its own `x-mimic-endpoint`, changes nothing and is not retried). `mimic_mesh_mirrored_total{backend="shop/cart-shadow:80",result="sent"}` counts one per request; the access line has `mirrored` `true` and the `route`, `backend` and `upstream` of the primary. |
-| RTE-84 | **I** (mirrors never slow the primary). With the mirror silent, slow (2 s), resetting after the head, refusing connections, and with no endpoint: the primary's status, fields, body, `attempts` and `upstream` equal those of the same requests without a mirror, and its median latency is within 50 ms of theirs; with `mirror_timeout` 300 ms the silent and slow mirrors' copies are counted `error` 300 to 400 ms after the request head, the refusing and endpoint-less ones `error` at once, the resetting one `error`, and a mirror answering after 50 ms `sent`; a primary that times out (`request: 100ms`, #449) is answered `504` while its copy to a slow mirror of 50 ms is still `sent`. |
+| RTE-84 | **I** (mirrors never slow the primary). With the mirror silent, slow (2 s), resetting after the head, refusing connections, and with no endpoint: the primary's status, fields, body, `attempts` and `upstream` equal those of the same requests without a mirror, and its median latency is within 50 ms of theirs; with `mirror_timeout` 300 ms the silent and slow mirrors' copies are counted `error` 300 to 400 ms after the request head, the refusing and endpoint-less ones `error` at once, the resetting one `error`, and a mirror answering after 50 ms `sent`; a copy does not reach the mirror pod before the primary's response head (a primary answering after 300 ms: the mirror pod sees nothing for 300 ms, then the copy), one whose primary fails (connect refused, no endpoint) or whose client leaves before the head still has its copy sent, and a primary that times out (`request: 100ms`, #449) is answered `504` while its copy, whose deadline passed with it, is counted `error` and never reaches the mirror pod. |
 | RTE-85 | **I** (bodies). With `MIMIC_MESH_RETRY_BUFFER` 64 KiB: a body of exactly 64 KiB is mirrored byte for byte; one of 64 KiB + 1 declared by `content-length` is `skipped_body` at the head (`mimic_mesh_retry_buffer_bytes` never above 0 for it); the same chunked is `skipped_body` once it passes 64 KiB and the primary still receives every byte; with the total held by other requests a new body is `skipped_body`; a client that leaves in the middle of a chunked upload (HTTP/1) or resets its stream (`h2c`) sends nothing to the mirror (`skipped_body`); a body that has not ended at the copy's deadline is `skipped_body`; with `MIMIC_MESH_RETRY_BUFFER` 0 a `GET` is `sent` and any `POST` with a body `skipped_body`. Three mirrors and a retried primary of one 32 KiB body raise `mimic_mesh_retry_buffer_bytes` by the cost of one copy of the body, not four, and it is back to 0 within 1 s after the last copy and try ended. |
 | RTE-86 | **I** (slots). With a silent mirror and `mirror_max_in_flight` 4: of 10 concurrent requests 4 copies are in flight and 6 counted `skipped_limit`, all 10 primaries answered `200`; once those copies end at their deadline the next request is mirrored again (`sent` or `error`, a slot was free). With `mirror_max_in_flight_total` 6 and two silent mirror Services, at most 6 copies are in flight together. A `skipped_limit` copy holds no body byte. |
 | RTE-87 | **I** (share and scope). A mirror of `percent: 10`: of 10 000 requests 1000 ± 200 are mirrored, the counts of `sent` and the mirror pod agree; `percent: 0` mirrors nothing and creates no series; two mirrors of one rule each receive their copies. The `no-route`, `no-backend` and `invalid-backend` answers, a stale view, mode `mock`, `"mesh": false`, an HTTP/1 `Upgrade` and an L4 connection to the routed Service mirror nothing and count nothing in `mimic_mesh_mirrored_total`. A view removing the mirror applies from the next request; a copy in flight under the old view finishes and is counted. |

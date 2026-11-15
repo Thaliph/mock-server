@@ -779,12 +779,9 @@ async fn rte_84_a_mirror_answering_after_50_ms_is_sent() {
 }
 
 #[tokio::test]
-async fn rte_84_a_primary_that_times_out_has_its_copy_sent() {
+async fn rte_84_a_primary_that_times_out_has_its_copy_counted_error() {
     let _logs = capture_logs();
-    let (primary, shadow) = (
-        Pod::http1("own", 5000).await,
-        Pod::http1("shadow", 150).await,
-    );
+    let (primary, shadow) = (Pod::http1("own", 5000).await, Pod::http1("shadow", 0).await);
     let state = state_with(
         routed(
             primary.addr,
@@ -802,11 +799,117 @@ async fn rte_84_a_primary_that_times_out_has_its_copy_sent() {
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let (head, _) = H1Client::connect(f.addr).await.get("/x").await;
     assert!(head.starts_with("HTTP/1.1 504"), "{head}");
+    until("error", || {
+        mirrored(&f, "shop/cart-shadow:80", "error") == 1.0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        shadow.counts.requests(),
+        0,
+        "the deadline passed with the primary"
+    );
+    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "sent"), 0.0);
+}
+
+#[tokio::test]
+async fn rte_84_a_copy_is_not_sent_before_the_primarys_response_head() {
+    let _logs = capture_logs();
+    let (primary, shadow) = (Pod::http1("own", 300).await, Pod::http1("shadow", 0).await);
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                None,
+                None,
+            ),
+        ),
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let addr = f.addr;
+    let call = tokio::spawn(async move { H1Client::connect(addr).await.get("/x").await });
+    until("the primary has the request", || {
+        primary.counts.requests() == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        shadow.counts.requests(),
+        0,
+        "no copy before the primary's head"
+    );
+    let (head, _) = call.await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the copy", || shadow.counts.requests() == 1).await;
     until("sent", || {
         mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
     })
     .await;
-    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "error"), 0.0);
+}
+
+#[tokio::test]
+async fn rte_84_a_primary_that_fails_has_its_copy_sent() {
+    let _logs = capture_logs();
+    let shadow = Pod::http1("shadow", 0).await;
+    let dead = closed_port().await;
+    let state = state_with(
+        routed(
+            dead,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                None,
+                None,
+            ),
+        ),
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let (head, _) = H1Client::connect(f.addr).await.get("/x").await;
+    assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the copy", || shadow.counts.requests() == 1).await;
+    until("sent", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rte_84_a_client_that_leaves_before_the_head_starts_the_copy() {
+    let _logs = capture_logs();
+    let (primary, shadow) = (Pod::http1("own", 1500).await, Pod::http1("shadow", 0).await);
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                None,
+                None,
+            ),
+        ),
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(GET.as_bytes()).await;
+    until("the primary has the request", || {
+        primary.counts.requests() == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(shadow.counts.requests(), 0, "the client is still there");
+    drop(client);
+    until("the copy", || shadow.counts.requests() == 1).await;
 }
 
 // RTE-86: slots.
