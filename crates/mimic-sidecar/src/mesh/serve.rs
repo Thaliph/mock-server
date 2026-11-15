@@ -25,7 +25,10 @@ use mimic_core::mesh::head::{Stop, leaves};
 use mimic_core::mesh::retry::{
     Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
 };
-use mimic_core::mesh::route::{FieldList, Pick, RequestParts, RouteView, draw, split_target};
+use mimic_core::mesh::route::{
+    FieldList, Pick, RequestParts, RouteView, TimeoutsView, draw, split_target,
+};
+use mimic_core::mesh::timeout::{self, Deadline, Kind};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -337,6 +340,47 @@ enum Tried {
         pick: Option<InFlight>,
         written: bool,
     },
+    /// A route timeout expired before the response head (spec §7.9 "Timeouts").
+    Timeout {
+        kind: Kind,
+        pick: Option<InFlight>,
+        written: bool,
+    },
+}
+
+/// The timeouts of the rule a request matched, and when the request began.
+#[derive(Clone, Copy)]
+struct Bounds<'a> {
+    timeouts: Option<&'a TimeoutsView>,
+    began: Instant,
+}
+
+impl Bounds<'_> {
+    /// The milliseconds since the request began.
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Runs `fut` until `deadline`: the timeout that expired when it does. A deadline too far
+    /// to be an `Instant` is none.
+    async fn within<T>(
+        &self,
+        fut: impl Future<Output = T>,
+        deadline: Option<Deadline>,
+    ) -> Result<T, Kind> {
+        let at = deadline.and_then(|d| {
+            Some((
+                self.began.checked_add(Duration::from_millis(d.at_ms))?,
+                d.kind,
+            ))
+        });
+        match at {
+            None => Ok(fut.await),
+            Some((at, kind)) => tokio::time::timeout_at(at.into(), fut)
+                .await
+                .map_err(|_| kind),
+        }
+    }
 }
 
 impl Tried {
@@ -367,9 +411,9 @@ impl Serving {
         protocol: Protocol,
         pick: Option<InFlight>,
         (backend, original): (&Backend, SocketAddr),
-        source: &Source,
-        head: &Parts,
+        (source, head): (&Source, &Parts),
         warned: &AtomicBool,
+        bounds: Bounds<'_>,
     ) -> Tried {
         let router = self.mesh.router();
         let upstream = pick.as_ref().map_or(original, |p| p.endpoint().addr);
@@ -378,10 +422,24 @@ impl Serving {
         } else {
             CLUSTER_CONNECT_TIMEOUT
         };
-        let connected = router
-            .pools
-            .checkout(upstream, protocol, self.origin.as_ref(), None, timeout)
+        let connected = bounds
+            .within(
+                router
+                    .pools
+                    .checkout(upstream, protocol, self.origin.as_ref(), None, timeout),
+                timeout::call_deadline(bounds.timeouts),
+            )
             .await;
+        let connected = match connected {
+            Ok(connected) => connected,
+            Err(kind) => {
+                return Tried::Timeout {
+                    kind,
+                    pick,
+                    written: false,
+                };
+            }
+        };
         let mut lease = match connected {
             Ok(lease) => {
                 if let Some(pick) = &pick {
@@ -397,7 +455,15 @@ impl Serving {
                 return Tried::unwritten(pick);
             }
         };
-        let mut sent = lease.send(source.request(head)).await;
+        // The try starts when its request is handed to the connection (spec §7.9 "Timeouts").
+        let deadline = timeout::try_deadline(bounds.timeouts, bounds.elapsed_ms());
+        let sent = bounds
+            .within(lease.send(source.request(head)), deadline)
+            .await;
+        let mut sent = match sent {
+            Ok(sent) => sent,
+            Err(kind) => return Self::timed_out(lease, pick, kind, true),
+        };
         if let Sent::Unsent = sent {
             if !source.intact() {
                 return Tried::Failed {
@@ -408,16 +474,22 @@ impl Serving {
                 };
             }
             router.metrics.reconnect(&backend.label);
-            let again = router
-                .pools
-                .checkout(
-                    upstream,
-                    protocol,
-                    self.origin.as_ref(),
-                    Some(&lease),
-                    timeout,
+            let again = bounds
+                .within(
+                    router.pools.checkout(
+                        upstream,
+                        protocol,
+                        self.origin.as_ref(),
+                        Some(&lease),
+                        timeout,
+                    ),
+                    deadline,
                 )
                 .await;
+            let again = match again {
+                Ok(again) => again,
+                Err(kind) => return Self::timed_out(lease, pick, kind, false),
+            };
             match again {
                 Ok(new) => lease = new,
                 Err(e) => {
@@ -428,7 +500,13 @@ impl Serving {
                     return Tried::unwritten(pick);
                 }
             }
-            sent = lease.send(source.request(head)).await;
+            let resent = bounds
+                .within(lease.send(source.request(head)), deadline)
+                .await;
+            sent = match resent {
+                Ok(resent) => resent,
+                Err(kind) => return Self::timed_out(lease, pick, kind, true),
+            };
         }
         match sent {
             Sent::Response(response) => Tried::Answer {
@@ -445,6 +523,17 @@ impl Serving {
                 tracing::debug!(%upstream, "the request could not be written twice");
                 Tried::unwritten(pick)
             }
+        }
+    }
+
+    /// A try cut by its deadline: its connection is never reused (an HTTP/1 one is closed, an
+    /// HTTP/2 stream is reset by dropping it and the connection stays pooled).
+    fn timed_out(mut lease: Lease, pick: Option<InFlight>, kind: Kind, written: bool) -> Tried {
+        lease.discard();
+        Tried::Timeout {
+            kind,
+            pick,
+            written,
         }
     }
 
@@ -594,6 +683,7 @@ impl Serving {
         // else the destination the app dialled.
         let mut original = Some(self.ctx.dst);
         let mut response_modifier = None;
+        let mut timeouts = None;
         if let Some(routed) = &routed {
             match self.select(routed, &head) {
                 Selected::Rule {
@@ -608,6 +698,7 @@ impl Serving {
                         modifier.apply(&mut Fields(&mut head.headers));
                     }
                     response_modifier = filters.and_then(|f| f.response_headers.as_ref());
+                    timeouts = view.rules[rule].timeouts.as_ref();
                     if !Arc::ptr_eq(&backend, &self.backend) {
                         original = backend.original();
                     }
@@ -668,8 +759,16 @@ impl Serving {
             let dst = original.unwrap_or(self.ctx.dst);
             let upstream = pick.as_ref().map_or(dst, |p| p.endpoint().addr);
             tracker.route(backend, upstream, tries);
+            let bounds = Bounds { timeouts, began };
             match self
-                .try_once(protocol, pick, (&drawn, dst), &source, &head, &warned)
+                .try_once(
+                    protocol,
+                    pick,
+                    (&drawn, dst),
+                    (&source, &head),
+                    &warned,
+                    bounds,
+                )
                 .await
             {
                 Tried::Answer {
@@ -735,6 +834,34 @@ impl Serving {
                         }),
                         done: None,
                     }));
+                }
+                Tried::Timeout {
+                    kind,
+                    pick,
+                    written,
+                } => {
+                    // Never retried, and nothing asked of the budget (spec §7.9 "Timeouts"); the
+                    // pod is not avoided.
+                    router.metrics.attempt(backend, Outcome::Timeout);
+                    if let (true, Some(pick)) = (written, &pick) {
+                        let label = &pick.endpoint().label;
+                        router.metrics.endpoint_try(backend, label, "none");
+                    }
+                    drop(pick);
+                    // The request body is read to its end, or the app's connection ends with
+                    // the answer.
+                    let close = http1 && !source.complete();
+                    source.cancel();
+                    tracing::debug!(%upstream, timeout = kind.label(), "the try timed out");
+                    self.count(
+                        route,
+                        backend,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timeout",
+                        began,
+                    );
+                    tracker.timed_out(kind);
+                    return Ok(answer(StatusCode::GATEWAY_TIMEOUT, "timeout", close));
                 }
                 Tried::Failed {
                     failure,

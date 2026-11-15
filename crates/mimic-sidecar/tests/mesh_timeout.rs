@@ -26,7 +26,6 @@ use tokio::net::TcpListener;
 struct SilentPod {
     addr: SocketAddr,
     received: Arc<std::sync::Mutex<Vec<u8>>>,
-    accepted: Arc<AtomicUsize>,
     open: Arc<AtomicUsize>,
 }
 
@@ -35,14 +34,13 @@ impl SilentPod {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (accepted, open) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let (log, a, o) = (received.clone(), accepted.clone(), open.clone());
+        let open = Arc::new(AtomicUsize::new(0));
+        let (log, o) = (received.clone(), open.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                a.fetch_add(1, Ordering::SeqCst);
                 o.fetch_add(1, Ordering::SeqCst);
                 let (log, o) = (log.clone(), o.clone());
                 tokio::spawn(async move {
@@ -60,7 +58,6 @@ impl SilentPod {
         SilentPod {
             addr,
             received,
-            accepted,
             open,
         }
     }
@@ -352,10 +349,7 @@ impl EchoPod {
                     let mut tainted = false;
                     let mut pending = Vec::new();
                     let mut buf = [0u8; 4096];
-                    loop {
-                        let Ok(n) = stream.read(&mut buf).await else {
-                            break;
-                        };
+                    'connection: while let Ok(n) = stream.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
@@ -374,7 +368,17 @@ impl EchoPod {
                             if head.starts_with("get /slow") {
                                 tainted = true;
                                 tainted_open.fetch_add(1, Ordering::SeqCst);
-                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                // The pod notices the connection closing while it waits.
+                                let mut one = [0u8; 1];
+                                let closed = async {
+                                    while matches!(stream.peek(&mut one).await, Ok(n) if n > 0) {
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
+                                };
+                                tokio::select! {
+                                    () = tokio::time::sleep(Duration::from_millis(200)) => {}
+                                    () = closed => break 'connection,
+                                }
                             }
                             let answer = format!(
                                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{id}",
@@ -601,7 +605,7 @@ async fn rte_68_a_stale_view_mesh_false_and_request_fields_do_not_cut_a_slow_ans
     let state = MeshState::new(&MeshConfig {
         enabled: true,
         seed: Some(1),
-        stale_after: Duration::from_millis(200),
+        stale_after: Duration::from_millis(1000),
         ..MeshConfig::default()
     });
     state.hold(routed, "\"1-a\"");
@@ -629,7 +633,7 @@ async fn rte_68_a_stale_view_mesh_false_and_request_fields_do_not_cut_a_slow_ans
         "{took:?}"
     );
     // A stale view routes nothing: the original destination answers after 300 ms.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
     state.tick();
     let began = Instant::now();
     let (head, body) = client.get("/limited").await;

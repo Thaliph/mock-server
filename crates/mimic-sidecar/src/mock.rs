@@ -556,6 +556,7 @@ impl Flight {
             attempts: None,
             route: None,
             rule: None,
+            timeout: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.owed.store(true, Ordering::Release);
@@ -599,6 +600,7 @@ impl Drop for Flight {
             attempts: None,
             route: None,
             rule: None,
+            timeout: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.release();
@@ -891,6 +893,7 @@ impl Mock {
             attempts: None,
             route: None,
             rule: None,
+            timeout: None,
         });
     }
 }
