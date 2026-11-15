@@ -14,6 +14,7 @@ use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::HeaderMap;
 use hyper::http::request::Parts;
 use prometheus_client::metrics::gauge::Gauge;
+use tokio::sync::oneshot;
 
 use crate::exchange::ReqBody;
 
@@ -211,6 +212,30 @@ impl Drop for Replay {
     }
 }
 
+/// The whole body of a request, for a copy to a mirror: shared segments (the memory stays
+/// charged while any copy holds them) and the trailers.
+#[derive(Clone)]
+pub(crate) struct Held {
+    segments: Vec<Segment>,
+    trailers: Option<HeaderMap>,
+    hint: SizeHint,
+}
+
+impl Held {
+    /// The body of one try of a copy.
+    pub(crate) fn attempt(&self) -> Attempt {
+        Attempt {
+            shared: None,
+            generation: 0,
+            queue: self.segments.iter().cloned().collect(),
+            hint: self.hint,
+            trailed: true,
+            own_trailers: self.trailers.clone(),
+            _keep: self.segments.clone(),
+        }
+    }
+}
+
 struct Shared {
     body: ReqBody,
     replay: Replay,
@@ -229,6 +254,37 @@ struct Shared {
     delivered: bool,
     /// Wakes the try that last waited for the app's body.
     waker: Option<Waker>,
+    /// The copies that wait for the end of the body: they get it whole, or `None`.
+    copies: Vec<oneshot::Sender<Option<Held>>>,
+    hint: SizeHint,
+}
+
+impl Shared {
+    /// The body ended (`whole` and still held) or cannot be copied any more: the waiting copies
+    /// get it or are skipped. Once an answer was delivered the bytes are released, those the
+    /// copies hold stay charged until they are done.
+    fn settle(&mut self, whole: bool) {
+        if self.copies.is_empty() {
+            return;
+        }
+        let held = (whole && !self.failed && self.replay.is_held()).then(|| Held {
+            segments: self.replay.snapshot().into_iter().collect(),
+            trailers: self.trailers.clone(),
+            hint: self.hint,
+        });
+        for copy in self.copies.drain(..) {
+            let _ = copy.send(held.clone());
+        }
+        if self.delivered {
+            self.replay.release();
+        }
+    }
+
+    /// The end of the app's body was read.
+    fn end(&mut self) {
+        self.ended = true;
+        self.settle(true);
+    }
 }
 
 /// The body of a request over its tries: what the app sends is read once, held for replay while
@@ -257,6 +313,8 @@ impl Source {
                 failed: false,
                 delivered: false,
                 waker: None,
+                copies: Vec::new(),
+                hint,
             })),
             hint,
         }
@@ -301,17 +359,42 @@ impl Source {
     pub(crate) fn cancel(&self) {
         let mut shared = lock(&self.shared);
         shared.closed = true;
+        shared.settle(false);
         shared.replay.release();
         if let Some(waker) = shared.waker.take() {
             waker.wake();
         }
     }
 
-    /// A response head came back: the bytes held are released.
+    /// A response head came back: the bytes held are released, unless a copy still waits for
+    /// the end of the body (spec §7.9 "Mirrors"): they are then held until it came or the copy
+    /// gave up.
     pub(crate) fn release(&self) {
         let mut shared = lock(&self.shared);
         shared.delivered = true;
-        shared.replay.release();
+        if shared.copies.is_empty() {
+            shared.replay.release();
+        }
+    }
+
+    /// A copy that starts once the end of the body was read: `Some` with the whole body, or
+    /// `None` when it does not fit the replay buffer or never came.
+    pub(crate) fn defer(&self) -> oneshot::Receiver<Option<Held>> {
+        let (tx, rx) = oneshot::channel();
+        let mut shared = lock(&self.shared);
+        if shared.failed || shared.closed || !shared.replay.is_held() {
+            let _ = tx.send(None);
+        } else if shared.ended {
+            let held = Held {
+                segments: shared.replay.snapshot().into_iter().collect(),
+                trailers: shared.trailers.clone(),
+                hint: shared.hint,
+            };
+            let _ = tx.send(Some(held));
+        } else {
+            shared.copies.push(tx);
+        }
+        rx
     }
 
     /// The request for one try: `head` and a body that starts with the bytes held.
@@ -328,6 +411,8 @@ impl Source {
             queue,
             hint: self.hint,
             trailed: false,
+            own_trailers: None,
+            _keep: Vec::new(),
         });
         *request.method_mut() = head.method.clone();
         *request.uri_mut() = head.uri.clone();
@@ -343,10 +428,11 @@ impl Drop for Source {
     /// the tries still pending fail their bodies.
     fn drop(&mut self) {
         let mut shared = lock(&self.shared);
+        shared.settle(false);
         if !shared.delivered {
             shared.closed = true;
-            shared.replay.release();
         }
+        shared.replay.release();
     }
 }
 
@@ -360,6 +446,10 @@ pub(crate) struct Attempt {
     hint: SizeHint,
     /// The trailers were handed over.
     trailed: bool,
+    /// The trailers of a copy's body, still to send.
+    own_trailers: Option<HeaderMap>,
+    /// What a copy sends stays charged until it is done.
+    _keep: Vec<Segment>,
 }
 
 impl Attempt {
@@ -371,6 +461,8 @@ impl Attempt {
             queue: VecDeque::new(),
             hint: SizeHint::with_exact(0),
             trailed: true,
+            own_trailers: None,
+            _keep: Vec::new(),
         }
     }
 
@@ -390,7 +482,11 @@ impl Body for Attempt {
     ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let this = self.get_mut();
         let Some(shared) = &this.shared else {
-            return Poll::Ready(None);
+            // A copy's body: what was held, then the trailers.
+            if let Some(segment) = this.queue.pop_front() {
+                return Poll::Ready(Some(Ok(Frame::data(segment.data.clone()))));
+            }
+            return Poll::Ready(this.own_trailers.take().map(|t| Ok(Frame::trailers(t))));
         };
         let mut shared = lock(shared);
         if this.stale(&shared) {
@@ -423,27 +519,31 @@ impl Body for Attempt {
                 shared.read = true;
                 match frame.into_data() {
                     Ok(data) => {
-                        shared.replay.push(&data);
+                        if !shared.replay.push(&data) {
+                            shared.settle(false);
+                        }
                         Poll::Ready(Some(Ok(Frame::data(data))))
                     }
                     Err(frame) => {
-                        shared.ended = true;
                         this.trailed = true;
                         if let Ok(trailers) = frame.into_trailers() {
                             shared.trailers = Some(trailers.clone());
+                            shared.end();
                             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
                         }
+                        shared.end();
                         Poll::Ready(None)
                     }
                 }
             }
             Poll::Ready(None) => {
-                shared.ended = true;
                 this.trailed = true;
+                shared.end();
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
                 shared.failed = true;
+                shared.settle(false);
                 shared.replay.release();
                 Poll::Ready(Some(Err(std::io::Error::other(e))))
             }
@@ -456,9 +556,9 @@ impl Body for Attempt {
 
     fn is_end_stream(&self) -> bool {
         let Some(shared) = &self.shared else {
-            return true;
+            return self.queue.is_empty() && self.own_trailers.is_none();
         };
-        let shared = lock(shared);
+        let mut shared = lock(shared);
         if self.stale(&shared) {
             return false;
         }
@@ -467,8 +567,12 @@ impl Body for Attempt {
         }
         if shared.ended {
             shared.trailers.is_none() || self.trailed
+        } else if shared.body.is_end_stream() {
+            // `hyper` stops reading a body that says it is over: this is where the copies learn it.
+            shared.end();
+            true
         } else {
-            shared.body.is_end_stream()
+            false
         }
     }
 

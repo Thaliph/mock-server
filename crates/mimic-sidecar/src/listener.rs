@@ -226,6 +226,9 @@ impl Shared {
 
     /// Starts the shutdown: the listeners stop accepting and the relays wind down.
     pub fn shutdown(&self) {
+        if let Some(mesh) = &self.mesh {
+            mesh.stop();
+        }
         self.stop.send_replace(true);
     }
 

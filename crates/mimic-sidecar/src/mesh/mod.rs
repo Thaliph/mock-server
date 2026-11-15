@@ -426,6 +426,8 @@ struct Inner {
     state_file: PathBuf,
     replay: Arc<ReplayBudget>,
     retry_buffer: usize,
+    /// `SIGTERM` came: no copy starts any more.
+    stopping: AtomicBool,
     pulls: Family<ResultLabel, Counter>,
     services: Gauge,
     endpoints: Gauge,
@@ -476,6 +478,7 @@ impl MeshState {
             state_file: config.state_file.clone(),
             replay: ReplayBudget::new(config.retry_buffer_total, Gauge::default()),
             retry_buffer: config.retry_buffer,
+            stopping: AtomicBool::new(false),
             pulls: Family::default(),
             services: Gauge::default(),
             endpoints: Gauge::default(),
@@ -546,6 +549,17 @@ impl MeshState {
     /// The buffer of a request that may be sent again (spec §7.9 "Retries", "Bodies").
     pub fn replay(&self) -> Replay {
         self.0.replay.replay(self.0.retry_buffer)
+    }
+
+    /// `SIGTERM` came: no copy starts any more (spec §7.9 "Mirrors").
+    pub fn stop(&self) {
+        self.0
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.0.stopping.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The bytes one request may hold, for retries and mirrors (`MIMIC_MESH_RETRY_BUFFER`).

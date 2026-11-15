@@ -33,6 +33,7 @@ use mimic_core::mesh::route::{
 use mimic_core::mesh::timeout::{self, Deadline, Kind};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tokio::time::Sleep;
 
 use super::MeshState;
@@ -40,7 +41,7 @@ use super::dial::CLUSTER_CONNECT_TIMEOUT;
 use super::gate::{Gate, Progress};
 use super::metrics::{Call, INVALID_BACKEND, NO_BACKEND};
 use super::pool::{self, Lease, Protocol, Sent};
-use super::replay::{Attempt, Source};
+use super::replay::{Attempt, Held, Source};
 use super::router::{Backend, InFlight, Plan, Routed, Slot};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
@@ -791,7 +792,7 @@ impl Serving {
                     if self.mirror(
                         mirrors,
                         (&head, as_sent.as_ref()),
-                        body_state,
+                        (body_state, &source),
                         (view.rules[rule].timeouts.as_ref(), began),
                         protocol,
                     ) {
@@ -1110,7 +1111,7 @@ impl Serving {
         &self,
         mirrors: &[MirrorView],
         (head, as_sent): (&Parts, Option<&HeaderMap>),
-        body: mirror::Body,
+        (body, source): (mirror::Body, &Source),
         (timeouts, began): (Option<&TimeoutsView>, Instant),
         protocol: Protocol,
     ) -> bool {
@@ -1144,12 +1145,15 @@ impl Serving {
                 continue;
             };
             let result = match (decision, slot) {
-                (mirror::Decision::Send, Some(slot)) => {
+                (decision @ (mirror::Decision::Send | mirror::Decision::AwaitBody), Some(slot)) => {
                     let Some(backend) = router.backend(&m.service, m.port) else {
                         router.metrics.mirrored(label, "error");
                         continue;
                     };
+                    // A body is waited for by the copy, in its own task, never by the request.
+                    let body = (decision == mirror::Decision::AwaitBody).then(|| source.defer());
                     let copy = Copy {
+                        body,
                         mesh: self.mesh.clone(),
                         backend,
                         protocol,
@@ -1168,7 +1172,6 @@ impl Serving {
                     continue;
                 }
                 (mirror::Decision::SkipLimit, _) => "skipped_limit",
-                // A copy that waits for the end of its body is not started yet.
                 _ => "skipped_body",
             };
             router.metrics.mirrored(label, result);
@@ -1307,8 +1310,8 @@ impl CopyHead {
         }
     }
 
-    fn request(&self) -> Request<Attempt> {
-        let mut request = Request::new(Attempt::bodiless());
+    fn request(&self, body: Option<&Held>) -> Request<Attempt> {
+        let mut request = Request::new(body.map_or_else(Attempt::bodiless, Held::attempt));
         *request.method_mut() = self.method.clone();
         *request.uri_mut() = self.uri.clone();
         *request.version_mut() = self.version;
@@ -1327,21 +1330,42 @@ struct Copy {
     protocol: Protocol,
     origin: Option<Arc<Origin>>,
     head: CopyHead,
+    /// The body, when the request has one: it comes once its end was read from the app, whole,
+    /// or never (`None`).
+    body: Option<oneshot::Receiver<Option<Held>>>,
     /// When the copy is given up, wherever it is.
     deadline: Instant,
     _slot: Slot,
 }
 
 impl Copy {
-    async fn run(self) {
+    async fn run(mut self) {
         let router = self.mesh.router();
         let _armed = Armed::new(&router.timers);
-        let result = self.attempt().await;
+        let at = tokio::time::Instant::from(self.deadline);
+        let held = match self.body.take() {
+            None => None,
+            Some(rx) => match tokio::time::timeout_at(at, rx).await {
+                Ok(Ok(Some(held))) => Some(held),
+                // Too large, cut, gone or not ended at the deadline.
+                _ => {
+                    if !self.mesh.stopping() {
+                        router.metrics.mirrored(&self.backend.label, "skipped_body");
+                    }
+                    return;
+                }
+            },
+        };
+        // No copy starts after `SIGTERM`; those in flight are dropped with the process.
+        if self.mesh.stopping() {
+            return;
+        }
+        let result = self.attempt(held.as_ref()).await;
         router.metrics.mirrored(&self.backend.label, result);
     }
 
     /// `sent` when a response head came back, else `error`.
-    async fn attempt(&self) -> &'static str {
+    async fn attempt(&self, held: Option<&Held>) -> &'static str {
         let router = self.mesh.router();
         let at = tokio::time::Instant::from(self.deadline);
         let Plan::Pod(pick) = self.backend.plan(router, &mut Planner::new(0)) else {
@@ -1375,7 +1399,7 @@ impl Copy {
                 }
                 Err(_) => return "error",
             };
-            let sent = tokio::time::timeout_at(at, connected.send(self.head.request())).await;
+            let sent = tokio::time::timeout_at(at, connected.send(self.head.request(held))).await;
             match sent {
                 Err(_) => {
                     connected.discard();
