@@ -5,6 +5,7 @@
 #   scripts/bench.sh               the default matrix: 18 runs of 30 s with 10 s pauses, about 12 minutes, plus the cluster
 #   scripts/bench.sh --dry-run     the plan only, nothing started (scripts/test_bench.sh reads it)
 #   SETUPS="mesh-lb mesh-churn mesh-refuse" scripts/bench.sh   the mesh setups (3 backend pods, routing asserted)
+#   SETUPS=mesh-mirror scripts/bench.sh   every request mirrored to a second Service (RTE-94, #450)
 #
 # Environment (defaults in brackets):
 #   CLUSTER=mimic-bench            kind cluster: created when absent, reused otherwise
@@ -15,7 +16,9 @@
 #                                  RSS with a synthetic view are measured (#444); mesh-churn: mesh-lb
 #                                  with a rollout restart of the backend during each run; mesh-refuse:
 #                                  mesh-lb with 2 injected backend pods and 1 Ready pod that is not
-#                                  injected and refuses connections (RTY-23, #445)
+#                                  injected and refuses connections (RTY-23, #445); mesh-mirror: mesh-lb with
+#                                  an HTTPRoute mirroring every request to a second fortio Service; each
+#                                  rate and protocol runs without the route, then with it (RTE-94, #450)
 #   PROPAGATION_SAMPLES=20         mesh-lb only: EndpointSlice changes timed, 0 to 100; 0 skips them
 #   PROTOCOLS="http1 h2c"          HTTP/1.1 keep-alive; h2c (HTTP/2 over cleartext)
 #   RATES="50 100 200"             requests per second, each 1 to 200
@@ -57,6 +60,7 @@ NS=mimic-bench
 SYSTEM_NS=mimic-system
 RELEASE=mimic
 RATE_CAP=200
+MIRROR_P50_BUDGET_MS=0.2    # mesh-mirror: the primary's p50 with the mirror over its p50 without (design §14, M3)
 MESH_PODS=3                 # the backend of the mesh setups (BEN-11)
 REFUSING_PODS=1             # mesh-refuse: of the MESH_PODS backend pods, this many are not injected and refuse (RTY-23)
 PROPAGATION_BUDGET_MS=2000  # EndpointSlice change to the sidecar's view applied, p99 (design §14, M1)
@@ -79,6 +83,19 @@ contains() {
   return 1
 }
 
+# variants_of <setup>: the variants of each rate and protocol, in order. mesh-mirror runs without the HTTPRoute
+# (off), then with it (on); the others have one run (-). run_total counts them.
+variants_of() {
+  if [[ $1 == mesh-mirror ]]; then echo "off on"; else echo "-"; fi
+}
+# variant_label <variant>: the plan words of a variant.
+variant_label() {
+  case $1 in
+    off) echo " (without mirror)" ;;
+    on) echo " (with mirror)" ;;
+  esac
+}
+
 read -ra SETUP_LIST <<<"$SETUPS"
 read -ra PROTOCOL_LIST <<<"$PROTOCOLS"
 read -ra RATE_LIST <<<"$RATES"
@@ -86,8 +103,8 @@ read -ra RATE_LIST <<<"$RATES"
 ((${#PROTOCOL_LIST[@]} > 0)) || config_error PROTOCOLS "empty"
 ((${#RATE_LIST[@]} > 0)) || config_error RATES "empty"
 for setup in "${SETUP_LIST[@]}"; do
-  contains "$setup" plain none discovery mesh-lb mesh-churn mesh-refuse \
-    || config_error SETUPS "$setup is not plain, none, discovery, mesh-lb, mesh-churn or mesh-refuse"
+  contains "$setup" plain none discovery mesh-lb mesh-churn mesh-mirror mesh-refuse \
+    || config_error SETUPS "$setup is not plain, none, discovery, mesh-lb, mesh-churn, mesh-mirror or mesh-refuse"
 done
 for protocol in "${PROTOCOL_LIST[@]}"; do
   contains "$protocol" http1 h2c || config_error PROTOCOLS "$protocol is not http1 or h2c"
@@ -128,7 +145,7 @@ SKIP_BUILD=${SKIP_BUILD-0}
 # the mesh setups last (they scale the backend to 3 pods, and the others need 1). mesh-refuse is the last one:
 # its refusing pod stays in the namespace, and the setups before it must not see it.
 ORDERED_SETUPS=()
-for setup in plain none discovery mesh-lb mesh-churn mesh-refuse; do
+for setup in plain none discovery mesh-lb mesh-churn mesh-mirror mesh-refuse; do
   contains "$setup" "${SETUP_LIST[@]}" && ORDERED_SETUPS+=("$setup")
 done
 
@@ -197,6 +214,7 @@ if ((DRY_RUN)); then
     case $setup in
       mesh-lb) echo "mesh-lb: backend $MESH_PODS pods, mode discovery; routing asserted before and after the runs" ;;
       mesh-churn) echo "mesh-churn: backend $MESH_PODS pods, mode discovery; rollout restart of the backend in every run; routing asserted before and after the runs" ;;
+      mesh-mirror) echo "mesh-mirror: backend $MESH_PODS pods, mode discovery; every rate and protocol runs without the HTTPRoute, then with it mirroring every request to a second fortio Service; routing asserted before and after the runs; the primary p50 budget is +$MIRROR_P50_BUDGET_MS ms and the mirror must receive as many requests as the primary" ;;
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
     esac
   done
@@ -205,15 +223,21 @@ if ((DRY_RUN)); then
     echo "mesh-lb synthetic view: $SYNTHETIC_SERVICES Services, $SYNTHETIC_ENDPOINTS endpoints each, RSS budget baseline + $RSS_BUDGET_MIB MiB"
   fi
   check_locks
-  total=$((${#ORDERED_SETUPS[@]} * ${#PROTOCOL_LIST[@]} * ${#RATE_LIST[@]}))
+  total=0
+  for setup in "${ORDERED_SETUPS[@]}"; do
+    read -ra variants <<<"$(variants_of "$setup")"
+    total=$((total + ${#variants[@]} * ${#PROTOCOL_LIST[@]} * ${#RATE_LIST[@]}))
+  done
   index=0
   for setup in "${ORDERED_SETUPS[@]}"; do
     for protocol in "${PROTOCOL_LIST[@]}"; do
       for rate in "${RATE_LIST[@]}"; do
-        index=$((index + 1))
-        fortio_args "$protocol" "$rate"
-        echo "run $index/$total setup $setup protocol $protocol rate $rate rps: fortio ${FORTIO_ARGS[*]}"
-        if ((index < total)); then echo "pause ${PAUSE}s"; fi
+        for variant in $(variants_of "$setup"); do
+          index=$((index + 1))
+          fortio_args "$protocol" "$rate"
+          echo "run $index/$total setup $setup protocol $protocol rate $rate rps$(variant_label "$variant"): fortio ${FORTIO_ARGS[*]}"
+          if ((index < total)); then echo "pause ${PAUSE}s"; fi
+        done
       done
     done
   done
@@ -224,6 +248,7 @@ fi
 # ---- real run ---------------------------------------------------------------------------------------
 
 LOCKED=0
+GW_CRDS=0
 NS_CREATED=0
 BUILT=0
 WORK=""
@@ -234,6 +259,10 @@ cleanup() {
   if [[ $NS_CREATED == 1 ]]; then
     kubectl delete namespace "$NS" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1 \
       || echo "WARN namespace $NS was not deleted" >&2
+  fi
+  # Only the Gateway API CRDs this run installed: a cluster that had them keeps them.
+  if [[ $GW_CRDS == 1 ]]; then
+    kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
   if [[ $BUILT == 1 ]]; then
     docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
@@ -436,6 +465,24 @@ injected_pods() {
   esac
 }
 
+# ensure_gateway_crds: the Gateway API standard CRDs, when the cluster has none: the manifest pinned by
+# scripts/e2e.sh (version and SHA-256 are read from there, one pin), removed on exit by this run only (RTE-94).
+ensure_gateway_crds() {
+  local version sha256
+  if kubectl get crd httproutes.gateway.networking.k8s.io -o name >/dev/null 2>&1; then return 0; fi
+  version=$(sed -n 's/^gw_version=//p' scripts/e2e.sh)
+  sha256=$(sed -n 's/^gw_sha256=//p' scripts/e2e.sh)
+  [[ -n $version && $sha256 =~ ^[0-9a-f]{64}$ ]] || { echo "FAIL the Gateway API pin of scripts/e2e.sh is not readable" >&2; exit 1; }
+  curl -fsSL --max-time 120 -o "$WORK/gateway-standard.yaml" \
+    "https://github.com/kubernetes-sigs/gateway-api/releases/download/$version/standard-install.yaml"
+  [[ $(sha256sum "$WORK/gateway-standard.yaml" | cut -d' ' -f1) == "$sha256" ]] \
+    || { echo "FAIL the Gateway API $version standard CRDs do not match the pinned digest" >&2; exit 1; }
+  GW_CRDS=1
+  kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+  kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io \
+    crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+}
+
 # prepare_setup <setup>: plain runs without the sidecar, the others with it (namespace label, a MimicWorkload
 # of the mode of the setup, restart). The injected backend has injected_pods pods; mesh-refuse adds its refusing pod.
 prepare_setup() {
@@ -457,6 +504,12 @@ YAML
     kubectl -n "$NS" rollout restart deploy/fortio-server deploy/fortio-client
   fi
   kubectl -n "$NS" scale deploy/fortio-server --replicas="$replicas" >/dev/null
+  if [[ $setup == mesh-mirror ]]; then
+    ensure_gateway_crds
+    # The mirror backend: a second fortio server, one pod, injected like the others (the namespace label).
+    workload fortio-mirror '["server", "-http-port", "8080", "-redirect-port", "disabled", "-ui-path", "", "-echo-server-default-params", "size=1024&delay=5ms"]' 8080 | kubectl apply -f -
+    kubectl -n "$NS" rollout status deploy/fortio-mirror --timeout=180s
+  fi
   if [[ $setup == mesh-refuse ]]; then
     refusing_workload | kubectl apply -f -
     kubectl -n "$NS" rollout status deploy/fortio-dead --timeout=180s
@@ -720,16 +773,91 @@ EOF
   echo "synthetic view: RSS $(jq -r '.rss_mib' "$WORK/synthetic.json") MiB, baseline $(jq -r '.rss_baseline_mib' "$WORK/synthetic.json") MiB"
 }
 
+# mirrored_sent: the copies the client sidecar counted sent, summed over the mirror Services (mesh-mirror).
+mirrored_sent() {
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$(pod_of fortio-client):15100/proxy/metrics" \
+    | awk 'index($1, "mimic_mesh_mirrored_total{") == 1 && index($0, "result=\"sent\"") { sum += $NF } END { print sum + 0 }'
+}
+
+# mirror_route <on|off>: the HTTPRoute of mesh-mirror, every request of fortio-server mirrored to fortio-mirror,
+# or deleted; then waits, up to 120 s, until the client sidecar's view agrees: a warm-up counts copies (on), or
+# two warm-ups in a row count none (off).
+mirror_route() {
+  local state=$1 before after again attempt
+  if [[ $state == on ]]; then
+    kubectl apply -f - >/dev/null <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: fortio-mirror, namespace: $NS}
+spec:
+  parentRefs: [{group: "", kind: Service, name: fortio-server, port: 8080}]
+  rules:
+    - backendRefs: [{name: fortio-server, port: 8080}]
+      filters:
+        - type: RequestMirror
+          requestMirror: {backendRef: {name: fortio-mirror, port: 8080}}
+YAML
+  else
+    kubectl -n "$NS" delete httproute fortio-mirror --ignore-not-found >/dev/null
+  fi
+  for attempt in $(seq 24); do
+    before=$(mirrored_sent)
+    warm_up
+    sleep 2
+    after=$(mirrored_sent)
+    if [[ $state == on ]]; then
+      if ((after > before)); then return 0; fi
+    else
+      warm_up
+      sleep 2
+      again=$(mirrored_sent)
+      if ((after == before && again == after)); then return 0; fi
+    fi
+    sleep 3
+  done
+  echo "FAIL mirror route $state: the client sidecar's view did not follow in 120 s" >&2
+  exit 1
+}
+
+# mirror_settle <sent before> <requests>: waits up to 30 s for the copies of a run with the mirror, and fails
+# unless the client counted exactly as many sent copies as the primary had requests (RTE-94). Prints the count.
+mirror_settle() {
+  local before=$1 requests=$2 sent deadline=$((SECONDS + 30))
+  while :; do
+    sent=$(($(mirrored_sent) - before))
+    if ((sent >= requests || SECONDS >= deadline)); then break; fi
+    sleep 1
+  done
+  if ((sent != requests)); then
+    echo "FAIL mesh-mirror: the mirror counted $sent sent copies for $requests primary requests, as many expected" >&2
+    exit 1
+  fi
+  echo "$sent"
+}
+
 # mesh_summary <setup>: the mesh block of the results of a mesh setup, in $WORK/<setup>.mesh.json (BEN-16).
 mesh_summary() {
   local setup=$1
   jq -n --arg setup "$setup" --argjson pods "$MESH_PODS" --argjson refusing "$REFUSING_PODS" \
+    --argjson budget "$MIRROR_P50_BUDGET_MS" \
     --slurpfile before "$WORK/$setup.routing-before.json" --slurpfile after "$WORK/$setup.routing-after.json" \
     --slurpfile runs "$WORK/$setup.jsonl" '
     {backend_pods: $pods, routing: {before: $before[0], after: $after[0]}}
     + (if $setup == "mesh-churn" then
          {churn: {restarts: ($runs | length), errors_total: ($runs | map(.errors) | add // 0),
                   fallbacks_total: $after[0].fallbacks, reconnects_total: $after[0].reconnects}}
+       else {} end)
+    + (if $setup == "mesh-mirror" then
+         {mirror: {budget_p50_ms: $budget,
+                   pairs: ($runs | group_by([.protocol, .rate]) | map(
+                     (map(select(.mirror.enabled == false))[0]) as $off
+                     | (map(select(.mirror.enabled == true))[0]) as $on
+                     | {protocol: $on.protocol, rate: $on.rate, requests: $on.requests,
+                        copies_sent: $on.mirror.copies_sent,
+                        p50_without_ms: $off.latency_ms.p50, p50_with_ms: $on.latency_ms.p50,
+                        delta_p50_ms: ((($on.latency_ms.p50 - $off.latency_ms.p50) * 1000 | round) / 1000),
+                        within_budget: (($on.latency_ms.p50 - $off.latency_ms.p50) <= $budget),
+                        copies_match: ($on.mirror.copies_sent == $on.requests)}))}}
        else {} end)
     + (if $setup == "mesh-refuse" then
          {refusing: {injected_pods: ($pods - $refusing), not_injected_pods: $refusing,
@@ -744,9 +872,11 @@ mesh_summary() {
   fi
 }
 
-# run_one <setup> <protocol> <rate> <index> <total>: one fortio run, sidecars measured before and after (BEN-03).
+# run_one <setup> <protocol> <rate> <index> <total> <variant>: one fortio run, sidecars measured before and after
+# (BEN-03). The variant is off or on for mesh-mirror (the route is in place), - for the others.
 run_one() {
-  local setup=$1 protocol=$2 rate=$3 index=$4 total=$5
+  local setup=$1 protocol=$2 rate=$3 index=$4 total=$5 variant=$6
+  local mirror_json=null sent_before=0
   local caller callee raw cb ca cr callee_before callee_after callee_rss caller_json=null callee_json=null
   local measure_callee=1 churn=0
   fortio_args "$protocol" "$rate"
@@ -761,13 +891,19 @@ run_one() {
   if ((measure_callee)); then
     callee_before=$(scrape "$callee" process_cpu_seconds_total)
   fi
-  echo "== run $index/$total setup $setup protocol $protocol rate $rate rps"
+  echo "== run $index/$total setup $setup protocol $protocol rate $rate rps$(variant_label "$variant")"
+  if [[ $variant == on ]]; then sent_before=$(mirrored_sent); fi
   # mesh-churn: a rolling restart of the backend starts with the load and runs through it (BEN-14).
   if ((churn)); then kubectl -n "$NS" rollout restart deploy/fortio-server >/dev/null; fi
   raw=$(kubectl -n "$NS" exec "$caller" -c fortio -- /usr/bin/fortio "${FORTIO_ARGS[@]}" 2>>"$WORK/fortio.log") \
     || { echo "FAIL fortio run $index failed, see $WORK/fortio.log" >&2; exit 1; }
   if ((churn)); then kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s >/dev/null; fi
   jq -e '.DurationHistogram.Count' <<<"$raw" >/dev/null || { echo "FAIL run $index printed no fortio JSON" >&2; exit 1; }
+  if [[ $variant == off ]]; then mirror_json='{"enabled": false}'; fi
+  if [[ $variant == on ]]; then
+    mirror_json=$(jq -nc --argjson sent "$(mirror_settle "$sent_before" "$(jq '.DurationHistogram.Count' <<<"$raw")")" \
+      '{enabled: true, copies_sent: $sent}')
+  fi
   if [[ $setup != plain ]]; then
     ca=$(scrape "$caller" process_cpu_seconds_total)
     cr=$(scrape "$caller" process_resident_memory_bytes)
@@ -780,7 +916,8 @@ run_one() {
   fi
   jq -c -n --arg setup "$setup" --arg protocol "$protocol" --argjson rate "$rate" \
     --argjson connections "$CONNECTIONS" --argjson duration_s "$DURATION_S" --argjson fortio "$raw" \
-    --argjson caller "$caller_json" --argjson callee "$callee_json" --argjson churn "$churn" '
+    --argjson caller "$caller_json" --argjson callee "$callee_json" --argjson churn "$churn" \
+    --argjson mirror "$mirror_json" '
     def pct($p): [$fortio.DurationHistogram.Percentiles[] | select(.Percentile == $p) | .Value * 1000][0];
     {
       setup: $setup, protocol: $protocol, rate: $rate, duration_s: $duration_s, connections: $connections,
@@ -789,6 +926,7 @@ run_one() {
       errors: ($fortio.DurationHistogram.Count - ($fortio.RetCodes["200"] // 0)),
       latency_ms: {p50: pct(50), p90: pct(90), p99: pct(99), "p99.9": pct(99.9)},
       rollout_restart: ($churn == 1),
+      mirror: $mirror,
       sidecar: {caller: $caller, callee: $callee},
       fortio: $fortio
     }' >>"$WORK/$setup.jsonl"
@@ -805,23 +943,31 @@ write_results() {
   jq -r --arg date "$TODAY" --arg setup "$setup" '
     def v: if . == null then "-" else tostring end;
     def r2: if . == null then "-" else (. * 100 | round / 100 | tostring) end;
-    "| \($date) | \($setup) | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
+    "| \($date) | \($setup)\(if .mirror.enabled == false then " (no mirror)" else "" end) | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
     "$WORK/$setup.jsonl" >>"$OUT_DIR/README.md"
   echo "wrote $file"
 }
 
-total=$((${#ORDERED_SETUPS[@]} * ${#PROTOCOL_LIST[@]} * ${#RATE_LIST[@]}))
+total=0
+for setup in "${ORDERED_SETUPS[@]}"; do
+  read -ra variants <<<"$(variants_of "$setup")"
+  total=$((total + ${#variants[@]} * ${#PROTOCOL_LIST[@]} * ${#RATE_LIST[@]}))
+done
 index=0
 for setup in "${ORDERED_SETUPS[@]}"; do
   prepare_setup "$setup"
   if [[ $setup == mesh-* ]]; then mesh_routing "$setup" before 1; fi
   for protocol in "${PROTOCOL_LIST[@]}"; do
     for rate in "${RATE_LIST[@]}"; do
-      index=$((index + 1))
-      run_one "$setup" "$protocol" "$rate" "$index" "$total"
-      if ((index < total)); then sleep "$PAUSE"; fi
+      for variant in $(variants_of "$setup"); do
+        index=$((index + 1))
+        if [[ $variant != - ]]; then mirror_route "$variant"; fi
+        run_one "$setup" "$protocol" "$rate" "$index" "$total" "$variant"
+        if ((index < total)); then sleep "$PAUSE"; fi
+      done
     done
   done
+  if [[ $setup == mesh-mirror ]]; then mirror_route off; fi
   if [[ $setup == mesh-* ]]; then
     # Fallbacks are not asserted under mesh-churn: a refused connection to a restarting pod is measured (BEN-14).
     # mesh-refuse is strict: its refusing pod is retried to a sibling, so no try should need the ClusterIP.
