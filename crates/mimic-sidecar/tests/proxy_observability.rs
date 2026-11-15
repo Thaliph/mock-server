@@ -478,6 +478,8 @@ async fn prx_08_tls_connection_line_has_the_sni() {
 
 #[tokio::test]
 async fn prx_09_metrics_show_the_exact_values_of_known_exchanges() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     // Outbound: two requests on one connection to a.example.
     let d1 = dest(
         &[
@@ -602,6 +604,8 @@ async fn prx_09_metrics_show_the_exact_values_of_known_exchanges() {
 
 #[tokio::test]
 async fn prx_09_authorities_over_the_budget_are_counted_as_other() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let addr = dest(&[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 0).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let f = fixture_budget(listener, Direction::Outbound, 2, move |_| Some(addr)).await;
@@ -693,6 +697,8 @@ fn prx_09_valid_budget_starts() {
 
 #[tokio::test]
 async fn prx_23_real_hosts_named_other_and_invalid_are_not_the_sentinels() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let addr = dest(&[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 0).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let f = fixture_budget(listener, Direction::Outbound, 2, move |_| Some(addr)).await;

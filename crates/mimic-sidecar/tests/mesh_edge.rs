@@ -88,11 +88,15 @@ async fn server_first(opaque: bool) {
 
 #[tokio::test]
 async fn msh_58_a_server_first_protocol_on_an_opaque_port_has_its_banner_at_once() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     server_first(true).await;
 }
 
 #[tokio::test]
 async fn msh_58_a_server_first_protocol_on_another_port_does_not_wait_a_second() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     server_first(false).await;
 }
 

@@ -183,6 +183,8 @@ async fn msh_33_the_first_request_and_the_view_applied() {
 
 #[tokio::test]
 async fn msh_33_a_gzip_body_is_read() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![Reply::Gzip(two(), "\"1-gz\"")], Reply::Hold).await;
     wait("view", || rig.services() == 2).await;
     assert_eq!(rig.pulls("ok"), 1);
@@ -191,6 +193,8 @@ async fn msh_33_a_gzip_body_is_read() {
 
 #[tokio::test]
 async fn msh_33_a_304_keeps_the_view() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(
         vec![
             Reply::View(two(), "\"1-aaa\""),
@@ -209,6 +213,8 @@ async fn msh_33_a_304_keeps_the_view() {
 
 #[tokio::test]
 async fn msh_33_the_token_is_read_for_each_request() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![], Reply::NotModified).await;
     wait("a request", || rig.api.count() >= 1).await;
     std::fs::write(rig.dir.path().join("token"), "rotated-token-2\n").unwrap();
@@ -277,6 +283,8 @@ fn routed(backend: &str) -> String {
 
 #[tokio::test]
 async fn rte_20_a_view_with_routes_is_accepted() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(
         vec![Reply::View(routed("shop/pay"), "\"1-r\"")],
         Reply::Hold,
@@ -291,6 +299,8 @@ async fn rte_20_a_view_with_routes_is_accepted() {
 #[tokio::test]
 async fn rte_20_a_view_whose_route_names_a_service_it_does_not_hold_is_refused_and_the_held_view_kept()
  {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(
         vec![
             Reply::View(two(), "\"1-aaa\""),
@@ -330,6 +340,8 @@ async fn rty_49_a_view_whose_policy_has_no_retries_is_refused_and_the_previous_o
 
 #[tokio::test]
 async fn msh_33_errors_keep_the_view_and_the_delay_resets_after_a_200() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(
         vec![
             Reply::View(two(), "\"1-aaa\""),
@@ -353,6 +365,8 @@ async fn msh_33_errors_keep_the_view_and_the_delay_resets_after_a_200() {
 
 #[tokio::test]
 async fn msh_33_a_missing_route_and_retry_after() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(
         vec![Reply::Status(404), Reply::RetryAfter(503, 2)],
         Reply::Hold,
@@ -368,6 +382,8 @@ async fn msh_33_a_missing_route_and_retry_after() {
 
 #[tokio::test]
 async fn msh_33_the_stop_ends_a_held_request() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![], Reply::Hold).await;
     wait("a request", || rig.api.count() >= 1).await;
     let begun = Instant::now();
@@ -386,6 +402,8 @@ fn gens(a: i64) -> String {
 
 #[tokio::test]
 async fn msh_34_an_older_generation_is_refused_and_the_view_kept() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let older = view_json(
         &[
             ("shop/cart", "10.96.0.10", 80),
@@ -415,6 +433,8 @@ async fn msh_34_an_older_generation_is_refused_and_the_view_kept() {
 
 #[tokio::test]
 async fn msh_34_equal_higher_and_unknown_generations_are_applied() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(
         vec![
             Reply::View(gens(5), "\"1-a\""),
@@ -448,6 +468,8 @@ async fn msh_34_equal_higher_and_unknown_generations_are_applied() {
 
 #[tokio::test]
 async fn msh_34_a_service_generation_counts() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     // The Service's slice goes from generation 1 to 0 in the second view.
     let lower = gens(1).replace(
         "\"endpointslice/shop/cart-x@u1\":1",
@@ -468,6 +490,8 @@ async fn msh_34_a_service_generation_counts() {
 
 #[tokio::test]
 async fn msh_34_an_object_created_again_has_a_new_uid_and_is_not_older() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     // The MimicConfig was deleted and created again: another UID, generation 1.
     let recreated = view_json(
         &[
@@ -499,6 +523,8 @@ async fn msh_34_an_object_created_again_has_a_new_uid_and_is_not_older() {
 
 #[tokio::test]
 async fn msh_34_a_stale_replica_serving_the_same_old_view_is_never_accepted() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let older = view_json(
         &[
             ("shop/cart", "10.96.0.10", 80),
@@ -558,6 +584,8 @@ async fn msh_35_the_mode_of_an_applied_view_is_applied() {
 
 #[tokio::test]
 async fn msh_35_a_silent_controller_changes_no_mode_and_off_pulls_nothing() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![], Reply::Hold).await;
     wait("a request", || rig.api.count() >= 1).await;
     assert_eq!(rig.mode.mode(), Mode::Discovery);
@@ -582,6 +610,8 @@ fn unix_now() -> u64 {
 
 #[tokio::test]
 async fn msh_36_an_applied_view_is_persisted_atomically() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![Reply::View(two(), "\"1-aaa\"")], Reply::Hold).await;
     wait("the file", || rig.state_file().exists()).await;
     let text = std::fs::read_to_string(rig.state_file()).unwrap();
