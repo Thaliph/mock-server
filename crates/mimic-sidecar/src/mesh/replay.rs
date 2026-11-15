@@ -290,6 +290,23 @@ impl Source {
         true
     }
 
+    /// The app's request body was read to its end.
+    pub(crate) fn complete(&self) -> bool {
+        let shared = lock(&self.shared);
+        !shared.failed && (shared.ended || shared.body.is_end_stream())
+    }
+
+    /// The request ends without an answer of a pod (a route timeout): the try in flight fails
+    /// its body, so that it never looks complete, and the bytes held are released.
+    pub(crate) fn cancel(&self) {
+        let mut shared = lock(&self.shared);
+        shared.closed = true;
+        shared.replay.release();
+        if let Some(waker) = shared.waker.take() {
+            waker.wake();
+        }
+    }
+
     /// A response head came back: the bytes held are released.
     pub(crate) fn release(&self) {
         let mut shared = lock(&self.shared);

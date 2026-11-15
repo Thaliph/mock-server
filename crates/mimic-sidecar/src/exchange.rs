@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
+use mimic_core::mesh::timeout::Kind;
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
 use mimic_core::proxy::http1::{CAPTURE_BODY_LIMIT, Captured, Event, RequestHead, Side};
 
@@ -250,6 +251,8 @@ pub(crate) struct Tracker {
     /// Mesh-routed: the route and the rule that matched (spec §7.9 "Routing").
     route: Option<Arc<str>>,
     rule: Option<usize>,
+    /// Mesh-routed: the route timeout that expired (spec §7.9 "Timeouts").
+    timeout: Option<&'static str>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -340,6 +343,7 @@ impl Tracker {
             attempts: None,
             route: None,
             rule: None,
+            timeout: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -378,7 +382,18 @@ impl Tracker {
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
     /// logged like a response, and never handed to discovery.
-    pub(crate) fn synthetic(mut self, status: u16) {
+    pub(crate) fn synthetic(self, status: u16) {
+        self.answered_by_sidecar(status, Outcome::Ok);
+    }
+
+    /// A route timeout expired before the response head (spec §7.9 "Timeouts"): the sidecar's
+    /// `504`, logged with `result: timeout` and the timeout that expired.
+    pub(crate) fn timed_out(mut self, kind: Kind) {
+        self.timeout = Some(kind.label());
+        self.answered_by_sidecar(StatusCode::GATEWAY_TIMEOUT.as_u16(), Outcome::Timeout);
+    }
+
+    fn answered_by_sidecar(mut self, status: u16, outcome: Outcome) {
         let head = self.started.elapsed();
         self.status = Some(status);
         self.head = Some(head);
@@ -394,7 +409,7 @@ impl Tracker {
             Some(status),
             head,
         );
-        self.finish(Outcome::Ok, 0);
+        self.finish(outcome, 0);
     }
 
     /// A refusal of a pod passed on as received (spec §7.9 "Retries"): like an answer of the
@@ -509,7 +524,7 @@ impl Tracker {
         self.ended = true;
         self.discover();
         let failed = self.request.failed.load(Ordering::Relaxed);
-        let outcome = if outcome == Outcome::Ok {
+        let outcome = if matches!(outcome, Outcome::Ok | Outcome::Timeout) {
             outcome
         } else if *self.ctx.aborted.borrow() {
             Outcome::Shutdown
@@ -546,6 +561,7 @@ impl Tracker {
             attempts: self.attempts,
             route: self.route.take(),
             rule: self.rule,
+            timeout: self.timeout,
         });
     }
 }
@@ -575,6 +591,15 @@ pub(crate) struct RespBody {
 }
 
 impl RespBody {
+    /// A route timeout expired after the head: the exchange ends here, logged with
+    /// `result: timeout` and the timeout, and handed to discovery as a response cut short.
+    pub(crate) fn cut(&mut self, kind: Kind) {
+        if let Some(tracker) = self.tracker.as_mut() {
+            tracker.timeout = Some(kind.label());
+        }
+        self.end(Outcome::Timeout);
+    }
+
     fn end(&mut self, outcome: Outcome) {
         if self.inner.is_end_stream()
             && let Some(tee) = self.tee.as_mut()
@@ -679,6 +704,7 @@ pub(crate) fn rejected(ctx: &Ctx) {
         attempts: None,
         route: None,
         rule: None,
+        timeout: None,
     });
 }
 
@@ -719,6 +745,7 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
         attempts: None,
         route: None,
         rule: None,
+        timeout: None,
     });
 }
 
@@ -1041,6 +1068,7 @@ impl Http1Tracker {
             attempts: None,
             route: None,
             rule: None,
+            timeout: None,
         });
     }
 }

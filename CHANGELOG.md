@@ -21,6 +21,14 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Route timeouts in the sidecar (#449, M3): `timeouts.request` (the whole call: every try, the pauses, the fallback
+  and the response up to its last byte) and `timeouts.backendRequest` (one try) of an `HTTPRoute` rule are applied.
+  Before the response head the sidecar answers `504` with `x-mimic-error: timeout`; after it the app's HTTP/1
+  connection is closed or its HTTP/2 stream reset. A timeout is never retried and asks nothing of the retry
+  budget; `0s` or no value means no timeout, and there is no default. Access lines gain `result: timeout` and
+  `timeout`; `mimic_mesh_attempts_total` has `result="timeout"` and `mimic_mesh_requests_total` `reason="timeout"`.
+  See Timeouts in the wiki page Mesh.
+
 - Routing by `HTTPRoute` in the sidecar (#448, M3): for a Service port that has routes the sidecar matches each
   request (path, method, headers, query parameters, the Gateway API's precedence), draws a backend by weight and
   sends the request to a pod of that backend with the backend's retry policy and budget, and applies the

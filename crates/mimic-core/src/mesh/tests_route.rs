@@ -1054,3 +1054,62 @@ fn rte_45_a_header_name_of_257_bytes_is_unsupported_and_one_of_256_is_not() {
         }
     }
 }
+
+#[test]
+fn rte_62_durations_compile_to_ms_and_zero_is_not_absent() {
+    for (text, ms) in [
+        ("0s", 0u64),
+        ("100ms", 100),
+        ("1h1m1s1ms", 3_661_001),
+        ("99999h99999h99999h99999h", 1_439_985_600_000),
+    ] {
+        let mut a = rule(vec![]);
+        a.request_timeout = Some(text.into());
+        a.backend_request_timeout = Some(text.into());
+        let c = plain(&simple(vec![a]));
+        assert!(c.programmed, "a duration of the table");
+        let want = format!(r#""timeouts":{{"backendRequestMs":{ms},"requestMs":{ms}}}"#);
+        assert!(json(&c, "shop/cart").contains(&want), "the duration in ms");
+    }
+    let mut a = rule(vec![]);
+    a.request_timeout = Some("0s".into());
+    assert!(json(&plain(&simple(vec![a])), "shop/cart").contains(r#""timeouts":{"requestMs":0}"#));
+    let c = plain(&simple(vec![rule(vec![])]));
+    assert!(
+        !json(&c, "shop/cart").contains("timeouts"),
+        "absent stays absent"
+    );
+}
+
+#[test]
+fn rte_62_a_malformed_duration_is_unsupported_and_names_its_path_only() {
+    for text in [
+        "1.5s",
+        "-1s",
+        "1d",
+        "",
+        "100000ms",
+        "1s1s1s1s1s",
+        "1S",
+        "SECRET",
+    ] {
+        for (field, backend) in [("request", false), ("backendRequest", true)] {
+            let mut a = rule(vec![]);
+            if backend {
+                a.backend_request_timeout = Some(text.into());
+            } else {
+                a.request_timeout = Some(text.into());
+            }
+            let (ok, reason, message) = first_unsupported(simple(vec![a]));
+            assert!(!ok, "a malformed duration is refused");
+            assert_eq!(reason, "UnsupportedValue");
+            assert_eq!(message, format!("unsupported: rules[0].timeouts.{field}"));
+        }
+    }
+    let mut ok = rule(vec![]);
+    let mut bad = rule(vec![]);
+    ok.request_timeout = Some("1s".into());
+    bad.backend_request_timeout = Some("1.5s".into());
+    let (_, _, message) = first_unsupported(simple(vec![ok, bad]));
+    assert_eq!(message, "unsupported: rules[1].timeouts.backendRequest");
+}

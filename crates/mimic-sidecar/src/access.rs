@@ -19,6 +19,8 @@ pub enum Outcome {
     Ok,
     UpstreamReset,
     ClientAbort,
+    /// A route timeout expired (spec §7.9 "Timeouts").
+    Timeout,
     /// An HTTP/2 connection broken by the client at connection level.
     Rejected,
     /// An HTTP/1 message the codec cannot frame: the rest of the connection is a tunnel.
@@ -35,6 +37,7 @@ impl Outcome {
             Outcome::Ok => "ok",
             Outcome::UpstreamReset => "upstream_reset",
             Outcome::ClientAbort => "client_abort",
+            Outcome::Timeout => "timeout",
             Outcome::Rejected => "rejected",
             Outcome::Unframed => "unframed",
             Outcome::Shutdown => "shutdown",
@@ -79,6 +82,8 @@ pub struct Exchange {
     /// and the index of its rule.
     pub route: Option<Arc<str>>,
     pub rule: Option<usize>,
+    /// With `result: timeout`: the route timeout that expired, `request` or `backendRequest`.
+    pub timeout: Option<&'static str>,
 }
 
 /// One finished opaque or TLS connection.
@@ -145,6 +150,7 @@ pub fn exchange(e: &Exchange) {
         attempts = e.attempts,
         route = e.route.as_deref(),
         rule = e.rule,
+        timeout = e.timeout,
         "http exchange"
     );
 }

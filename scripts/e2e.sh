@@ -101,6 +101,10 @@ cleanup() {
     # Only the CRDs this run installed: a cluster that had them keeps them.
     [[ -z ${RTE_21_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${RTE_71_CLEANUP:-} ]]; then
+    kubectl delete namespace rte-71 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    [[ -z ${RTE_71_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n ${RTE_55_CLEANUP:-} ]]; then
     kubectl delete namespace rte-55 --ignore-not-found --wait=false >/dev/null 2>&1 || true
     [[ -z ${RTE_55_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -5689,6 +5693,157 @@ kubectl delete namespace rte-55 --wait=false >/dev/null
 RTE_55_CLEANUP=
 RTE_55_CRDS=
 echo "rte_55: the canary followed 90/10, 0/100 and the header rule within a view update, /other got 404 no-route with its access line, and the deleted route gave both versions back"
+
+# --- Route timeouts (#449, spec §12.25 RTE-71) ---------------------------------------------------------------------------------
+# Objects of this section only: rte-71 (injected: client, which calls; slow, a Service whose pods answer /slow after 2 s and
+# /fast at once). The Gateway API CRDs are handled as in rte_55: the pinned manifest of msh_28, installed here, removed at the
+# end when this section installed them.
+log "rte_71: a request: 200ms route cuts /slow with 504 timeout and leaves /fast, request: 0s gives /slow back"
+[[ -s $WORK/gateway-standard.yaml ]] || fail "rte_71: the pinned Gateway API manifest of msh_28 is missing"
+RTE_71_CLEANUP=1
+# rte_55 deleted the CRDs without waiting: let a deletion in progress end before installing them again.
+for _ in $(seq 60); do
+  [[ -n $(kubectl get crd httproutes.gateway.networking.k8s.io -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true) ]] || break
+  sleep 1
+done
+if [[ -z $(kubectl get crd httproutes.gateway.networking.k8s.io -o name 2>/dev/null || true) ]]; then RTE_71_CRDS=1; fi
+kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+ns_fresh rte-71 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Service
+metadata: {name: slow, namespace: rte-71}
+spec:
+  selector: {app: slow}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: slow, namespace: rte-71}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: slow}}
+  template:
+    metadata: {labels: {app: slow}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c]
+          args:
+            - |
+              import http.server, time
+              class H(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      if self.path == "/slow":
+                          time.sleep(2)
+                      body = b"ok"
+                      self.send_response(200)
+                      self.send_header("content-length", str(len(body)))
+                      self.end_headers()
+                      try:
+                          self.wfile.write(body)
+                      except OSError:
+                          pass
+                  def log_message(self, *args):
+                      pass
+              http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: rte-71}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for dep in slow client; do kubectl -n rte-71 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_71: $dep did not roll out Ready"; done
+# rte_71_until <timeout seconds> <description> <command...>: polls the command once a second.
+rte_71_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "rte_71: $desc"
+}
+admin_forward
+rte_71_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
+rte_71_client=$(kubectl -n rte-71 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+# rte_71_get <path>: "<status> <x-mimic-error or -> <seconds on the client's clock>" of one request from client to slow.
+rte_71_get() {
+  kubectl -n rte-71 exec deploy/client -c app -- python3 -c '
+import sys, time, urllib.error, urllib.request
+start = time.monotonic()
+try:
+    response = urllib.request.urlopen("http://slow.rte-71.svc" + sys.argv[1], timeout=10)
+    status, error = response.status, response.headers.get("x-mimic-error")
+except urllib.error.HTTPError as http_error:
+    status, error = http_error.code, http_error.headers.get("x-mimic-error")
+print(status, error or "-", "%.3f" % (time.monotonic() - start))
+' "$1"
+}
+rte_71_slow_is_cut() { local got; got=$(rte_71_get /slow) || return 1; [[ ${got%% *} == 504 ]]; }
+# rte_71_counter <metric> <label="value">: the sum of the series of the client's sidecar that carry the label.
+rte_71_counter() {
+  sidecar_metrics rte-71 "$rte_71_client" | grep "^$1{" | grep -F "$2" | awk '{ sum += $NF } END { print sum + 0 }'
+}
+# rte_71_access <jq boolean>: the number of access lines of the sidecar of client for which the boolean holds.
+rte_71_access_is() {
+  [[ $(kubectl -n rte-71 logs "$rte_71_client" -c mimic-sidecar 2>/dev/null \
+    | jq -R -r "fromjson? | select(.target == \"access\" and ($1)) | 1" | wc -l | tr -d ' ') -ge 1 ]]
+}
+
+# RTE-71: a rule with request: 200ms.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: slow-timeout, namespace: rte-71}
+spec:
+  parentRefs: [{group: "", kind: Service, name: slow, port: 80}]
+  rules:
+    - backendRefs: [{name: slow, port: 80}]
+      timeouts: {request: 200ms}
+YAML
+# Until the sidecar holds the route /slow is answered after its 2 s: wait for the first 504.
+rte_71_until 60 "/slow was not answered 504 within 60 s of the route with request: 200ms" rte_71_slow_is_cut
+read -r rte_71_status rte_71_error rte_71_seconds <<<"$(rte_71_get /slow)"
+[[ $rte_71_status == 504 && $rte_71_error == timeout ]] || fail "rte_71: /slow gave '$rte_71_status $rte_71_error', 504 timeout expected"
+awk -v s="$rte_71_seconds" 'BEGIN { exit !(s < 1) }' || fail "rte_71: /slow took $rte_71_seconds s on the client's clock, under 1 s expected"
+read -r rte_71_status rte_71_error _ <<<"$(rte_71_get /fast)"
+[[ $rte_71_status == 200 ]] || fail "rte_71: /fast gave $rte_71_status, 200 expected"
+(( $(rte_71_counter mimic_mesh_attempts_total 'result="timeout"') >= 1 )) \
+  || fail "rte_71: mimic_mesh_attempts_total{result=\"timeout\"} is not at least 1 on the sidecar of client"
+(( $(rte_71_counter mimic_mesh_requests_total 'reason="timeout"') >= 1 )) \
+  || fail "rte_71: mimic_mesh_requests_total{reason=\"timeout\"} is not at least 1 on the sidecar of client"
+rte_71_until 10 "no access line of client holds GET /slow with result timeout" rte_71_access_is \
+  '.direction == "outbound" and .path == "/slow" and .result == "timeout"'
+
+# request: 0s turns the timeout off: /slow is answered 200 after its 2 s.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: slow-timeout, namespace: rte-71}
+spec:
+  parentRefs: [{group: "", kind: Service, name: slow, port: 80}]
+  rules:
+    - backendRefs: [{name: slow, port: 80}]
+      timeouts: {request: 0s}
+YAML
+rte_71_slow_is_ok() { local got; got=$(rte_71_get /slow) || return 1; [[ ${got%% *} == 200 ]]; }
+rte_71_until 60 "/slow was not answered 200 within 60 s of the route with request: 0s" rte_71_slow_is_ok
+
+kubectl delete namespace rte-71 --wait=false >/dev/null
+[[ -z ${RTE_71_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
+RTE_71_CLEANUP=
+RTE_71_CRDS=
+echo "rte_71: request: 200ms gave /slow 504 timeout in $rte_71_seconds s with its metrics and access line, /fast stayed 200, and request: 0s gave /slow 200"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

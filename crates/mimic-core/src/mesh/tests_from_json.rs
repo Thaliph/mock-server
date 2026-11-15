@@ -556,3 +556,46 @@ fn rte_45_header_names_are_bounded_to_256_bytes() {
         }
     }
 }
+
+#[test]
+fn rte_62_from_json_reads_timeouts_of_0_1_and_the_largest_value() {
+    use serde_json::json;
+    for ms in [0u64, 1, 1_439_985_600_000] {
+        for field in ["requestMs", "backendRequestMs"] {
+            let v = set(&pointer(&format!("/timeouts/{field}")), json!(ms))
+                .unwrap_or_else(|e| panic!("{field} {ms}: {e}"));
+            let again = read(&v.to_json()).expect("reads back");
+            assert_eq!(again, v);
+            assert!(v.to_json().contains(&format!(r#""{field}":{ms}"#)));
+        }
+    }
+}
+
+#[test]
+fn rte_62_from_json_refuses_a_malformed_timeout_and_an_unknown_field() {
+    use serde_json::json;
+    for field in ["requestMs", "backendRequestMs"] {
+        for bad in [json!(-1), json!(1.5), json!("100"), json!(null)] {
+            rte_12_refused(
+                &format!("{field} {bad}"),
+                mutated(|v| {
+                    v.pointer_mut(&pointer("/timeouts"))
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .insert(field.into(), bad.clone());
+                }),
+            );
+        }
+    }
+    rte_12_refused(
+        "unknown",
+        mutated(|v| {
+            v.pointer_mut(&pointer("/timeouts"))
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("idleMs".into(), json!(1));
+        }),
+    );
+}

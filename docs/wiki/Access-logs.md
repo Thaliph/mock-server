@@ -82,7 +82,8 @@ decrypted or not. A field that has no value is absent from the line, not `null`.
 | `attempts` | Mesh-routed requests: the number of tries (1 without a retry, at most 4, see [Mesh](Mesh#retries)). L4-balanced connections: the number of connects tried. Absent on relayed connections. |
 | `tls` | `true` when the exchange was decrypted by TLS interception. Absent otherwise. |
 | `interception` | Connection only, outbound TLS only: why the connection was not intercepted (a decision other than `intercepted`, which writes exchange lines instead). |
-| `result` | How it ended. Exchange: `ok`, `upstream_reset` (the destination reset it), `client_abort` (the app went away), `unframed` (HTTP/1 the codec cannot frame; the rest of the connection is a tunnel), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace). Connection: `ok`, `upstream_reset`, `client_abort`, `shutdown`, `mock_closed` (closed by the mock). |
+| `result` | How it ended. Exchange: `ok`, `upstream_reset` (the destination reset it), `client_abort` (the app went away), `unframed` (HTTP/1 the codec cannot frame; the rest of the connection is a tunnel), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace), `timeout` (a route timeout expired, [Mesh](Mesh#timeouts): `status` is `504` before the response head and the pod's status after it). Connection: `ok`, `upstream_reset`, `client_abort`, `shutdown`, `mock_closed` (closed by the mock). |
+| `timeout` | With `result` `timeout` only: the route timeout that expired, `request` or `backendRequest`. |
 | `mock` | Outbound, in mock mode only: `exact`, `endpoint`, `fallback` or `miss`: the tier of the mock that answered. |
 | `mock_miss` | With `mock` `miss`: why the mock had no answer. |
 | `load_run` | The uid of the load test run that sent a request carrying the load marker. Absent otherwise. |
