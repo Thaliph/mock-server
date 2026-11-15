@@ -883,6 +883,27 @@ for rule in "!has(self.retries) || self.targetRefs.exists(t, t.kind == 'Service'
 done
 echo "rty_47: the MimicConfig CRD bounds retries and retryBudget and fits them to a Service target only"
 
+# CBR-04 (#451): outlierDetection and circuitBreaker of the MimicConfig CRD, their bounds and their CEL rules.
+for f in "consecutiveFailures 1 100" "consecutive5xx 0 100" "maxEjectionPercent 0 100"; do
+  read -r name min max <<<"$f"
+  [[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 ".properties.outlierDetection.properties.$name | [.type, .minimum, .maximum]") == "[\"integer\",$min,$max]" ]] \
+    || fail "cbr_04: outlierDetection.$name is not an integer of $min to $max"
+done
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.outlierDetection.properties.baseEjectionTime | .type + " " + .pattern') == 'string ^[0-9]{1,3}s$' ]] \
+  || fail "cbr_04: outlierDetection.baseEjectionTime is not a <n>s string"
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.outlierDetection["x-kubernetes-validations"][0].rule') == "!has(self.baseEjectionTime) || (int(self.baseEjectionTime.replace('s', '')) >= 1 && int(self.baseEjectionTime.replace('s', '')) <= 300)" ]] \
+  || fail "cbr_04: outlierDetection.baseEjectionTime is not bounded to 1s to 300s by CEL"
+for name in maxRequests maxConnections; do
+  [[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 ".properties.circuitBreaker.properties.$name | [.type, .minimum, .maximum]") == '["integer",1,100000]' ]] \
+    || fail "cbr_04: circuitBreaker.$name is not an integer of 1 to 100000"
+done
+cel=$(printf '%s\n' "$mc_spec" | yq -r '[.["x-kubernetes-validations"][].rule] | join("\n")')
+for rule in "!has(self.outlierDetection) || self.targetRefs.exists(t, t.kind == 'Service')" \
+  "!has(self.circuitBreaker) || self.targetRefs.exists(t, t.kind == 'Service')"; do
+  grep -qxF -- "$rule" <<<"$cel" || fail "cbr_04: the MimicConfig CRD lacks the CEL rule $rule"
+done
+echo "cbr_04: the MimicConfig CRD bounds outlierDetection and circuitBreaker and fits them to a Service target only"
+
 # MSH-29 (#441): the controller's RBAC for the mesh watches, and the variables the mesh values render.
 role=$(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller")' "$tmp/default.yaml")
 rule_verbs() { # rule_verbs <resource>: the verbs of the rules that name the resource, one line each

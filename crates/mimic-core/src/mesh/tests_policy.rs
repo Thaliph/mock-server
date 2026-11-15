@@ -415,3 +415,209 @@ fn rty_44_an_invalid_retries_config_is_invalid_in_the_status_and_takes_no_part()
     assert_eq!(status(&s, "shop", "b").accepted.reason, "Accepted");
     assert_eq!(retry_policy(&s, "shop", "cart", "shop/cart").0, 2);
 }
+
+fn mesh_cfg(
+    ns: &str,
+    name: &str,
+    svc: &str,
+    outlier: Option<OutlierSpec>,
+    breaker: Option<BreakerSpec>,
+) -> Config {
+    Config {
+        outlier_detection: outlier,
+        circuit_breaker: breaker,
+        ..cfg(ns, name, 1, &[(TargetKind::Service, svc)])
+    }
+}
+
+fn outlier_spec(
+    failures: Option<u32>,
+    fives: Option<u32>,
+    base: Option<u32>,
+    percent: Option<u32>,
+) -> OutlierSpec {
+    OutlierSpec {
+        consecutive_failures: failures,
+        consecutive_5xx: fives,
+        base_ejection_seconds: base,
+        max_ejection_percent: percent,
+    }
+}
+
+fn breaker_spec(requests: Option<u32>, connections: Option<u32>) -> BreakerSpec {
+    BreakerSpec {
+        max_requests: requests,
+        max_connections: connections,
+    }
+}
+
+fn od(failures: u32, fives: u32, base: u32, percent: u32) -> OutlierDetection {
+    OutlierDetection {
+        consecutive_failures: failures,
+        consecutive_5xx: fives,
+        base_ejection_seconds: base,
+        max_ejection_percent: percent,
+    }
+}
+
+fn cb(requests: u32, connections: u32) -> CircuitBreaker {
+    CircuitBreaker {
+        max_requests: requests,
+        max_connections: connections,
+    }
+}
+
+fn mesh_policy(s: &Snapshot, ns: &str, d: &str, key: &str) -> (OutlierDetection, CircuitBreaker) {
+    let p = &view_of(s, ns, d).view.services[key].policy;
+    (p.outlier_detection.clone(), p.circuit_breaker.clone())
+}
+
+#[test]
+fn cbr_01_the_defaults_without_any_config() {
+    let s = cluster();
+    assert_eq!(defaults().outlier_detection, od(5, 0, 30, 50));
+    assert_eq!(defaults().circuit_breaker, cb(1024, 1024));
+    assert_eq!(effective(None), defaults());
+    assert_eq!(
+        mesh_policy(&s, "shop", "cart", "shop/cart"),
+        (od(5, 0, 30, 50), cb(1024, 1024))
+    );
+    let mut s = cluster();
+    s.configs = vec![mesh_cfg("shop", "a", "cart", None, None)];
+    assert_eq!(
+        mesh_policy(&s, "shop", "cart", "shop/cart"),
+        (od(5, 0, 30, 50), cb(1024, 1024))
+    );
+}
+
+#[test]
+fn cbr_01_each_field_the_winner_sets_is_taken_and_the_others_keep_their_default() {
+    let mut s = cluster();
+    for (set, want) in [
+        (outlier_spec(Some(1), None, None, None), od(1, 0, 30, 50)),
+        (outlier_spec(Some(100), None, None, None), od(100, 0, 30, 50)),
+        (outlier_spec(None, Some(0), None, None), od(5, 0, 30, 50)),
+        (outlier_spec(None, Some(100), None, None), od(5, 100, 30, 50)),
+        (outlier_spec(None, None, Some(1), None), od(5, 0, 1, 50)),
+        (outlier_spec(None, None, Some(300), None), od(5, 0, 300, 50)),
+        (outlier_spec(None, None, None, Some(0)), od(5, 0, 30, 0)),
+        (outlier_spec(None, None, None, Some(100)), od(5, 0, 30, 100)),
+        (outlier_spec(None, None, None, None), od(5, 0, 30, 50)),
+        (outlier_spec(Some(2), Some(3), Some(4), Some(5)), od(2, 3, 4, 5)),
+    ] {
+        s.configs = vec![mesh_cfg("shop", "a", "cart", Some(set), None)];
+        assert_eq!(
+            mesh_policy(&s, "shop", "cart", "shop/cart"),
+            (want, cb(1024, 1024))
+        );
+    }
+    for (set, want) in [
+        (breaker_spec(Some(1), None), cb(1, 1024)),
+        (breaker_spec(Some(100_000), None), cb(100_000, 1024)),
+        (breaker_spec(None, Some(1)), cb(1024, 1)),
+        (breaker_spec(None, Some(100_000)), cb(1024, 100_000)),
+        (breaker_spec(None, None), cb(1024, 1024)),
+    ] {
+        s.configs = vec![mesh_cfg("shop", "a", "cart", None, Some(set))];
+        assert_eq!(
+            mesh_policy(&s, "shop", "cart", "shop/cart"),
+            (od(5, 0, 30, 50), want)
+        );
+    }
+}
+
+#[test]
+fn cbr_01_a_consented_service_carries_the_config_of_its_own_namespace() {
+    let mut s = cluster();
+    s.grants = Some(vec![grant("risk", "shop")]);
+    s.configs = vec![
+        dep_cfg("shop", "d", 1, "cart", &["risk/scoring"]),
+        mesh_cfg(
+            "risk",
+            "p",
+            "scoring",
+            Some(outlier_spec(Some(7), None, None, None)),
+            Some(breaker_spec(Some(9), None)),
+        ),
+        mesh_cfg(
+            "shop",
+            "q",
+            "cart",
+            Some(outlier_spec(Some(2), None, None, None)),
+            None,
+        ),
+    ];
+    assert_eq!(
+        mesh_policy(&s, "shop", "cart", "risk/scoring"),
+        (od(7, 0, 30, 50), cb(9, 1024))
+    );
+    assert_eq!(
+        mesh_policy(&s, "shop", "cart", "shop/cart"),
+        (od(2, 0, 30, 50), cb(1024, 1024))
+    );
+}
+
+#[test]
+fn cbr_01_validate_refuses_each_field_out_of_bounds_naming_it() {
+    let svc = |o, b| mesh_cfg("shop", "x", "cart", o, b);
+    for ok in [
+        outlier_spec(Some(1), Some(0), Some(1), Some(0)),
+        outlier_spec(Some(100), Some(100), Some(300), Some(100)),
+        outlier_spec(None, None, None, None),
+    ] {
+        assert!(validate(&svc(Some(ok), None)).is_ok());
+    }
+    for ok in [
+        breaker_spec(Some(1), Some(1)),
+        breaker_spec(Some(100_000), Some(100_000)),
+        breaker_spec(None, None),
+    ] {
+        assert!(validate(&svc(None, Some(ok))).is_ok());
+    }
+    for (bad, field) in [
+        (outlier_spec(Some(0), None, None, None), "consecutiveFailures"),
+        (outlier_spec(Some(101), None, None, None), "consecutiveFailures"),
+        (outlier_spec(None, Some(101), None, None), "consecutive5xx"),
+        (outlier_spec(None, None, Some(0), None), "baseEjectionTime"),
+        (outlier_spec(None, None, Some(301), None), "baseEjectionTime"),
+        (outlier_spec(None, None, None, Some(101)), "maxEjectionPercent"),
+    ] {
+        let err = validate(&svc(Some(bad), None)).expect_err("out of bounds");
+        assert!(err.contains(field), "{err}");
+    }
+    for (bad, field) in [
+        (breaker_spec(Some(0), None), "maxRequests"),
+        (breaker_spec(Some(100_001), None), "maxRequests"),
+        (breaker_spec(None, Some(0)), "maxConnections"),
+        (breaker_spec(None, Some(100_001)), "maxConnections"),
+    ] {
+        let err = validate(&svc(None, Some(bad))).expect_err("out of bounds");
+        assert!(err.contains(field), "{err}");
+    }
+}
+
+#[test]
+fn cbr_01_both_objects_need_a_service_target() {
+    let dep = |o, b| Config {
+        outlier_detection: o,
+        circuit_breaker: b,
+        ..cfg("shop", "x", 1, &[(TargetKind::Deployment, "cart")])
+    };
+    let err = validate(&dep(Some(outlier_spec(None, None, None, None)), None)).unwrap_err();
+    assert!(err.contains("outlierDetection"), "{err}");
+    let err = validate(&dep(None, Some(breaker_spec(None, None)))).unwrap_err();
+    assert!(err.contains("circuitBreaker"), "{err}");
+    let both = Config {
+        outlier_detection: Some(outlier_spec(Some(2), None, None, None)),
+        ..cfg(
+            "shop",
+            "x",
+            1,
+            &[
+                (TargetKind::Deployment, "cart"),
+                (TargetKind::Service, "cart"),
+            ],
+        )
+    };
+    assert!(validate(&both).is_ok());
+}

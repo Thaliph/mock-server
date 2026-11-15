@@ -80,6 +80,8 @@ pub(crate) fn config(ns: &str, name: &str, deployment: &str, dests: &[(&str, &st
         slow_start: None,
         retries: None,
         retry_budget: None,
+        outlier_detection: None,
+        circuit_breaker: None,
     }
 }
 

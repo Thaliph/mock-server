@@ -336,7 +336,7 @@ const GOLDEN: &str = concat!(
     r#"{"cluster":"local","format":1,"generations":{},"mesh":true,"mode":"none","services":{"shop/cart":{"#,
     r#""endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},"#,
     r#""generations":{"endpointslice/shop/cart-x7k2p@uid-cart-x7k2p":41},"ips":["10.96.12.7"],"#,
-    r#""policy":{"loadBalancer":{"slowStartSeconds":30},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
+    r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":30},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
 );
 
 #[test]
@@ -533,7 +533,7 @@ fn rty_45_the_policy_holds_retries_and_every_budget_field_and_a_change_moves_the
     let base = view_of(&s, "shop", "cart");
     assert!(
         base.json.contains(
-            r#""policy":{"loadBalancer":{"slowStartSeconds":30},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#
+            r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":30},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#
         ),
         "{}",
         base.json
@@ -562,4 +562,49 @@ fn rty_45_the_policy_holds_retries_and_every_budget_field_and_a_change_moves_the
         second.view.services["shop/cart"].generations["mimicconfig/shop/c@uid-c"],
         2
     );
+}
+
+#[test]
+fn cbr_02_the_policy_holds_both_objects_with_every_field_and_each_field_moves_the_etag() {
+    let mut s = snapshot();
+    s.services = vec![http_svc("shop", "cart", "10.96.12.7")];
+    let base = view_of(&s, "shop", "cart");
+    assert!(
+        base.json.contains(
+            r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer""#
+        ),
+        "{}",
+        base.json
+    );
+    assert!(base.json.contains(
+        r#""outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3"#
+    ));
+    let sets: [fn(&mut Config); 6] = [
+        |c| c.outlier_detection = Some(OutlierSpec { consecutive_failures: Some(6), ..none_o() }),
+        |c| c.outlier_detection = Some(OutlierSpec { consecutive_5xx: Some(1), ..none_o() }),
+        |c| c.outlier_detection = Some(OutlierSpec { base_ejection_seconds: Some(31), ..none_o() }),
+        |c| c.outlier_detection = Some(OutlierSpec { max_ejection_percent: Some(51), ..none_o() }),
+        |c| c.circuit_breaker = Some(BreakerSpec { max_requests: Some(7), max_connections: None }),
+        |c| c.circuit_breaker = Some(BreakerSpec { max_requests: None, max_connections: Some(7) }),
+    ];
+    let mut etags = std::collections::BTreeSet::new();
+    etags.insert(base.etag.clone());
+    for set in sets {
+        let mut c = cfg("shop", "c", 1, &[(TargetKind::Service, "cart")]);
+        set(&mut c);
+        s.configs = vec![c];
+        let b = view_of(&s, "shop", "cart");
+        assert_ne!(b.json, base.json);
+        assert!(etags.insert(b.etag), "each change gives a new ETag");
+        assert_eq!(b.json, view_of(&s, "shop", "cart").json);
+    }
+}
+
+fn none_o() -> OutlierSpec {
+    OutlierSpec {
+        consecutive_failures: None,
+        consecutive_5xx: None,
+        base_ejection_seconds: None,
+        max_ejection_percent: None,
+    }
 }
