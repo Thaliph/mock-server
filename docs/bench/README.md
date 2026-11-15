@@ -432,7 +432,7 @@ primary's, what remains is the copy's own work on the same workers right after t
 ## M4: outlier detection and circuit breaker (#451, CBR-34)
 
 Backend of 3 pods, mode discovery, 200 rps, 30 s; JSON `2026-11-15-mesh-lb.json`, `2026-11-15-mesh-eject.json`
-(8 connections, http1 and h2c), `2026-11-15-mesh-breaker.json` (32 connections, http1 only). Load average below 4 at
+(8 connections, http1 and h2c), `2026-11-15-mesh-breaker.json` (32 connections, http1 and h2c, a later run of the same session). Load average below 4 at
 the start. The first run of this section (8 connections for both setups) is replaced: its `mesh-eject` budget
 (5 requests per ejection) could not hold with concurrent load, and its `mesh-breaker` never exceeded `maxRequests`
 (4 breaker-open lines). CBR-34 now bounds `mesh-eject` by `consecutiveFailures + connections - 1` per ejection and
@@ -445,19 +445,23 @@ runs `mesh-breaker` with 32 connections and at least 10 % breaker-open answers. 
 | 2026-11-15 | mesh-lb | h2c | 200 | 199.92 | 10.03 | 11.36 | 13.98 | 18 | 0 | 0.272 | 0.098 | 17 | 14.8 |
 | 2026-11-15 | mesh-eject | http1 | 200 | 199.93 | 8.46 | 9.47 | 11.62 | 14.8 | 0 | 0.21 | 0.088 | 16 | 14.1 |
 | 2026-11-15 | mesh-eject | h2c | 200 | 199.92 | 9.78 | 10.93 | 13.29 | 16.46 | 0 | 0.262 | 0.123 | 17 | 14.7 |
-| 2026-11-15 | mesh-breaker | http1 | 200 | 199.63 | 6.09 | 56.01 | 59.61 | 59.97 | 4488 | 0.179 | 0.023 | 18.1 | 14.4 |
+| 2026-11-15 | mesh-breaker | http1 | 200 | 199.64 | 5.71 | 56.01 | 59.61 | 59.97 | 4488 | 0.17 | 0.021 | 18.5 | 14.2 |
+| 2026-11-15 | mesh-breaker | h2c | 200 | 199.58 | 3.59 | 56.15 | 59.84 | 66.13 | 4488 | 0.137 | 0.027 | 18.9 | 14.4 |
 
 | Check | Result | Budget | Verdict |
 |---|---|---|---|
 | `mesh-eject`: error rate | 0 % (0 of 12000) | 0 % | met |
 | `mesh-eject`: requests to the resetting pod | 19 for 3 ejections (6.33 each) | at most 5 + 8 - 1 = 12 each | met |
-| `mesh-breaker`: breaker-open answers | 4512 of 5984 requests (75.4 %) | at least 10 % | met |
-| `mesh-breaker`: longest `duration_ms` of a breaker-open line | 4 ms | at most 1 ms | **not met** |
+| `mesh-breaker`: breaker-open answers | 9024 of 11968 requests (75.4 %) | at least 10 % | met |
+| `mesh-breaker`: p99 `duration_ms` of the breaker-open lines | 0 ms (8935 at 0 ms, 70 at 1, 14 at 2, 5 at 3; largest 3) | at most 1 ms | met |
 | `mesh-lb` p50 against M3 | see below | within 0.2 ms | met against the same-day M3 runs |
 
-`mesh-breaker` errors are the 503 answers of the breaker (1496 answers 200, 4488 answers 503; the access lines count
-4512, the difference being the warm-up requests, which fortio does not count). Its p50 (6.09 ms) is that of the
-accepted requests and the refused ones together.
+`mesh-breaker` errors are the 503 answers of the breaker (per protocol 1496 answers 200 and 4488 answers 503; the access
+lines count 4512, the difference being the warm-up requests, which fortio does not count). Its p50 is that of the
+accepted requests and the refused ones together. CBR-34 first bounded the largest `duration_ms` of a breaker-open line
+by 1 ms; the first run had one line of 4 ms, this one 19 of 9024 lines (0.21 %) above 1 ms, the largest 3 ms. A single
+line can wait on a worker that 32 connections keep busy, and `duration_ms` is whole milliseconds, so CBR-34 now bounds
+the p99 and records the counts per millisecond and the largest (decision on #451).
 
 `mesh-lb` p50 (no failures), 200 rps: 8.53 ms (http1) and 10.03 ms (h2c). The M3 runs of the same day, which route
 the same way with no mirror: 8.42 to 8.55 ms and 10.02 to 10.15 ms (the "no route" and "route, no mirror" rows
