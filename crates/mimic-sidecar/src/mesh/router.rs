@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -353,6 +353,8 @@ pub(crate) struct Router {
     services: Mutex<BTreeMap<String, Arc<ServiceRetry>>>,
     /// The middle of the delay before a retry after a trusted refusal.
     pub(crate) refusal_delay: Duration,
+    /// The route deadlines armed now (test hook, spec §7.9 "Timeouts").
+    pub(crate) timers: Arc<AtomicUsize>,
 }
 
 impl Router {
@@ -374,6 +376,7 @@ impl Router {
             avoid,
             services: Mutex::new(BTreeMap::new()),
             refusal_delay,
+            timers: Arc::default(),
         }
     }
 
@@ -420,6 +423,12 @@ impl Router {
     pub(crate) fn retry_state(&self) -> (usize, usize) {
         let backends = self.backends.read().unwrap_or_else(PoisonError::into_inner);
         (lock(&self.services).len(), backends.len())
+    }
+
+    /// The retries the budget of Service `key` (`<namespace>/<name>`) counts in its window.
+    pub(crate) fn window_retries(&self, key: &str) -> u64 {
+        let now = self.started.elapsed();
+        lock(&self.services).get(key).map_or(0, |s| s.counts(now).1)
     }
 
     /// The backend of a Service port.

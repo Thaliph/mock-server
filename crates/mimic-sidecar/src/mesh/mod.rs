@@ -688,6 +688,21 @@ impl MeshState {
         self.0.router.retry_state()
     }
 
+    /// Test hook (#449): the route deadlines armed now.
+    #[doc(hidden)]
+    pub fn armed_timers_for_test(&self) -> usize {
+        self.0
+            .router
+            .timers
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook (#449): the retries counted in the budget window of Service `key`.
+    #[doc(hidden)]
+    pub fn window_retries_for_test(&self, key: &str) -> u64 {
+        self.0.router.window_retries(key)
+    }
+
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
     pub(crate) fn off(&self) -> bool {
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
