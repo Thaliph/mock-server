@@ -78,6 +78,7 @@ minutes later.
 | `mimic_mesh_retry_budget_exhausted_total` | counter, retries refused because the retry budget of the Service was used up (see [Mesh](Mesh#retries)) | `backend` |
 | `mimic_mesh_retries_skipped_total` | counter, failures of a retried kind that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` | gauge, request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | none |
+| `mimic_mesh_mirrored_total` | counter, one per drawn mirror of a routed request ([Mesh](Mesh#mirroring)); the series appears at the first copy | `backend` (the mirror Service port, bounded by the view), `result` (`sent`: a response head came back, any status; `error`: none did, or the deadline passed; `skipped_body`: the body did not fit the replay buffer or did not end in time; `skipped_limit`: no free slot, 256 per mirror Service port and 1024 per sidecar) |
 | `mimic_mesh_stripped_headers_total` | counter, `x-mimic-*` fields removed from app responses by the inbound side | none |
 | `mimic_mesh_inbound_refusals_total` | counter, inbound connections answered `503` `connect-failed` because the app refused the connection (cleartext HTTP/1 and `h2c`) | none |
 | `mimic_mesh_unframed_closes_total` | counter, inbound connections closed because the app sent a response the sidecar cannot frame while the fields are removed | none |
@@ -93,6 +94,9 @@ minutes later.
 | `mimic_mesh_route_status_total` (counter, `status.parents[]` patches of HTTPRoutes) | `result` (`ok`, `conflict`, `error`) |
 | `mimic_mesh_view_builds_total` | `result` |
 | `mimic_mesh_view_build_duration_seconds`, `mimic_mesh_watches`, `mimic_mesh_view_truncated_total`, `mimic_mesh_view_cache_bytes` | none |
+
+Mirrors: `rate(mimic_mesh_mirrored_total{result!="sent"}[5m])` by `result` shows copies that were lost; `skipped_body`
+and `skipped_limit` rising are the bounds of [Mesh](Mesh#mirroring) at work, `error` is the mirror Service failing.
 
 A retry rate to watch: `rate(mimic_mesh_retries_total[5m])` by `reason`; `mimic_mesh_retries_skipped_total`
 with `reason="exhausted"` rising means requests ran out of tries; `mimic_mesh_retry_budget_exhausted_total`
