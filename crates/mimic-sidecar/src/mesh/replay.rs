@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
@@ -255,7 +255,9 @@ struct Shared {
     /// Wakes the try that last waited for the app's body.
     waker: Option<Waker>,
     /// The copies that wait for the end of the body: they get it whole, or `None`.
-    copies: Vec<(oneshot::Sender<Option<Held>>, Arc<AtomicBool>)>,
+    copies: Vec<oneshot::Sender<Option<Held>>>,
+    /// A copy was given the whole body.
+    given: bool,
     hint: SizeHint,
 }
 
@@ -272,12 +274,9 @@ impl Shared {
             trailers: self.trailers.clone(),
             hint: self.hint,
         });
-        for (copy, sent) in self.copies.drain(..) {
-            // The copy has its body and will be sent: the access line may say so, unless its
-            // task already gave up (deadline) and nobody gets the body.
-            if copy.send(held.clone()).is_ok() && held.is_some() {
-                sent.store(true, Ordering::SeqCst);
-            }
+        self.given |= held.is_some();
+        for copy in self.copies.drain(..) {
+            let _ = copy.send(held.clone());
         }
         if self.delivered {
             self.replay.release();
@@ -296,6 +295,15 @@ impl Shared {
 pub(crate) struct Source {
     shared: Arc<Mutex<Shared>>,
     hint: SizeHint,
+}
+
+/// Tells whether the body of a request was given to a copy (see [`Source::whole`]).
+pub(crate) struct Whole(Arc<Mutex<Shared>>);
+
+impl Whole {
+    pub(crate) fn given(&self) -> bool {
+        lock(&self.0).given
+    }
 }
 
 fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -318,6 +326,7 @@ impl Source {
                 delivered: false,
                 waker: None,
                 copies: Vec::new(),
+                given: false,
                 hint,
             })),
             hint,
@@ -377,7 +386,7 @@ impl Source {
         let mut shared = lock(&self.shared);
         shared.delivered = true;
         // A copy that gave up (its deadline) dropped its receiver: it holds nothing back.
-        shared.copies.retain(|(tx, _)| !tx.is_closed());
+        shared.copies.retain(|tx| !tx.is_closed());
         if shared.copies.is_empty() {
             shared.replay.release();
         }
@@ -385,8 +394,7 @@ impl Source {
 
     /// A copy that starts once the end of the body was read: `Some` with the whole body, or
     /// `None` when it does not fit the replay buffer or never came.
-    /// `sent` is set once the copy has its body (it is then sent or fails, never skipped).
-    pub(crate) fn defer(&self, sent: &Arc<AtomicBool>) -> oneshot::Receiver<Option<Held>> {
+    pub(crate) fn defer(&self) -> oneshot::Receiver<Option<Held>> {
         let (tx, rx) = oneshot::channel();
         let mut shared = lock(&self.shared);
         if shared.failed || shared.closed || !shared.replay.is_held() {
@@ -397,12 +405,17 @@ impl Source {
                 trailers: shared.trailers.clone(),
                 hint: shared.hint,
             };
-            sent.store(true, Ordering::SeqCst);
+            shared.given = true;
             let _ = tx.send(Some(held));
         } else {
-            shared.copies.push((tx, sent.clone()));
+            shared.copies.push(tx);
         }
         rx
+    }
+
+    /// Whether a copy of the request was given its whole body, a handle that outlives the call.
+    pub(crate) fn whole(&self) -> Whole {
+        Whole(self.shared.clone())
     }
 
     /// The request for one try: `head` and a body that starts with the bytes held.

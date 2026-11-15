@@ -33,7 +33,7 @@ use mimic_core::mesh::route::{
 use mimic_core::mesh::timeout::{self, Deadline, Kind};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Sleep;
 
 use super::MeshState;
@@ -41,7 +41,7 @@ use super::dial::CLUSTER_CONNECT_TIMEOUT;
 use super::gate::{Gate, Progress};
 use super::metrics::{Call, INVALID_BACKEND, NO_BACKEND};
 use super::pool::{self, Lease, Protocol, Sent};
-use super::replay::{Attempt, Held, Source};
+use super::replay::{Attempt, Held, Source, Whole};
 use super::router::{Backend, InFlight, Plan, Routed, Slot};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
@@ -770,6 +770,9 @@ impl Serving {
         let mut original = Some(self.ctx.dst);
         let mut response_modifier = None;
         let mut timeouts = None;
+        // The copies wait for it: it opens at the primary's response head, or when the call
+        // ends without one (spec §7.9 "Mirrors", "Start").
+        let mut gate = None;
         if let Some(routed) = &routed {
             match self.select(routed, &head) {
                 Selected::Rule {
@@ -789,7 +792,7 @@ impl Serving {
                     if let Some(modifier) = filters.and_then(|f| f.request_headers.as_ref()) {
                         modifier.apply(&mut Fields(&mut head.headers));
                     }
-                    self.mirror(
+                    gate = self.mirror(
                         mirrors,
                         (&head, as_sent.as_ref()),
                         (body_state, &source),
@@ -937,6 +940,7 @@ impl Serving {
                         other => self.not_retried(&drawn, other),
                     }
                     source.release();
+                    drop(gate.take());
                     let Conn { pick, lease } = conn;
                     if let Some(modifier) = response_modifier {
                         modifier.apply(&mut Fields(response.headers_mut()));
@@ -1103,9 +1107,10 @@ impl Serving {
         }
     }
 
-    /// Decides the copies of the request for the `mirrors` of its rule and starts those that
-    /// can start now (spec §7.9 "Mirrors"). Nothing here waits. `sent` is set when a copy is sure to be
-    /// sent: at once for a request without a body, else when its body ended whole.
+    /// Decides the copies of the request for the `mirrors` of its rule and spawns their tasks
+    /// (spec §7.9 "Mirrors"). Nothing here waits: the copies start when the returned [`MirrorGate`]
+    /// opens. `sent` is set when a copy is sure to be sent: when the gate opens for a request
+    /// without a body (before its deadline), else by the copy once it has its body.
     fn mirror(
         &self,
         mirrors: &[MirrorView],
@@ -1113,10 +1118,10 @@ impl Serving {
         (body, source): (mirror::Body, &Source),
         (timeouts, began): (Option<&TimeoutsView>, Instant),
         (protocol, sent): (Protocol, &Arc<AtomicBool>),
-    ) {
+    ) -> Option<MirrorGate> {
         // No copy starts after `SIGTERM`: none is decided, so none is claimed as sent.
         if mirrors.is_empty() || self.mesh.stopping() {
-            return;
+            return None;
         }
         let router = self.mesh.router();
         let labels: Vec<String> = mirrors
@@ -1139,6 +1144,8 @@ impl Serving {
             .checked_add(Duration::from_millis(ms))
             .unwrap_or_else(|| Instant::now() + router.mirror_timeout);
         let decided = router.mirror_decide(&candidates, body, share);
+        let (open, go) = watch::channel(());
+        let (mut bodiless, mut awaiting) = (false, false);
         for ((m, label), decision) in mirrors.iter().zip(&labels).zip(decided) {
             let Some((decision, slot)) = decision else {
                 continue;
@@ -1153,13 +1160,13 @@ impl Serving {
                         continue;
                     };
                     // A body is waited for by the copy, in its own task, never by the request.
-                    let body =
-                        (decision == mirror::Decision::AwaitBody).then(|| source.defer(sent));
-                    if decision == mirror::Decision::Send {
-                        sent.store(true, Ordering::SeqCst);
-                    }
+                    let body = (decision == mirror::Decision::AwaitBody).then(|| source.defer());
+                    bodiless |= decision == mirror::Decision::Send;
+                    awaiting |= decision == mirror::Decision::AwaitBody;
                     let copy = Copy {
                         body,
+                        go: go.clone(),
+                        sent: sent.clone(),
                         mesh: self.mesh.clone(),
                         backend,
                         protocol,
@@ -1181,6 +1188,13 @@ impl Serving {
             };
             router.metrics.mirrored(label, result);
         }
+        Some(MirrorGate {
+            open: Some(open),
+            sent: sent.clone(),
+            bodiless,
+            body: awaiting.then(|| source.whole()),
+            deadline,
+        })
     }
 
     /// The delay before the try that follows a try that ended with `outcome`.
@@ -1325,6 +1339,29 @@ impl CopyHead {
     }
 }
 
+/// What holds the copies of a request back until the primary's response head arrived or the call
+/// ended without one (spec §7.9 "Mirrors", "Start"): dropping it, when the call ends or its
+/// future is dropped (the client left), opens it as well.
+struct MirrorGate {
+    open: Option<watch::Sender<()>>,
+    /// Set when it opens before the deadline and a copy without a body, or one that already has
+    /// its body, is then sent (or fails).
+    sent: Arc<AtomicBool>,
+    bodiless: bool,
+    body: Option<Whole>,
+    deadline: Instant,
+}
+
+impl Drop for MirrorGate {
+    fn drop(&mut self) {
+        let ready = self.bodiless || self.body.as_ref().is_some_and(Whole::given);
+        if ready && Instant::now() < self.deadline {
+            self.sent.store(true, Ordering::SeqCst);
+        }
+        self.open.take();
+    }
+}
+
 /// A copy of a request on its way to a pod of a mirror (spec §7.9 "Mirrors"): one try, in its
 /// own task and on pools of its own, never awaited by the request. It holds its slot until it
 /// ends.
@@ -1337,6 +1374,10 @@ struct Copy {
     /// The body, when the request has one: it comes once its end was read from the app, whole,
     /// or never (`None`).
     body: Option<oneshot::Receiver<Option<Held>>>,
+    /// Opens at the primary's response head, or at its end without one.
+    go: watch::Receiver<()>,
+    /// Set once a copy with a body has it and the primary's head is there.
+    sent: Arc<AtomicBool>,
     /// When the copy is given up, wherever it is.
     deadline: Instant,
     _slot: Slot,
@@ -1360,6 +1401,19 @@ impl Copy {
                 }
             },
         };
+        // Not before the primary's head; the sender is dropped when the call ends.
+        if tokio::time::timeout_at(at, self.go.changed())
+            .await
+            .is_err()
+        {
+            if !self.mesh.stopping() {
+                router.metrics.mirrored(&self.backend.label, "error");
+            }
+            return;
+        }
+        if held.is_some() && Instant::now() < self.deadline {
+            self.sent.store(true, Ordering::SeqCst);
+        }
         // No copy starts after `SIGTERM`; those in flight are dropped with the process.
         if self.mesh.stopping() {
             return;
