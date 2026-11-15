@@ -117,6 +117,14 @@ plus 20 % of the requests): the failure is returned as it is, counted in
 (`suppressed` counts the others). Fix the failing pods; to allow more retries raise `retryBudget` in a
 `MimicConfig` on the Service ([Mesh](Mesh#retries)). `retries: 0` turns the retries off on purpose.
 
+**`504` with `x-mimic-error: timeout`.** A route timeout expired before the pod's response head
+([Mesh](Mesh#timeouts)). The access line has `result: timeout` and `timeout: request` or `backendRequest`
+(which of the rule's two it was); `mimic_mesh_requests_total{reason="timeout"}` rises. Raise the timeout in the
+`HTTPRoute` rule, or find why the pod is slow. A timeout is never retried, and the pod may still have processed
+the request. When it expired after the head the app sees a cut response (a closed HTTP/1 connection, an HTTP/2
+`INTERNAL_ERROR`) and the access line has the pod's status. A producer route in the callee's namespace binds
+callers that have no route of their own: check `kubectl get httproute -A`.
+
 **`503` with `x-mimic-error: connect-failed` after 4 tries.** Every pod tried and the ClusterIP refused the
 connection (`mimic_mesh_retries_skipped_total{reason="exhausted"}`). Check the pods' ports and, over
 intercepted TLS, their certificates (`tls verification failed` lines).

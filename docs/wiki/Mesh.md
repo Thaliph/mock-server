@@ -257,7 +257,7 @@ With the Gateway API CRDs installed ([Install](Install#gateway-api-optional)), t
 `HTTPRoute` (`gateway.networking.k8s.io/v1`) whose `parentRefs` name a **Service** (`group: ""`, `kind: Service`;
 the GAMMA convention), compiles it and puts it in the views of the callers it applies to. Routes with Gateway
 parents are ignored. **The sidecar applies the matches, the backend weights and the header modifiers of a
-route** (below); timeouts are #449 and mirrors #450, and the sidecar does not apply them yet.
+route**, timeouts included ([Timeouts](#timeouts)); mirrors are #450, and the sidecar does not apply them yet.
 
 **Supported**, per rule: `matches` with `path` (`Exact`, `PathPrefix`), `headers` and `queryParams` of type
 `Exact`, `method`; `backendRefs` to Services with `port` and `weight`; the filters `RequestHeaderModifier`,
@@ -381,6 +381,40 @@ does not exist stays empty, and entries mimic wrote stay after `helm uninstall`.
 Older Gateway API CRDs than 1.2 make the API server prune `timeouts` before mimic reads a route; with the
 experimental channel a route with a field mimic does not know is `UnsupportedValue`, never half-applied.
 
+### Timeouts
+
+A rule's `timeouts` bound the requests it routes (Gateway API `HTTPRouteTimeouts`, CRDs 1.2 or later):
+
+```yaml
+rules:
+  - backendRefs: [{name: slow, port: 80}]
+    timeouts:
+      request: 3s          # the whole call
+      backendRequest: 1s   # one try
+```
+
+- `request` bounds the **whole call**: it starts when the sidecar has the request head and covers every try, the
+  connects, the pool waits, the pauses between tries, the fallback to the original destination and the response
+  body up to its last byte.
+- `backendRequest` bounds **one try**: it starts when the try's request is handed to its connection (connect and
+  pool wait keep `MIMIC_MESH_CONNECT_TIMEOUT`) and runs to the last byte of that try's response. Each try has its
+  own, and none outlives what is left of `request`.
+- **Before the response head**, the sidecar answers `504` with `x-mimic-error: timeout`. **After the head**, the
+  response cannot be changed: an HTTP/1 connection to the app is closed and an HTTP/2 stream is reset with
+  `INTERNAL_ERROR`, so the app sees a cut response.
+- **A timeout is never retried** and asks nothing of the retry budget ([Retries](#retries)). The pod is not
+  avoided either.
+- `0s` turns a timeout off, same as leaving it out. **There is no default timeout**: a request that no rule
+  routes (no route, a stale view, mode `mock`, `Upgrade`, `CONNECT`, L4) has none.
+- Nothing in the request sets or extends a timeout: `grpc-timeout`, `x-envoy-upstream-rq-timeout-ms` and
+  `x-mimic-*` fields are never read.
+- The expiry is in the access line (`result: timeout` and `timeout`, [Access logs](Access-logs)) and in
+  `mimic_mesh_attempts_total{result="timeout"}` and `mimic_mesh_requests_total{reason="timeout"}`
+  ([Monitoring](Monitoring)).
+
+A route of the callee's namespace sets the timeouts of every caller that has no route of its own; a route of the
+caller's namespace overrides it ([Limits](#limits)).
+
 ## Observability
 
 Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `backend` is
@@ -393,7 +427,7 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 | `mimic_mesh_endpoint_requests_total` | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | `backend`, `endpoint` |
 | `mimic_mesh_reconnects_total`, `mimic_mesh_fallbacks_total` | `backend` |
-| `mimic_mesh_attempts_total` (every try, to a pod or to the original destination; a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_attempts_total` (every try, to a pod or to the original destination; a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`, `timeout`) |
 | `mimic_mesh_retries_total` (tries after the first) | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
 | `mimic_mesh_retries_skipped_total` (a retried kind of failure that was not retried) | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` (gauge, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL`) | none |
@@ -456,8 +490,19 @@ parse, once per streak), `tls verification failed`.
   address) and `x-mimic-origin: inbound; pod=<name>`, and every method is retried on another pod. Over inbound
   TLS, which it does not decrypt, it closes the connection without a byte: only the idempotent methods
   above are retried, a `POST` gets the close. With the mesh off nothing is answered.
-- **No timeout yet.** A try that gets neither an answer nor a close waits as long as the app's own connection
-  does; per-try and per-request timeouts come with #449.
+- **No timeout without a route.** A request that no rule with `timeouts` routes waits as long as the app's own
+  connection does; mimic sets no default ([Timeouts](#timeouts)).
+- **A route timeout counts the app's own pace.** `request` and `backendRequest` run until the last byte of the
+  response is handed to the app: an app that reads a large response slowly, or sends its request body slowly,
+  can time its own call out.
+- **A cut close-delimited response can look complete.** After the head a timeout closes the app's HTTP/1
+  connection; an HTTP/1.0 response with neither `content-length` nor chunked framing ends at the close, so the
+  app cannot tell it was cut. HTTP/1.1 and HTTP/2 apps always see the cut.
+- **A producer route's timeouts bind every caller.** A route of the callee's namespace sets the timeouts of every
+  caller without a route of its own, as it sets their weights: `request: 1ms` makes every such call answer `504`.
+  A route of the caller's namespace overrides it.
+- **A timed-out request may have been processed.** A `504` says no complete response came back in time, not that
+  the pod did nothing. This is why a timeout is never retried.
 - **Inbound heads are held when the mesh is on.** The inbound HTTP/1 relay writes a final response head once
   it is whole (at most 64 KiB) instead of as it is read: timing only, no byte changes but the `x-mimic-*`
   lines.
@@ -469,8 +514,8 @@ parse, once per streak), `tls verification failed`.
 ## What is coming
 
 - **M2**: retries of proxy-level failures on another pod are in (above); the retry budget and
-  `MimicConfig.retries` are next (#446), then timeouts (#449).
-- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts #449, mirrors #450.
+  `MimicConfig.retries` are next (#446).
+- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts are in ([Timeouts](#timeouts)), mirrors #450.
 - **M4**: outlier detection, circuit breaker and fault injection.
 - **M5**: admission contract, failure signalling and HPA.
 - **M6**: north-south gateway.

@@ -67,13 +67,13 @@ minutes later.
 
 | Metric (sidecar) | Type | Labels |
 |---|---|---|
-| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (the matched route `<namespace>/<name>`, `none` without a match; at most 256 distinct values, the next ones are `other`, and the series of a route that left the view go 5 minutes later), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, among them `no-route` (no rule of the port's routes matched), `no-backend` (every weight of the rule is 0) and `invalid-backend` (the drawn backend is not valid), or that of a trusted refusal passed to the app) |
+| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (the matched route `<namespace>/<name>`, `none` without a match; at most 256 distinct values, the next ones are `other`, and the series of a route that left the view go 5 minutes later), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, among them `timeout` (a route timeout expired before the response head, [Mesh](Mesh#timeouts)), `no-route` (no rule of the port's routes matched), `no-backend` (every weight of the rule is 0) and `invalid-backend` (the drawn backend is not valid), or that of a trusted refusal passed to the app) |
 | `mimic_mesh_request_duration_seconds` | histogram, until the response head, spanning every try | `service`, `backend`, `status_class` |
 | `mimic_mesh_endpoint_requests_total` | counter, each try written to a pod | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
 | `mimic_mesh_reconnects_total` | counter, requests sent again on a new connection because nothing of them was written | `backend` |
 | `mimic_mesh_fallbacks_total` | counter, requests and L4 connections sent to the original destination (the ClusterIP) | `backend` |
-| `mimic_mesh_attempts_total` | counter, every try to a pod or to the original destination (a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_attempts_total` | counter, every try to a pod or to the original destination (a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`, `timeout`: a route timeout expired before the try's response head) |
 | `mimic_mesh_retries_total` | counter, tries after the first | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
 | `mimic_mesh_retry_budget_exhausted_total` | counter, retries refused because the retry budget of the Service was used up (see [Mesh](Mesh#retries)) | `backend` |
 | `mimic_mesh_retries_skipped_total` | counter, failures of a retried kind that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
