@@ -101,6 +101,10 @@ cleanup() {
     # Only the CRDs this run installed: a cluster that had them keeps them.
     [[ -z ${RTE_21_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${RTE_93_CLEANUP:-} ]]; then
+    kubectl delete namespace rte-93 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    [[ -z ${RTE_93_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n ${RTE_71_CLEANUP:-} ]]; then
     kubectl delete namespace rte-71 --ignore-not-found --wait=false >/dev/null 2>&1 || true
     [[ -z ${RTE_71_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -5844,6 +5848,209 @@ kubectl delete namespace rte-71 --wait=false >/dev/null
 RTE_71_CLEANUP=
 RTE_71_CRDS=
 echo "rte_71: request: 200ms gave /slow 504 timeout in $rte_71_seconds s with its metrics and access line, /fast stayed 200, and request: 0s gave /slow 200"
+
+# --- Request mirror (#450, spec §12.26 RTE-93) ---------------------------------------------------------------------------------
+# Objects of this section only: rte-93 (injected: client, which calls; cart, which answers 200; cart-shadow, which counts the
+# requests and bodies it receives and answers 500). The Gateway API CRDs are handled as in rte_55: the pinned manifest of
+# msh_28, installed here, removed at the end when this section installed them.
+log "rte_93: a RequestMirror copies 100 POSTs with their bodies to cart-shadow, the route without it stops the copies"
+[[ -s $WORK/gateway-standard.yaml ]] || fail "rte_93: the pinned Gateway API manifest of msh_28 is missing"
+RTE_93_CLEANUP=1
+# rte_71 deleted the CRDs without waiting: let a deletion in progress end before installing them again.
+for _ in $(seq 60); do
+  [[ -n $(kubectl get crd httproutes.gateway.networking.k8s.io -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true) ]] || break
+  sleep 1
+done
+if [[ -z $(kubectl get crd httproutes.gateway.networking.k8s.io -o name 2>/dev/null || true) ]]; then RTE_93_CRDS=1; fi
+kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+ns_fresh rte-93 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+rte_93_app() { # rte_93_app <name> <status>: a Deployment and a Service answering <status> to every request and counting what it received (GET /stats)
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Service
+metadata: {name: $1, namespace: rte-93}
+spec:
+  selector: {app: $1}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $1, namespace: rte-93}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: $1}}
+  template:
+    metadata: {labels: {app: $1}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          env: [{name: STATUS, value: "$2"}]
+          command: [python3, -c]
+          args:
+            - |
+              import http.server, json, os, threading
+              lock = threading.Lock()
+              count = 0
+              bodies = set()
+              class H(http.server.BaseHTTPRequestHandler):
+                  protocol_version = "HTTP/1.1"
+                  def reply(self, status, body):
+                      self.send_response(status)
+                      self.send_header("content-length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  def do_GET(self):
+                      global count
+                      if self.path == "/stats":
+                          with lock:
+                              self.reply(200, json.dumps({"count": count, "bodies": sorted(bodies)}).encode())
+                      else:
+                          with lock:
+                              count += 1
+                          self.reply(int(os.environ["STATUS"]), b"x")
+                  def do_POST(self):
+                      global count
+                      body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                      with lock:
+                          count += 1
+                          bodies.add(body.decode())
+                      self.reply(int(os.environ["STATUS"]), b"x")
+                  def log_message(self, *args):
+                      pass
+              http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+YAML
+}
+rte_93_app cart 200
+rte_93_app cart-shadow 500
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: rte-93}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for dep in cart cart-shadow client; do kubectl -n rte-93 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_93: $dep did not roll out Ready"; done
+# rte_93_until <timeout seconds> <description> <command...>: polls the command once a second.
+rte_93_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "rte_93: $desc"
+}
+admin_forward
+rte_93_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
+rte_93_client=$(kubectl -n rte-93 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+# rte_93_post <first> <count>: "<200 answers> <others>" of count POSTs from client to cart, the body of the n-th being
+# 1 KiB made of the number n (four digits, 256 times).
+rte_93_post() {
+  kubectl -n rte-93 exec deploy/client -c app -- python3 -c '
+import sys, urllib.error, urllib.request
+first, count = int(sys.argv[1]), int(sys.argv[2])
+ok = other = 0
+for n in range(first, first + count):
+    request = urllib.request.Request("http://cart.rte-93.svc/", data=("%04d" % n).encode() * 256, method="POST")
+    try:
+        status = urllib.request.urlopen(request, timeout=10).status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    if status == 200:
+        ok += 1
+    else:
+        other += 1
+print(ok, other)
+' "$1" "$2"
+}
+# rte_93_stats <jq expression>: the expression applied to cart-shadow's /stats ({count, bodies}), read from client.
+rte_93_stats() {
+  kubectl -n rte-93 exec deploy/client -c app -- python3 -c '
+import urllib.request
+print(urllib.request.urlopen("http://cart-shadow.rte-93.svc/stats", timeout=10).read().decode())
+' | jq -r "$1"
+}
+# rte_93_sent: the sent copies the sidecar of client counted for cart-shadow.
+rte_93_sent() {
+  sidecar_metrics rte-93 "$rte_93_client" \
+    | awk 'index($0, "mimic_mesh_mirrored_total{") == 1 && index($0, "backend=\"rte-93/cart-shadow:80\"") && index($0, "result=\"sent\"") { sum += $NF } END { print sum + 0 }'
+}
+# rte_93_access <jq boolean>: the number of access lines of the sidecar of client for which the boolean holds.
+rte_93_access() {
+  kubectl -n rte-93 logs "$rte_93_client" -c mimic-sidecar 2>/dev/null \
+    | jq -R -r "fromjson? | select(.target == \"access\" and ($1)) | 1" | wc -l | tr -d ' '
+}
+
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-mirror, namespace: rte-93}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - backendRefs: [{name: cart, port: 80}]
+      filters:
+        - type: RequestMirror
+          requestMirror: {backendRef: {name: cart-shadow, port: 80}}
+YAML
+# Until the sidecar holds the route nothing is mirrored: wait for the first copy (body 0000, outside the 100 below).
+rte_93_first_copy() { rte_93_post 0 1 >/dev/null || return 1; [[ $(rte_93_stats '.count') -ge 1 ]]; }
+rte_93_until 60 "no request was mirrored to cart-shadow within 60 s of the route" rte_93_first_copy
+rte_93_has_sent() { [[ $(rte_93_sent) -ge 1 ]]; }
+rte_93_until 15 "the first copy was not counted sent by the sidecar of client" rte_93_has_sent
+rte_93_count_before=$(rte_93_stats '.count')
+rte_93_sent_before=$(rte_93_sent)
+rte_93_access_before=$(rte_93_access '.direction == "outbound" and .mirrored == true')
+rte_93_answers=$(rte_93_post 1 100) || fail "rte_93: the 100 POSTs to cart failed"
+[[ $rte_93_answers == "100 0" ]] || fail "rte_93: 100 POSTs to cart gave '$rte_93_answers' (200 others), 100 0 expected: the mirror's 500 reached the app"
+rte_93_copies() { [[ $(rte_93_stats '.count') -ge $((rte_93_count_before + 100)) ]]; }
+rte_93_until 15 "cart-shadow did not receive 100 more requests within 15 s" rte_93_copies
+[[ $(rte_93_stats '.count') -eq $((rte_93_count_before + 100)) ]] || fail "rte_93: cart-shadow received $(( $(rte_93_stats '.count') - rte_93_count_before )) requests for 100 POSTs, 100 expected"
+rte_93_same=$(rte_93_stats '[.bodies[] | select(length == 1024) | .[0:4] as $k | select(. == ([range(256) | $k] | join(""))) | $k | tonumber | select(. >= 1 and . <= 100)] | unique | length')
+[[ $rte_93_same == 100 ]] || fail "rte_93: cart-shadow received $rte_93_same of the 100 distinct 1 KiB bodies sent, 100 expected"
+rte_93_sent_grew() { [[ $(rte_93_sent) -eq $((rte_93_sent_before + 100)) ]]; }
+rte_93_until 15 "mimic_mesh_mirrored_total{result=\"sent\"} for cart-shadow did not grow by exactly 100" rte_93_sent_grew
+rte_93_access_grew() { [[ $(rte_93_access '.direction == "outbound" and .mirrored == true') -ge $((rte_93_access_before + 100)) ]]; }
+rte_93_until 15 "fewer than 100 new access lines of client have mirrored true" rte_93_access_grew
+echo "rte_93: 100 POSTs got 200 from cart and 100 copies with their bodies reached cart-shadow, counted sent with mirrored true"
+
+# The route without the mirror: the counter stops growing.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-mirror, namespace: rte-93}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - backendRefs: [{name: cart, port: 80}]
+YAML
+rte_93_stopped() {
+  local before
+  before=$(rte_93_stats '.count')
+  rte_93_post 200 5 >/dev/null || return 1
+  sleep 2
+  [[ $(rte_93_stats '.count') -eq $before ]]
+}
+rte_93_until 60 "cart-shadow kept receiving copies 60 s after the route lost its mirror" rte_93_stopped
+rte_93_count_after=$(rte_93_stats '.count')
+rte_93_answers=$(rte_93_post 300 20) || fail "rte_93: the 20 POSTs to cart after the mirror was removed failed"
+[[ $rte_93_answers == "20 0" ]] || fail "rte_93: 20 POSTs to cart without the mirror gave '$rte_93_answers', 20 0 expected"
+sleep 3
+[[ $(rte_93_stats '.count') -eq $rte_93_count_after ]] || fail "rte_93: cart-shadow's counter grew from $rte_93_count_after to $(rte_93_stats '.count') after the mirror was removed"
+
+kubectl delete namespace rte-93 --wait=false >/dev/null
+[[ -z ${RTE_93_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
+RTE_93_CLEANUP=
+RTE_93_CRDS=
+echo "rte_93: copies reached cart-shadow with their bodies while the route mirrored, stopped within a view update after it did not, and cart always answered 200"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
