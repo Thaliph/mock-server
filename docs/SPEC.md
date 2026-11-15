@@ -375,6 +375,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `backend`, `upstream` | (M1) mesh-routed requests only (§7.9): `<namespace>/<name>:<port>` of the Service port and the pod `ip:port` the request went to | (M1) L4-balanced connections only (§7.9): the same two fields |
   | `attempts` | (M2) mesh-routed requests only: the number of tries (§7.9 "Retries"), 1 without a retry | (M2) L4-balanced connections only: the number of connects tried |
   | `route`, `rule` | (M3, #448) mesh-routed requests that a route rule matched (§7.9 "Routing"): the route's `<namespace>/<name>` and the index of the rule in it (0 first); absent otherwise. `backend` is then the backend Service port drawn, absent when none was (a `no-route`, `no-backend` or `invalid-backend` answer) | — |
+  | `reason` | (M4, #451) mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, …; §7.9); absent otherwise, also for a trusted refusal passed as received. A `breaker-open` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts` | — |
   | `timeout` | (M3, #449) with `result: timeout` only: the route timeout that expired, `request` or `backendRequest` (§7.9 "Routing") | — |
   | `mirrored` | (M3, #450) `true` when at least one copy of the request was sent to a mirror of the matched rule (§7.9 "Routing", "Mirrors"; result `sent` or `error`), absent otherwise (no mirror, none drawn, every one skipped). It is read when the line is written: a copy still waiting for a body that has not ended then (HTTP/2 full duplex, the request body ending after the response) is not counted, so the field never claims a copy that was not sent | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
@@ -488,8 +489,8 @@ Accepted limits of the proxy:
   The mesh adds answers of its own: `503` `x-mimic-error: no-endpoint` (the Service port has
   no endpoint) and `503` `x-mimic-error: connect-failed`, `502` `x-mimic-error:
   invalid-response`, from #448 `404` `no-route` and `500` `no-backend` and `invalid-backend`,
-  from #449 `504` `x-mimic-error: timeout` (a route timeout, §7.9 "Routing"), all with
-  `content-length: 0`. They are not recorded by discovery.
+  from #449 `504` `x-mimic-error: timeout` (a route timeout, §7.9 "Routing"), from #451 `503`
+  `x-mimic-error: breaker-open` (§7.9 "Circuit breaker"), all with `content-length: 0`. They are not recorded by discovery.
   From M2 a mesh-routed request whose failure came before the app could process it is tried
   again on another pod (§7.9 "Retries"): an app sees no difference, a pod can see a request
   another pod refused, and an idempotent request that a pod read and then dropped without an
@@ -1184,16 +1185,23 @@ the recorder keeps the first message of each side:
   most 4 tries, `0` disables retries and the fallback to the ClusterIP, §7.9 "Retries") and
   `retryBudget` (`percent`, integer 0 to 100, default 20; `minPerSecond`, integer 0 to 1000,
   default 10; `window`, `<n>s`, 1 to 60 s, default 10 s; each field absent takes its default
-  alone, §7.9 "Retry budget"). A field that fits no
-  target kind of the object is rejected by CEL. Breaker, faults and admission are added by
-  later milestones. `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
+  alone, §7.9 "Retry budget"); from M4 (#451) `outlierDetection` (`consecutiveFailures`,
+  integer 1 to 100, default 5; `consecutive5xx`, integer 0 to 100, default 0 = off;
+  `baseEjectionTime`, `<n>s`, 1 to 300 s, default 30 s; `maxEjectionPercent`, integer 0 to
+  100, default 50, `0` turns ejection off; §7.9 "Outlier detection") and `circuitBreaker`
+  (`maxRequests`, integer 1 to 100000, default 1024; `maxConnections`, integer 1 to 100000,
+  default 1024; §7.9 "Circuit breaker"), each field absent taking its default alone. A field
+  that fits no target kind of the object is rejected by CEL. Faults and admission are added by
+  later milestones (#452, M5). `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
   `Invalid`) and `ResolvedRefs` (False: `RefNotPermitted`). **Precedence** (pure, `mimic-core`
   `mesh::policy`): for each target object, the valid `MimicConfig`s that target it are ordered by
   `creationTimestamp`, then by name; the first wins as a whole, the others are `Conflicted` (a config
   with several targets can win one and lose another; it applies where it wins). An invalid object
   takes no part in the precedence. `Accepted` reads `Invalid` before `TargetNotFound` before
   `Conflicted`. Defaults without any `MimicConfig`: slow start 30 s, `mesh.enabled: true`,
-  `retries: 3`, `retryBudget: {percent: 20, minPerSecond: 10, window: 10s}`.
+  `retries: 3`, `retryBudget: {percent: 20, minPerSecond: 10, window: 10s}`, from M4
+  `outlierDetection: {consecutiveFailures: 5, consecutive5xx: 0, baseEjectionTime: 30s,
+  maxEjectionPercent: 50}` and `circuitBreaker: {maxRequests: 1024, maxConnections: 1024}`.
 - From M3 (#447), Gateway API `HTTPRoute`s (`gateway.networking.k8s.io/v1`, when the CRD exists,
   §2) whose `parentRefs` name a Service (GAMMA) are read by both replicas, validated, compiled into
   the views of the callers they apply to and reported in their `status.parents[]` (§7.9 "Routes").
@@ -2569,8 +2577,10 @@ no insignificant whitespace):
 {"cluster":"local","format":1,"generations":{"mimicconfig/shop/cart@5b1c":3},"mesh":true,"mode":"none",
  "services":{"shop/cart":{"endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},
   "generations":{"endpointslice/shop/cart-x7k2p@9f3a":41},"ips":["10.96.12.7"],
-  "policy":{"loadBalancer":{"slowStartSeconds":30},"retries":3,
-   "retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}
+  "policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":30},
+   "outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},
+   "retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},
+  "ports":{"80":{"name":"http","targetPort":"http"}}}}}
 ```
 
 - **Scope**: every Service of `n`, and the Services declared in `spec.destinations` of the winning
@@ -2592,8 +2602,11 @@ no insignificant whitespace):
   the ready ones, else the serving and terminating ones with `ready: false`, sorted by address and
   port, without duplicates, with the `zone` when there is one; the `generations` of those
   EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none
-  (from #446 the policy always holds `retries` and `retryBudget`, every field set; the view is
-  unreleased before M2, so its `format` stays 1 and `from_json` refuses any other policy field).
+  (from #446 the policy always holds `retries` and `retryBudget`, every field set, and from
+  #451 `outlierDetection` and `circuitBreaker`, every field set; the mesh view is in no release
+  yet, so its `format` stays 1 and `from_json` refuses any other policy field and a missing
+  one; a later policy field, such as the `faults` of #452, is added the same way while the view
+  is unreleased, and with a new `format` after the first release that carries it).
   `mesh: false` (the winning config of `d` says so) gives a view without Services and without
   `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The `generations` of a consented Service name its winning `MimicConfig` of the destination's namespace
   (`mimicconfig/<namespace>/<name>@<uid>`): decided, kept as is, because the consent already shares that
@@ -2793,8 +2806,10 @@ no insignificant whitespace):
   **Pools** are per (pod IP, port, protocol), the protocol being the one the app spoke
   (HTTP/1 or HTTP/2, never upgraded). HTTP/2: connections multiplexed, a new one (at most 16 per
   pod) when none has a free stream (the peer's `MAX_CONCURRENT_STREAMS` is reached). HTTP/1: one
-  request at a time per connection, at most 1024 connections per pod (a request over that waits
-  for one to be free), `hyper`'s client with `preserve_header_case`. The slot of a connection
+  request at a time per connection, at most 1024 connections per pool (from M4, #451, the
+  `policy.circuitBreaker.maxConnections` of the request's backend Service, "Circuit breaker"
+  below; a request over that waits for one to be free), `hyper`'s client with
+  `preserve_header_case`. The slot of a connection
   being opened is given back when the request that waits for it is cancelled. A reconnect after
   an unwritten request keeps the healthy idle connections of the pool. A connection idle for
   `MIMIC_MESH_POOL_IDLE_TIMEOUT` is closed. An endpoint that leaves the view stops being chosen
@@ -2812,7 +2827,9 @@ no insignificant whitespace):
   it is picked only when no other endpoint can be (a Service with one endpoint still tries it
   first, then the ClusterIP), and a connect to it that succeeds ends the avoidance at once; after
   the 5 s it is a normal candidate again, and a failure starts the 5 s anew. So a blackholed pod
-  costs one connect timeout, not one per request. A **stale view** (older than
+  costs one connect timeout, not one per request. From M4 (#451) avoidance stays as it is and
+  **outlier ejection** ("Outlier detection" below) comes on top: avoidance is the soft, at once
+  penalty of one failed connect, ejection the hard exclusion after a streak of failures. A **stale view** (older than
   `MIMIC_MESH_STALE_AFTER`, the time of §7.9 "Age and readiness") is not used for pod
   addresses: new connections to its Services keep the byte relay, and each request of a
   connection already mesh-routed goes to the ClusterIP and is counted as a fallback, so a dead
@@ -2987,8 +3004,8 @@ no insignificant whitespace):
       back to its pool (so a late response can never answer another request), an HTTP/2
       stream to the pod is reset with `CANCEL` and its connection stays pooled for its other
       streams. The bytes held for replay are released, the pod's `in_flight` is decremented,
-      and the pod is **not avoided** (a slow pod is not a failed connect; outlier detection is
-      M4).
+      and the pod is **not avoided** (a slow pod is not a failed connect) and the try counts
+      nothing for outlier detection (#451, "Outlier detection" below).
     - **Not retried**: an expiry ends the request, whatever the method and the tries left; it
       asks nothing of the retry budget (§7.9 "Retries"). An expiry during a connect, a pool
       wait or the delay before a retry also answers `504` and starts no new try.
@@ -3033,8 +3050,10 @@ no insignificant whitespace):
       keeps it while its copy waits for the primary; at
       most **256** copies are in flight per mirror Service port and **1024** for the sidecar
       in total (the `mirror_max_in_flight` and `mirror_max_in_flight_total` fields of the
-      sidecar's `MeshConfig`, no `MIMIC_*` variable; M4 decides whether `circuitBreaker.
-      maxRequests` replaces the first). Without a free slot the copy is skipped (`result
+      sidecar's `MeshConfig`, no `MIMIC_*` variable; decided on #451: `circuitBreaker.
+      maxRequests` does not replace them, a copy takes no breaker slot and is never answered
+      `breaker-open`, so that copies can never fill the breaker of a Service that also serves
+      primary requests). Without a free slot the copy is skipped (`result
       ="skipped_limit"`) and nothing is held for it. A slot is given back when its copy ends
       (response read to its end, failure, deadline) or is skipped.
     - **Body**: a copy carries the whole body or is not sent. A request without a body (HTTP/1
@@ -3061,8 +3080,12 @@ no insignificant whitespace):
       (no marker): the copy is the request as the backend would see it.
     - **Where and how**: one try, to a pod of the mirror Service port chosen by the P2C of "Load
       balancing" over its endpoints (the same endpoint state: its `in_flight` counts the copy,
-      slow start and avoidance apply, a failed connect starts the avoidance), over **pools of
-      its own**, per (pod IP, port, protocol), apart from the pools of other requests (so a slow
+      slow start and avoidance apply, a failed connect starts the avoidance; from #451 ejected
+      endpoints are excluded, a copy with every endpoint ejected is `error`, and the copy's
+      proxy-level outcome counts for outlier detection as a try's does, never its status),
+      over **pools of
+      its own**, per (pod IP, port, protocol), bounded like the others by the mirror Service's
+      `maxConnections` from #451, apart from the pools of other requests (so a slow
       mirror never takes a connection a primary request could use), in the protocol the app
       spoke (HTTP/1 or HTTP/2; over intercepted TLS, TLS verified against the name the app sent,
       as for a backend). **Never retried**, no fallback to the ClusterIP, no retry budget asked
@@ -3140,7 +3163,9 @@ no insignificant whitespace):
     the view, so the sidecar holds at most one budget per Service of its view
     (`MIMIC_MESH_MAX_SERVICES`). Without failures the budget costs one short lock per request.
   - **Where**: each retry goes to a pod **not tried yet** for this request, chosen by the P2C
-    above among those (avoidance applies); when every endpoint was tried, P2C over all of them.
+    above among those (avoidance applies; from #451 an ejected endpoint is never chosen and
+    counts as neither tried nor untried, also when this request's own try ejected it); when
+    every endpoint that is not ejected was tried, P2C over all of those.
     When every try so far failed to connect and either no untried endpoint is left or the next
     try is the last one, that try goes to the **original destination** instead (for a routed
     request, the drawn backend's ClusterIP, "Routing" above), at most once per request, and it ends the tries (counted in `mimic_mesh_fallbacks_total`). So a Service with one
@@ -3218,6 +3243,109 @@ no insignificant whitespace):
     (the duration spans every try; `reason` is also the value of a trusted refusal passed to the
     app); `mimic_mesh_endpoint_requests_total` counts each try written to the pod, with the
     `status_class` of that try (`none` without a response).
+  **Outlier detection** (M4, #451; design §3.2, §6; passive only: no active health check). Per
+  caller pod (the sidecar), per backend Service port and per endpoint of it, the sidecar keeps
+  the state of `mimic-core` `mesh::outlier` (pure: the sidecar's monotonic clock is passed in,
+  no I/O), configured by the Service's `policy.outlierDetection` (in the view:
+  `consecutiveFailures`, `consecutive5xx`, `baseEjectionSeconds`, `maxEjectionPercent`).
+  - **Outcomes**: each try to a pod (a mesh-routed request, routed or not, each of its retries,
+    a mirror copy, the connect of an L4-balanced connection) gives at most one outcome, known
+    when the try ends or gets its final response head; a reconnect of an unwritten request is
+    part of its try. A try to the original destination (a fallback, a stale view) has no pod
+    and gives none.
+
+    | Outcome of one try to a pod | `failures` | `5xx` |
+    |---|---|---|
+    | **Proxy-level failure**: `connect_failed` (refused, timed out, failed TLS handshake or verification, a ninth TLS pool of the pod), a trusted app refusal (`app_refused`, "Retries" above), `reset` (closed or reset after the request was written and before any byte of a response head, whatever the method and whether it is retried), a response head `hyper` rejects (`invalid-response`) | + 1 | kept |
+    | A final response head of the pod with a status 500 to 599 that is not a trusted refusal (an app's `503`, also one carrying `x-mimic-*` fields the trust rules refuse; every `5xx` over intercepted TLS) | 0 | + 1 |
+    | Any other final response head of the pod (a `1xx` interim head is not an outcome); an L4 connect that succeeded | 0 | 0 |
+    | **Neutral**: a trusted refusal `overloaded` or `queue-timeout`, `refused_stream`, a route timeout (#449), the app leaving (its connection closed or its stream reset) before the head, anything after the response head, a copy's deadline | kept | kept |
+
+    A busy pod is not a failing pod: the refusals of a pod's admission and its refused streams
+    say it works and is full, and ejecting it would move its load onto its siblings; a timeout
+    is the route author's bound and the app leaving is the app's doing. A copy's status is
+    never read (its `5xx` counts nothing), its proxy-level failures count as above.
+  - **Ejection**: when `failures` reaches `consecutiveFailures`, or `consecutive5xx` is not 0
+    and `5xx` reaches it, the endpoint is **ejected** when fewer than `allowed = ⌊n ×
+    maxEjectionPercent / 100⌋` endpoints of the port are ejected then, `n` being the endpoints
+    of the port in the view (ready, or serving and terminating when none is ready); otherwise
+    it is not ejected and its counter keeps counting, so the next failure once there is room
+    ejects it. At the default 50 % a port of 1 endpoint never ejects (avoidance still applies),
+    2 or 3 endpoints eject at most 1, 4 at most 2; 100 % can eject them all; 0 never ejects. An
+    ejection sets both counters to 0.
+  - **Ejection time**: `baseEjectionSeconds × 2ᵏ`, at most **300 s**, `k` the ejections of the
+    endpoint earlier in its **streak** (0 for the first): 30, 60, 120, 240, 300, 300 … s at the
+    default. The streak ends (`k` back to 0) once the endpoint has been restored for 300 s
+    without being ejected again. The arithmetic saturates, so no `k` overflows.
+  - **Restoration**: at the end of its ejection time the endpoint is a candidate again with both
+    counters at 0: no probe and no slow start of its own (P2C's least request already gives it
+    only its share). The choice compares the end time with the clock, so it is exact for the
+    choice; the INFO line and the gauge below follow at the sidecar's sweep, once per second.
+  - **Choice**: an ejected endpoint is left out of every P2C of the port (first tries, retries,
+    mirror copies, L4 connections); avoidance and slow start apply among the others as before.
+    When every endpoint of the port is ejected (possible only when `allowed` is `n`) a request
+    is answered `503` `breaker-open` without any try ("Circuit breaker" below), an L4 connection
+    is closed without a byte (as when every connect failed; no fallback), a copy is `error`. A
+    request whose own tries ejected the last endpoints left goes on as "Retries" says when the
+    planner has no pod: the fallback to the original destination when every try so far failed to
+    connect, else the failure as is (`mimic_mesh_retries_skipped_total{reason="exhausted"}`).
+  - **Views**: the state of an endpoint is kept while the view holds it in that Service port
+    and dropped when it leaves (an endpoint that comes back starts afresh, not ejected, streak
+    0), with its port when the port leaves. When a view leaves more ejected endpoints than its
+    `allowed` (the port shrank, a lower `maxEjectionPercent`), the ejected ones whose ejection
+    ends first (ties: the lower address) are restored at once until no more than `allowed` are
+    ejected: that bound holds at every instant. New thresholds apply from the next outcome (a
+    counter already at or over a new threshold ejects at the next failure); a new
+    `baseEjectionSeconds` applies from the next ejection.
+  - **Bounds**: per endpoint a fixed-size state (the two counters, the end of its ejection, its
+    streak and its last restoration), so the state is bounded by the endpoints of the view
+    (`MIMIC_MESH_MAX_ENDPOINTS`); recording an outcome allocates nothing and takes one short
+    lock of the port.
+  - **Logs**: INFO `endpoint ejected` (`service`, `backend`, `endpoint` the pod `ip:port`,
+    `reason` `consecutive_failures` or `consecutive_5xx`, `ejection_seconds`, `ejections` the
+    streak's count, this one included) and INFO `endpoint restored` (`service`, `backend`,
+    `endpoint`, `cause` `elapsed` or `max_percent`), one line per ejection and per restoration;
+    an endpoint that leaves the view writes none. No path, header or request data.
+  **Circuit breaker** (M4, #451; design §6, §9). Per caller pod and per backend **Service** (all
+  its ports share one count, as they share one policy and one retry budget), the sidecar counts
+  the mesh-routed requests in flight and bounds them by the Service's
+  `policy.circuitBreaker.maxRequests`.
+  - **What holds a slot**: a mesh-routed request (cleartext HTTP/1, `h2c`, intercepted TLS;
+    routed or not, counted on the drawn backend's Service when routed), from the moment its
+    first try is planned (after the route match, the backend draw and, from #452, the fault
+    injection: an injected abort takes no slot, an injected delay is waited before the slot is
+    taken) until its response is complete (its last body byte, trailers included) or it ends
+    (failed, cut by a route timeout, the app gone). Its tries, reconnects, pool waits, the delay
+    before a retry and the fallback to the original destination are all inside its one slot. An
+    `Upgrade` or `CONNECT` holds its slot until its answer head (`101`, a `2xx`, or a refusal),
+    then leaves the count; long-lived responses (SSE, gRPC streams) hold their slot for their
+    whole life. Hold no slot: mirror copies (their own bounds, "Mirrors" above), L4-balanced
+    connections (they cannot be answered `503`; the app's own connections bound them), the
+    requests the mock answers, the requests of a stale view or a view of `"mesh": false`, and
+    the sidecar's own answers that come before (`no-route`, `no-backend`, `invalid-backend`,
+    `no-endpoint`).
+  - **Breaker open**: a request that finds `maxRequests` requests of its Service in flight, or
+    every endpoint of its port ejected, is answered by the caller's sidecar at once: `503`,
+    exactly one `x-mimic-error: breaker-open`, `content-length: 0`, no `x-mimic-endpoint` (it
+    names no pod, so no sidecar ever trusts it), on the app's connection or stream as the
+    `no-route` answer of #448. Nothing is sent to a pod or to the original destination; no
+    try, no deposit on or ask of the retry budget, never retried, no response modifier, never
+    recorded (`mimic_discovery_exchanges_total{result="synthetic"}`). A new `maxRequests`
+    applies from the next request: a lower one lets the requests in flight finish.
+  - **State**: one count per Service of the view, dropped with the Service (a Service that
+    leaves and comes back counts from 0; requests in flight from before give their slot back
+    to the dropped count). Taking and giving back a slot is one atomic operation.
+  - **Log**: WARN `breaker open` at most once per second per Service (`service`, `backend`,
+    `cause` `max_requests` or `all_ejected`, `in_flight`, `max_requests`, `suppressed`: the
+    answers not logged since that Service's previous line), dropped with the Service.
+  - **`maxConnections`** bounds the HTTP/1 connections of one pool of this sidecar (pod IP,
+    port, protocol and, over intercepted TLS, server name; "Load balancing" above), the
+    primary pools and the mirror pools each: a new connection is opened only while the pool
+    holds fewer than the `maxConnections` of the Service of the request that needs it (a pod
+    shared by two Services follows the request's own); otherwise the request waits for a free
+    connection, inside its breaker slot and its route timeouts. A lower value closes nothing:
+    connections over it close as they go idle (they are not given back to the pool). HTTP/2
+    pools keep their 16 connections per pod, whatever `maxConnections`.
   **Configuration**: the time a failed pod is avoided (5 s) is the `avoid_failed_for` field of
   the sidecar's `MeshConfig`, not an environment variable: no `MIMIC_*` variable sets it; nor
   does the refusal delay (25 ms ± 50 %), a field of the same struct. From #446 `retries` and the
@@ -3225,6 +3353,10 @@ no insignificant whitespace):
   removed); no variable sets them. From #450 the mirror bounds (256 copies in flight per mirror
   Service port, 1024 in total, a 10 s deadline per copy) are the `mirror_max_in_flight`,
   `mirror_max_in_flight_total` and `mirror_timeout` fields of the same struct, not variables.
+  From #451 outlier detection and the breaker come from the view's policy only; the 300 s cap
+  of an ejection, the 300 s that end a streak and the 1 s sweep are constants, and no
+  `MIMIC_*` variable sets any of them; the fixed 1024 HTTP/1 connections per pool are
+  replaced by the policy's `maxConnections`.
   **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
   `<namespace>/<name>` and `<namespace>/<name>:<port>`; `service` is the Service the app called
   and `backend` the Service port the request went to: from #448 the drawn backend of a routed
@@ -3232,7 +3364,8 @@ no insignificant whitespace):
   `invalid-backend` one; `route` (from #448) is the matched route's `<namespace>/<name>`, `none`
   when the Service port has no route or none matched; `reason` is `none`, the `x-mimic-error` of
   an answer of the sidecar (from #448 also `no-route`, `no-backend`, `invalid-backend`, from
-  #449 `timeout` for the `504` of a route timeout), or (M2) that of a trusted refusal passed to
+  #449 `timeout` for the `504` of a route timeout, from #451 `breaker-open`, with `backend` the
+  Service port the request would have gone to), or (M2) that of a trusted refusal passed to
   the app; a route timeout after the response head leaves the request counted with the pod's
   `status_class` and its `reason` at the head, `none`, and shows in the access line, `result:
   timeout`):
@@ -3254,6 +3387,8 @@ no insignificant whitespace):
   | `mimic_mesh_inbound_refusals_total` | counter (M2, #518), inbound connections to which the sidecar answered `503` `connect-failed` because its app refused the connection (§4.1 "Refused app connections"), one per connection; created by the first | — |
   | `mimic_mesh_retry_budget_exhausted_total` | counter (M2, #446), failures that `classify` and the planner would have retried but the retry budget refused, one per request or L4 connection at most; a series is created by its first refusal | `backend` |
   | `mimic_mesh_mirrored_total` | counter (M3, #450), one per drawn mirror of a routed request ("Routing", "Mirrors"); a series is created by its first count | `backend` (the mirror Service port), `result` (`sent`, `error`, `skipped_body`, `skipped_limit`) |
+  | `mimic_mesh_ejections_total` | counter (M4, #451), one per ejection ("Outlier detection"); a series is created by its first count | `backend`, `reason` (`consecutive_failures`, `consecutive_5xx`) |
+  | `mimic_mesh_ejected_endpoints` | gauge (M4, #451), endpoints of the Service port ejected now, updated by the 1 s sweep and at each ejection; 0 for every Service port of the view | `backend` |
 
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
   are `other`; the series of an endpoint that left the view are removed 5 minutes after it left
@@ -3262,7 +3397,7 @@ no insignificant whitespace):
   left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`,
   `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`, and from M2
   `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, and
-  from #446 `mimic_mesh_retry_budget_exhausted_total`, from #450 `mimic_mesh_mirrored_total`). From #448 at most 256 distinct routes
+  from #446 `mimic_mesh_retry_budget_exhausted_total`, from #450 `mimic_mesh_mirrored_total`, from #451 `mimic_mesh_ejections_total` and `mimic_mesh_ejected_endpoints`). From #448 at most 256 distinct routes
   have a `route` label of their own, in the order the sidecar first counts them, the next ones
   are `other`; the series of a route that left the view are removed 5 minutes after it left, as
   above, and its slot is free again. A route adds at most one `backend` value per distinct
@@ -4783,6 +4918,33 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   of other requests is chosen less by P2C while it serves copies, and a failed connect of a copy
   starts its avoidance for every request: the pod's load and reachability are real whatever the
   request.
+- (M4, #451) **Outlier detection is per caller pod and passive.** Each sidecar ejects from what
+  its own tries saw: N caller pods eject a failing pod each after their own
+  `consecutiveFailures`, and the state is not shared nor kept across a sidecar restart
+  (stateless). There is no active health check: a pod that only hangs (accepts, never answers)
+  is not ejected, since a route timeout is neutral; nor is a pod whose admission refuses
+  (`overloaded`, `queue-timeout`) or whose HTTP/2 streams are refused.
+- (M4, #451) **A pod can get itself ejected, not another.** Failures are counted on the pod of
+  the try: connect failures and resets on the caller's own connection to that address, a
+  trusted app refusal only when bound to that pod (§7.9 "Retries"), a `5xx` as the status that
+  pod answered. An app that resets, refuses or (with `consecutive5xx`) answers `5xx` gets its
+  own pod ejected by its callers, which it could do by failing anyway. With `consecutive5xx` an
+  app whose `5xx` come from its own downstream failing is ejected too (the cascade Envoy's
+  `consecutive5xx` has): that is why it is off by default, and `maxEjectionPercent` bounds it.
+  A caller app can drive its own sidecar to eject pods (requests a healthy pod resets or
+  answers `5xx`), for its own traffic only. A party that can forge TCP resets on the pod
+  network, or take over a pod IP before the view updates (design §13), can eject that address
+  for up to one ejection time: no identity check without mTLS (non-goal).
+- (M4, #451) **One endpoint is never ejected at the default.** `⌊1 × 50 / 100⌋` is 0, so a Service
+  port of one endpoint keeps receiving every request (avoidance and the fallback to the
+  ClusterIP still apply); `maxEjectionPercent: 100` lets every endpoint be ejected, and then
+  every request is answered `503` `breaker-open` until the first ejection ends.
+- (M4, #451) **The breaker is per caller pod and counts held streams.** `maxRequests` bounds what
+  one sidecar has in flight to a Service, not what the Service receives: N callers send up to N
+  × `maxRequests`. Long-lived responses (SSE, gRPC streams) hold a slot for their whole life;
+  size `maxRequests` for them. An author of a `MimicConfig` of the Service sets it for every
+  caller (`maxRequests: 1` throttles all of them), as for every destination policy (RBAC of
+  `mimicconfigs` in the Service's namespace). L4-balanced connections are not bounded by it.
 
 ## 12. Delivery plan
 
@@ -5875,6 +6037,73 @@ on the median of 50 requests with a tolerance of 50 ms.
 | RTE-97 | Reserved (#450). |
 | RTE-98 | Reserved (#450). |
 | RTE-99 | Reserved (#450). |
+
+### 12.27 M4 — Outlier detection and circuit breaker (#451)
+
+Design: `docs/design/mimic-mesh.md` §3.2, §6, §9, §10, §14 (M4 row), §15. Spec text: §4.1 (access
+line `reason`, the mesh's own answers), §7 (`MimicConfig`), §7.9 (view `policy`, "Load balancing"
+pools and avoidance, "Timeouts", "Mirrors", "Retries" "Where", "Outlier detection", "Circuit
+breaker", "Configuration", "Metrics"), §11.1 (M4 #451). Levels as in §12.2, plus **F** (fuzz),
+**B** (criterion micro-benchmark), **M** (a `scripts/bench.sh` run by hand, recorded on #451, as
+§12.19 "Mesh setups") and **D** (review). CBR-01 to CBR-49 are #451 (CBR-37 to CBR-49 reserved);
+fault injection (#452) uses `FLT-xx`. Decisions recorded on #451: avoidance (M1) is kept and
+ejection added on top; `consecutiveFailures` counts the proxy-level failures of the outcome table
+of §7.9 "Outlier detection" (connect failures, trusted app refusals, resets before the head,
+rejected response heads), while admission refusals, refused streams, route timeouts and the app
+leaving are neutral; `consecutive5xx` counts the pod's `5xx` heads that are not trusted refusals
+and never the caller sidecar's own answers; `allowed = ⌊n × maxEjectionPercent / 100⌋` (no "at
+least one"), kept at every instant; ejection time doubled per ejection of a streak, capped at
+300 s, the streak ended by 300 s without ejection; `maxRequests` is per caller pod and backend
+Service, one slot per request whatever its tries, held streams hold it, mirror copies and L4
+connections hold none, and it does not replace the mirror bounds of #450; `maxConnections`
+replaces the fixed 1024 HTTP/1 connections per pool; `breaker-open` is never retried and asks
+nothing of the budget; metrics `mimic_mesh_ejections_total{backend,reason}` and
+`mimic_mesh_ejected_endpoints{backend}`. Out of scope: active health checks, sharing ejections
+between caller pods, fault injection (#452), admission (M5), Gateway hops (M6). In the **I**
+tests the sidecar runs in process as in §12.22, fed views by a fake controller; pods are
+in-process servers that can be **resetting** (close every connection after reading a request
+head), **refusing** (closed port), **silent** (read the request, never answer), **5xx** (answer
+`500`) or **overloaded** (the refusing pod of §12.22); `avoid_failed_for` is shortened where a
+criterion says so and `baseEjectionSeconds` is set in the view (1 s at least).
+
+| ID | Criterion |
+|---|---|
+| CBR-01 | **U** (`mimic-core` `mesh::policy`). Without any `MimicConfig` a Service's policy has `outlierDetection` `{consecutiveFailures: 5, consecutive5xx: 0, baseEjectionSeconds: 30, maxEjectionPercent: 50}` and `circuitBreaker` `{maxRequests: 1024, maxConnections: 1024}`; each field the winning config sets is taken (`consecutive5xx` 0, `maxEjectionPercent` 0 and 100, `consecutiveFailures` 1 and 100, `baseEjectionTime` `1s` and `300s`, `maxRequests` and `maxConnections` 1 and 100000 included) and each it does not set keeps its default alone; a consented Service of another namespace carries its own namespace's config (as MSH-07). `validate` gives `Invalid`, the message naming the field, for `consecutiveFailures` 0 and 101, `consecutive5xx` 101, `baseEjectionTime` 0 and 301 s, `maxEjectionPercent` 101, `maxRequests` and `maxConnections` 0 and 100001, and for `outlierDetection` or `circuitBreaker` in a config without a Service target. |
+| CBR-02 | **U** (`mesh::view`). The view's `policy` holds `circuitBreaker` and `outlierDetection` with every field, keys sorted (the JSON of §7.9 for the defaults); a change of any of the six fields in the winning config gives a new ETag; `View::from_json` reads back what `build` wrote and refuses an unknown field in either object, a missing object or field, and a value outside the bounds of CBR-01; MSH-12, RTY-45 and RTE-12 still hold with the new fields in their fixtures. |
+| CBR-03 | **U** (next to the controller's adapters, as RTY-46). A `MimicConfig` object converts with `outlierDetection` and `circuitBreaker` (`baseEjectionTime: 30s` → 30; absent fields `None`; an absent object sets nothing); a `baseEjectionTime` that does not parse (`30`, `1m`, `-1s`) makes the config `Invalid`, not a panic. |
+| CBR-04 | **E** (chart, `scripts/check-chart.sh`, as RTY-47). The rendered CRD has `outlierDetection.consecutiveFailures` (integer, 1 to 100), `consecutive5xx` (0 to 100), `baseEjectionTime` (`<n>s`), `maxEjectionPercent` (0 to 100), `circuitBreaker.maxRequests` and `maxConnections` (1 to 100000), the CEL rule for a `baseEjectionTime` of 1 to 300 s and the rule for both objects on a Service target only. |
+| CBR-05 | **E** (kind, `scripts/e2e.sh` section `msh_17`, its objects only). The API server accepts each field at both of its bounds and an object with one field; it refuses `consecutiveFailures` 0, `consecutive5xx` 101, `baseEjectionTime` `0s`, `301s` and `30`, `maxEjectionPercent` 101, `maxRequests` 0, `maxConnections` `"8"`, and either object in a config whose only target is a Deployment, each with the CEL message or schema error naming the field. |
+| CBR-06 | **F** (fuzz target `mesh`). The seed corpus holds a view with both new objects; MSH-13 holds (`View::from_json` never panics, an accepted document holds the bounds and reads back equal). |
+| CBR-07 | **U** (`mimic-core` `mesh::outlier`, outcomes). Exhaustively over the outcome kinds of the table of §7.9 "Outlier detection" (`connect_failed`, `app_refused`, `reset` for a retried and a not retried method, `invalid-response`, a `5xx` head that is not trusted (`500`, `503`, `503` with an untrusted `overloaded`), a trusted `overloaded` and `queue-timeout`, `refused_stream`, `timeout`, the app leaving, a copy's deadline, a `1xx`, a `2xx`, a `4xx` head, an L4 connect that succeeded) × the two counters at 0 and at 3: each outcome changes `failures` and `5xx` exactly as the table says (+ 1, 0 or kept). |
+| CBR-08 | **U** (thresholds). With `consecutiveFailures` 5: 4 failures, a `2xx`, 4 failures eject nothing; 5 failures in a row eject (`reason` `consecutive_failures`); a neutral outcome between them keeps the count (4 failures, an `overloaded`, 1 failure eject) and a `5xx` head sets it to 0. With `consecutive5xx` 3: three `5xx` eject (`consecutive_5xx`), a `2xx` or `4xx` between them resets, a proxy-level failure between them keeps the count; with `consecutive5xx` 0 no number of `5xx` ejects. An ejection sets both counters to 0. |
+| CBR-09 | **U** (ejection time, clock passed in). With `baseEjectionSeconds` 30 the ejections of one streak last 30, 60, 120, 240, 300, 300 s; with 300 every one lasts 300 s; with 1: 1, 2, 4 … 256, 300 s. An endpoint ejected at `t` for `d` is excluded at `t + d − 1 ms` and a candidate at `t + d`, with both counters 0. Restored at `r`, an ejection at `r + 299.999 s` continues the streak and one at `r + 300 s` starts a new one (30 s). A streak of 100 ejections, a time of `u64::MAX` ms and a clock that goes back neither panic nor overflow (the clock going back ends no ejection). |
+| CBR-10 | **U** (`maxEjectionPercent`). For `n` 1 to 10 and `maxEjectionPercent` 0, 10, 33, 50, 99, 100, the most endpoints ejected at once is `⌊n × p / 100⌋` (1 endpoint at 50: 0; 2 and 3: 1; 4: 2; 100 %: `n`; 0 %: none). An endpoint that reaches its threshold without room is not ejected, its counter keeps counting, and its first failure after another endpoint's restoration ejects it. |
+| CBR-11 | **U** (views). An endpoint that leaves the port drops its state (no restoration reported) and one that comes back is a candidate with counters 0 and streak 0; with 4 endpoints and 2 ejected at 50 %, a view with 2 of them (both ejected) restores at once the one whose ejection ends first (equal ends: the lower address), reported with cause `max_percent`; a lower `maxEjectionPercent` does the same, 0 restores all; a lower `consecutiveFailures` makes a counter already over it eject at its next failure; a new `baseEjectionSeconds` applies to the next ejection only. |
+| CBR-12 | **U** (`proptest`). Over any policy within the bounds, any sequence of outcomes on up to 16 endpoints, view changes and non-decreasing times: at every step no more than `⌊n × maxEjectionPercent / 100⌋` endpoints are ejected; an endpoint is ejected only right after `consecutiveFailures` failures (or `consecutive5xx` `5xx` heads) counted as the table says since its last ejection, restoration or arrival; every ejection lasts between `baseEjectionSeconds` and 300 s; the same sequence gives the same states and reports (no hidden clock or random source). |
+| CBR-13 | **U** (`mesh::lb` and `mesh::retry::Planner` with ejection). Over sets of 1 to 8 endpoints with any ejected subset and any draws: the choice never returns an ejected endpoint while one is not ejected, says "all ejected" when every one is, and among the others keeps P2C, avoidance and slow start exactly as without ejection (the M1 choice criteria hold); the planner never plans an ejected endpoint, treats one ejected by this request's own try as no candidate, and takes the original destination only by the rule of §7.9 "Retries". |
+| CBR-14 | **B** (criterion, results in `docs/bench/`). A P2C pick over 1000 endpoints with 10 % ejected stays within the M1 budget of 2 µs, and recording an outcome is measured. |
+| CBR-15 | **I** (the issue's ejection, default policy but `baseEjectionSeconds` 1). A Service of 3 pods, one resetting: 100 sequential `GET`s, HTTP/1 keep-alive and `h2c`, are all answered `200` by the two others; the resetting pod receives exactly 5 request heads, then none while ejected; one INFO `endpoint ejected` (`service`, `backend`, `endpoint` its `ip:port`, `reason` `consecutive_failures`, `ejection_seconds` 1, `ejections` 1), `mimic_mesh_ejections_total{reason="consecutive_failures"}` 1 and `mimic_mesh_ejected_endpoints` 1; requests reach it again from 1 s after the ejection, INFO `endpoint restored` (`cause` `elapsed`) and the gauge 0 within 2 s of it; its next ejection lasts 2 s (`ejections` 2). A `POST` that the pod resets (not retried, the app sees the close) counts as a failure too. |
+| CBR-16 | **I** (composed with avoidance, `avoid_failed_for` 100 ms). A pod refusing connections is avoided after its first failed connect (MSH criteria unchanged) and ejected after its fifth; while ejected it receives no connect at all, also when the two others are avoided; a connect that succeeds ends the avoidance and resets `failures`. |
+| CBR-17 | **I** (neutral outcomes). 200 requests each to: an overloaded pod (trusted refusals, retried elsewhere), a pod whose HTTP/2 streams are refused, a silent pod under a route rule with `backendRequest: 50ms` (504s), and a healthy pod whose requests the app abandons before the head: none is ejected (`mimic_mesh_ejections_total` absent, no `endpoint ejected` line); tries on the original destination (a stale view) eject nothing. |
+| CBR-18 | **I** (`consecutive5xx` and trust). A `5xx` pod with `consecutive5xx` 0 is never ejected and every `500` reaches the app; with `consecutive5xx` 3 it is ejected after 3 (`reason` `consecutive_5xx`) and its later requests go to the others. With `consecutive5xx` 3, a pod answering `503` `overloaded` with `x-mimic-endpoint` naming another pod of the Service is ejected itself (its `5xx`) and the named pod's state is unchanged; the caller sidecar's own `connect-failed`, `timeout` and `breaker-open` answers count on no pod; over intercepted TLS a `503` `overloaded` bound to the pod counts as `5xx`. |
+| CBR-19 | **I** (trusted app refusal, the set-up of RTY-37). A pod whose inbound sidecar is in process and whose app port is closed answers `503` `connect-failed` with `x-mimic-origin`: the caller ejects it after 5 such answers and no request fails; a peer outside the mesh forging the three fields bound to another pod's address ejects nothing of that pod. |
+| CBR-20 | **I** (`maxEjectionPercent` and every endpoint ejected). Two resetting pods of 2: only one is ejected at 50 %; a Service of one resetting pod is never ejected (its requests keep their M2 path: retries, then the ClusterIP); with `maxEjectionPercent` 100 both are ejected, and the next request is answered `503` `breaker-open` without any connect (the pods and the ClusterIP see nothing), with one WARN `breaker open` `cause` `all_ejected`; after the first ejection ends requests are tried again. An L4 connection to that Service while every pod is ejected is closed without a byte. |
+| CBR-21 | **I** (view changes). An ejected pod that leaves the view drops from `mimic_mesh_ejected_endpoints` within 1 s without an `endpoint restored` line, and comes back as a candidate; a view taking a port of 4 pods with 2 ejected down to those 2 restores one at once (`cause` `max_percent`); a view setting `maxEjectionPercent` 0 restores every ejected pod. |
+| CBR-22 | **I** (mirrors and L4). Mirror copies to a resetting mirror pod eject it (counted on the mirror Service port), after which no copy reaches it; with `consecutive5xx` 1 a mirror pod answering `500` to copies is not ejected; copies with every mirror pod ejected are `error`. An L4-balanced (TLS passed through) Service with a refusing pod ejects it after 5 failed connects and sends it no connection while ejected. |
+| CBR-23 | **I** (retries). Once a pod is ejected no retry goes to it; with `maxEjectionPercent` 100 and 3 refusing pods, a request whose own tries eject the last of them is sent to the ClusterIP (`mimic_mesh_fallbacks_total` + 1); the budget's `window_requests` and `window_retries` are those without outlier detection. |
+| CBR-24 | **I** (labels and logs). With 300 Service ports in the view: `mimic_mesh_ejected_endpoints` has one series per Service port of the view, `mimic_mesh_ejections_total` only the two `reason` values; both series of a Service port are gone 5 minutes after it left (the scrape before still has them); no label or line of #451 carries a path, a header or query value, or a body byte (a canary in each is in none). |
+| CBR-25 | **I** (`maxRequests`, HTTP/1 keep-alive and `h2c`). With `maxRequests` 4 and silent pods: 4 requests are in flight and the 5th to 10th are answered `503`, exactly one `x-mimic-error: breaker-open`, `content-length: 0`, no `x-mimic-endpoint`, the median time from the request head read to the answer written (sidecar's access `duration_ms`, and the client's measure) at most 1 ms; no pod receives them; the HTTP/1 connection and the `h2c` connection stay usable; once one of the 4 ends the next request is sent. |
+| CBR-26 | **I** (what holds a slot, `maxRequests` 1). A request retried twice (refusing then healthy pods) and one sent to the ClusterIP after connect failures each hold one slot; a long response (SSE, body over 2 s) holds it until its last byte, so a concurrent request is `breaker-open`; an HTTP/1 `Upgrade` frees it at its `101`; a client that leaves, and a route timeout, free it at once; 50 silent mirror copies hold none (primary requests are answered); 5 concurrent L4 connections are all relayed; requests answered by the mock and on a stale view are never `breaker-open`. |
+| CBR-27 | **I** (scope). Two ports of one Service share one count, two Services do not; a routed request counts on its drawn backend's Service: a route of `shop/cart` sending to `shop/cart-v1` with `maxRequests` 1 on `cart-v1` and the default on `cart` refuses the second concurrent request. |
+| CBR-28 | **I** (accounting of `breaker-open`). Each such answer adds no try (`mimic_mesh_attempts_total` unchanged), nothing to the budget's counts, no retry, no response modifier field; it counts `mimic_mesh_requests_total{reason="breaker-open",status_class="5xx"}` with `backend` the Service port, `mimic_discovery_exchanges_total{result="synthetic"}`, and is not recorded; its access line has `reason: breaker-open`, `backend`, `route`/`rule` when matched, no `upstream` or `attempts`; 100 answers in 1 s write one WARN `breaker open` (`cause` `max_requests`, `in_flight`, `max_requests`), the next second's line has `suppressed` 99 or the count since. A `breaker-open` answered by an app (forwarded from its own sidecar) to a caller sidecar is an app `503`: passed as received, never retried, and removed by a meshed callee's strip (§4.1). |
+| CBR-29 | **I** (changes). A view lowering `maxRequests` from 8 to 2 with 8 in flight lets them finish and refuses new requests until fewer than 2 are in flight; a higher value applies from the next request; a Service that leaves the view and comes back counts from 0. |
+| CBR-30 | **I** (access `reason`). The access lines of the sidecar's answers `no-endpoint`, `connect-failed`, `no-route`, `no-backend`, `invalid-backend`, `timeout` (before the head) and `breaker-open` carry their `reason`; a trusted refusal passed as received and every pod answer carry none (PRX criteria otherwise unchanged). |
+| CBR-31 | **I** (`maxConnections`). With `maxConnections` 2 and a slow pod, 6 concurrent HTTP/1 requests open at most 2 connections to it and all 6 are answered; `h2c` keeps its bound of 16 connections per pod whatever `maxConnections`; mirror pools are bounded by the mirror Service's value apart from the primary pools; a pod in two Services with 2 and 4 follows each request's own; lowering 4 to 2 closes no busy connection and leaves at most 2 open once they went idle; the default keeps the M1 behaviour (MSH criteria unchanged). |
+| CBR-32 | **E** (kind, `scripts/e2e.sh` section `cbr_32`, own namespace, cleaned by a trap, Python test services). A Service of 3 injected pods, one whose app closes every connection after reading a request (Ready through a probe on another port): of 300 `GET`s from an injected caller all are `200`, the broken pod receives at most 5 of them, the caller sidecar shows `mimic_mesh_ejections_total{reason="consecutive_failures"}` 1 and the `endpoint ejected` line; then a `MimicConfig` on a second Service of 3 pods, one answering `500`, with `consecutive5xx: 3`: once the view carries it (`mesh view applied`), that pod receives at most 3 more requests of the next 100. |
+| CBR-33 | **E** (same section). A `MimicConfig` with `circuitBreaker.maxRequests: 2` on a Service whose pods answer after 1 s: of 10 concurrent requests from the injected caller 2 are `200` and 8 are `503` `breaker-open`; after the config is deleted and the view updated, 10 concurrent requests are all `200`. |
+| CBR-34 | **M** (benchmark, design §14 M4 row). `scripts/bench.sh` setups `mesh-eject` (the `mesh-refuse` backend with the third pod resetting instead of refusing) and `mesh-breaker` (`maxRequests: 8` over a 50 ms backend at 400 rps), accepted by BEN-02 and BEN-11, not in the default matrix: in `mesh-eject` at 200 rps the client's error rate is 0 % and the resetting pod receives at most 5 requests per ejection of the caller sidecar; in `mesh-breaker` the access `duration_ms` of every `breaker-open` line is at most 1; `mesh-lb` p50 is within 0.2 ms of the M3 runs (no cost without failures); results in `docs/bench/`. |
+| CBR-35 | **D** (documentation review). `docs/wiki/Mesh.md` has "Outlier detection and circuit breaker": the fields and defaults, what counts as a failure and what is neutral, `consecutive5xx` off by default and why, the rounding of `maxEjectionPercent` (one endpoint is never ejected at 50 %), the doubling and the 300 s cap, avoidance and ejection together, the breaker per caller pod, held streams, mirrors and L4 outside it; `Troubleshooting.md` `breaker-open` with its two causes and the WARN `cause`; `Monitoring.md` the two metrics; `Access-logs.md` `reason`. |
+| CBR-36 | **D** (security review). An app or a peer forging failures ejects only its own pod (CBR-18, CBR-19); admission refusals and timeouts cannot be used to eject (CBR-17); the state is per caller pod and bounded by the view (CBR-12, CBR-21, CBR-24); `breaker-open` names no pod and is never trusted (CBR-28); labels and lines carry no request data (CBR-24); the §11.1 limits of #451 are written; `mimic-core` `mesh::outlier` has no clock, I/O or random source. |
 
 ## 13. Test strategy
 
