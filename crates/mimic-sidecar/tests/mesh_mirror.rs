@@ -2171,6 +2171,59 @@ async fn rte_85_a_body_that_has_not_ended_at_the_deadline_is_skipped() {
 }
 
 #[tokio::test]
+async fn rte_85_a_body_ending_after_the_deadline_is_not_claimed_as_mirrored() {
+    let logs = capture_logs();
+    let (primary, shadow, f) =
+        body_rig(false, |c| c.mirror_timeout = Duration::from_millis(300)).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(&post_head("Transfer-Encoding: chunked\r\n"))
+        .await;
+    client.send(b"5\r\nhello\r\n").await;
+    until("the primary began", || primary.started() == 1).await;
+    until("skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    client.send(b"0\r\n\r\n").await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let entry = &logs.access_exactly(1).await[0];
+    assert!(entry.get("mirrored").is_none(), "{entry}");
+    assert_eq!(shadow.started(), 0);
+}
+
+#[tokio::test]
+async fn rte_87_a_request_after_sigterm_is_not_claimed_as_mirrored() {
+    let logs = capture_logs();
+    let primary = RawPod::start(|_| OK_OWN.to_vec()).await;
+    let shadow = RawPod::start(|_| OK_OWN.to_vec()).await;
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                Some(MODIFIER),
+                None,
+            ),
+        ),
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    state.stop();
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(GET.as_bytes()).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let entry = &logs.access_exactly(1).await[0];
+    assert!(entry.get("mirrored").is_none(), "{entry}");
+    assert_eq!(shadow.counts.requests(), 0);
+}
+
+#[tokio::test]
 async fn rte_85_without_a_buffer_a_get_is_sent_and_a_post_with_a_body_is_skipped() {
     let _logs = capture_logs();
     let (_primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 0).await;
