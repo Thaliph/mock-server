@@ -8,8 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use common::mesh_pods::{EchoPod, H1Client, Pod};
 use common::{Logs, capture_logs, closed_port, fixture_mesh};
+use http_body_util::{BodyExt, Empty};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::view::{Limits, View};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -538,7 +541,7 @@ async fn cbr_20_at_most_the_allowed_share_is_ejected_and_a_single_pod_never() {
 
 #[tokio::test]
 async fn cbr_20_with_every_pod_ejected_nothing_is_tried_and_an_l4_connection_is_closed() {
-    let _logs = capture_logs();
+    let logs = capture_logs();
     let cluster = Pod::http1("cluster", 0).await;
     let (x, y) = (
         ModePod::start(Mode::Reset).await,
@@ -559,13 +562,25 @@ async fn cbr_20_with_every_pod_ejected_nothing_is_tried_and_an_l4_connection_is_
     assert_eq!(ejected(&scrape, &label), 2.0, "{scrape}");
     let heads = (x.heads(), y.heads());
     let mut client = H1Client::connect(f.addr).await;
-    assert_eq!(status(&mut client, "GET", "/").await, 503);
+    let (head, body) = client.get("/").await;
+    let head = head.to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 503"), "{head}");
+    assert_eq!(head.matches("x-mimic-error").count(), 1, "{head}");
+    assert!(head.contains("x-mimic-error: breaker-open"), "{head}");
+    assert!(
+        !head.contains("x-mimic-endpoint") && body.is_empty(),
+        "{head}"
+    );
     assert_eq!(
         (x.heads(), y.heads()),
         heads,
         "no try while all are ejected"
     );
     assert_eq!(cluster.counts.requests(), 0, "the ClusterIP sees nothing");
+    let warned = lines(&logs, "breaker open").await;
+    assert_eq!(warned.len(), 1, "{}", logs.text());
+    assert_eq!(warned[0]["cause"], "all_ejected");
+    assert_eq!(warned[0]["service"], "shop/cart");
 }
 
 #[tokio::test]
@@ -888,4 +903,260 @@ async fn cbr_24_series_are_bounded_by_the_view_and_carry_no_request_data() {
     assert_eq!(series(&f, "mimic_mesh_ejected_endpoints{"), 301);
     state.evict(Instant::now() + Duration::from_secs(5 * 60 + 1));
     assert_eq!(series(&f, "mimic_mesh_ejected_endpoints{"), 1);
+}
+
+/// An `h2c` server that resets every stream with `reason`.
+async fn h2_refuser(reason: h2::Reason, requests: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(stream).await else {
+                    return;
+                };
+                while let Some(Ok((_, mut respond))) = conn.accept().await {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    respond.send_reset(reason);
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// An `h2c` server written frame by frame: on the first `HEADERS` it sends `GOAWAY` with a
+/// last-stream-id of 0 (nothing was processed) and keeps the connection open.
+async fn h2_goaway(requests: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let mut preface = [0u8; 24];
+                if stream.read_exact(&mut preface).await.is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await;
+                loop {
+                    let mut head = [0u8; 9];
+                    if stream.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let len = usize::from(head[0]) << 16
+                        | usize::from(head[1]) << 8
+                        | usize::from(head[2]);
+                    let mut payload = vec![0u8; len];
+                    if stream.read_exact(&mut payload).await.is_err() {
+                        return;
+                    }
+                    if head[3] == 1 {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let ack = [0, 0, 0, 4, 1, 0, 0, 0, 0];
+                        let goaway = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                        let _ = stream.write_all(&ack).await;
+                        let _ = stream.write_all(&goaway).await;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+type H2Sender = hyper::client::conn::http2::SendRequest<Empty<Bytes>>;
+
+async fn h2_client(addr: SocketAddr) -> H2Sender {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    sender
+}
+
+/// One `GET` over `h2c`: the status, or the error.
+async fn h2_status(sender: &mut H2Sender) -> Result<u16, String> {
+    let request = hyper::Request::get("http://cart.shop.svc/")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let status = response.status().as_u16();
+    response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(status)
+}
+
+#[tokio::test]
+async fn cbr_15_over_h2c_a_resetting_pod_is_ejected_after_five_and_restored_after_its_time() {
+    let logs = capture_logs();
+    let (a, b) = (Pod::h2c("a", 0, None).await, Pod::h2c("b", 0, None).await);
+    let resets = Arc::new(AtomicUsize::new(0));
+    let bad = h2_refuser(h2::Reason::INTERNAL_ERROR, resets.clone()).await;
+    let state = state_with(&[cart(&[a.addr, b.addr, bad]).outlier(1, 0, 5, 50)], |_| {});
+    let f = fixture_mesh(dst(), &state, None).await;
+    let mut sender = h2_client(f.addr).await;
+    for n in 0..100 {
+        assert_eq!(h2_status(&mut sender).await, Ok(200), "request {n}");
+    }
+    assert_eq!(resets.load(Ordering::SeqCst), 5, "five heads, then none");
+    let scrape = f.metrics.encode();
+    assert_eq!(ejections(&scrape, "consecutive_failures"), 1.0, "{scrape}");
+    assert_eq!(ejected(&scrape, "shop/cart:80"), 1.0, "{scrape}");
+    let ejected_lines = lines(&logs, "endpoint ejected").await;
+    assert_eq!(ejected_lines.len(), 1, "{}", logs.text());
+    assert_eq!(ejected_lines[0]["endpoint"], bad.to_string());
+    assert_eq!(ejected_lines[0]["ejection_seconds"], 1);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    state.tick();
+    let restored = lines(&logs, "endpoint restored").await;
+    assert_eq!(restored.len(), 1, "{}", logs.text());
+    assert_eq!(restored[0]["cause"], "elapsed");
+    for n in 0..200 {
+        assert_eq!(h2_status(&mut sender).await, Ok(200), "request {n}");
+        if resets.load(Ordering::SeqCst) >= 10 {
+            break;
+        }
+    }
+    assert_eq!(resets.load(Ordering::SeqCst), 10, "five more once restored");
+    let again = lines(&logs, "endpoint ejected").await;
+    assert_eq!(again[1]["ejection_seconds"], 2);
+}
+
+#[tokio::test]
+async fn cbr_17_refused_streams_and_goaways_are_never_ejected() {
+    let logs = capture_logs();
+    for goaway in [false, true] {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let refuser = if goaway {
+            h2_goaway(seen.clone()).await
+        } else {
+            h2_refuser(h2::Reason::REFUSED_STREAM, seen.clone()).await
+        };
+        let ok = Pod::h2c("ok", 0, None).await;
+        let state = state_with(&[cart(&[ok.addr, refuser]).outlier(30, 1, 2, 100)], |_| {});
+        let f = fixture_mesh(dst(), &state, None).await;
+        let mut sender = h2_client(f.addr).await;
+        for n in 0..200 {
+            assert_eq!(h2_status(&mut sender).await, Ok(200), "request {n}");
+        }
+        assert!(
+            seen.load(Ordering::SeqCst) > 5,
+            "tried: {}",
+            seen.load(Ordering::SeqCst)
+        );
+        let scrape = f.metrics.encode();
+        assert!(
+            !scrape.contains("mimic_mesh_ejections_total{"),
+            "goaway {goaway}: {scrape}"
+        );
+    }
+    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+}
+
+#[tokio::test]
+async fn cbr_17_a_route_timeout_is_never_ejected() {
+    let logs = capture_logs();
+    let slow = Pod::http1("slow", 3000).await;
+    let timed = r#","routes":[{"name":"shop/timed","rules":[{"backends":[{"port":80,"service":"shop/cart","weight":1}],"matches":[{"path":{"type":"PathPrefix","value":"/"}}],"timeouts":{"backendRequestMs":50}}]}]"#;
+    let mut shop = cart(&[slow.addr]).outlier(30, 1, 1, 100);
+    shop.routes = timed.into();
+    let state = state_with(&[shop], |_| {});
+    let f = fixture_mesh(dst(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    for n in 0..30 {
+        assert_eq!(status(&mut client, "GET", "/").await, 504, "request {n}");
+    }
+    assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
+    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+}
+
+#[tokio::test]
+async fn cbr_17_a_request_the_app_abandons_is_never_ejected() {
+    let logs = capture_logs();
+    let pod = Pod::http1("ok", 0).await;
+    let state = state_with(&[cart(&[pod.addr]).outlier(30, 1, 1, 100)], |_| {});
+    let f = fixture_mesh(dst(), &state, None).await;
+    for n in 1..=30 {
+        // The head and a part of the body, then the app leaves.
+        let mut leaving = TcpStream::connect(f.addr).await.unwrap();
+        leaving
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: cart.shop.svc:80\r\ncontent-length: 10\r\n\r\nabc",
+            )
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if pod.counts.requests() >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pod.counts.requests(), n, "the pod got request {n}");
+        drop(leaving);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
+    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+}
+
+#[tokio::test]
+async fn cbr_18_the_answers_of_the_caller_sidecar_count_on_no_pod() {
+    let logs = capture_logs();
+    // Every pod refuses to connect: the caller's `connect-failed` answers are no `5xx` of a pod.
+    let state = state_with(
+        &[cart(&[closed_port().await]).outlier(30, 3, 100, 100)],
+        |_| {},
+    );
+    let f = fixture_mesh(dst(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    for _ in 0..20 {
+        assert_eq!(status(&mut client, "GET", "/").await, 503);
+    }
+    let scrape = f.metrics.encode();
+    assert_eq!(ejections(&scrape, "consecutive_5xx"), 0.0, "{scrape}");
+    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+}
+
+#[tokio::test]
+async fn cbr_20_after_the_first_ejection_ends_requests_are_tried_again() {
+    let _logs = capture_logs();
+    let cluster = Pod::http1("cluster", 0).await;
+    let (x, y) = (
+        ModePod::start(Mode::Reset).await,
+        ModePod::start(Mode::Reset).await,
+    );
+    let state = state_with(
+        &[cart_on(cluster.addr, &[x.addr, y.addr]).outlier(1, 0, 5, 100)],
+        |_| {},
+    );
+    let f = fixture_mesh(cluster.addr, &state, None).await;
+    for _ in 0..30 {
+        let mut client = H1Client::connect(f.addr).await;
+        let _ = status_or_closed(&mut client).await;
+    }
+    let heads = x.heads() + y.heads();
+    assert_eq!(
+        status(&mut H1Client::connect(f.addr).await, "GET", "/").await,
+        503
+    );
+    assert_eq!(x.heads() + y.heads(), heads, "nothing tried while ejected");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let _ = status_or_closed(&mut H1Client::connect(f.addr).await).await;
+    assert!(x.heads() + y.heads() > heads, "tried again");
 }

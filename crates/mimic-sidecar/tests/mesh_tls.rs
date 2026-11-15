@@ -814,3 +814,50 @@ async fn rte_91_mirror_pods_with_a_certificate_for_another_name_fail_and_the_pri
     );
     assert_eq!(mirrored(&rig, "result=\"sent\""), 0.0);
 }
+
+/// Like `view_on`, with `consecutive5xx` 3.
+fn view_5xx(cluster: SocketAddr, pods: &[SocketAddr]) -> mimic_core::mesh::view::View {
+    let (ip, port) = (cluster.ip(), cluster.port());
+    let endpoints: Vec<String> = pods
+        .iter()
+        .map(|p| format!(r#"{{"ip":"{}","port":{},"ready":true}}"#, p.ip(), p.port()))
+        .collect();
+    let text = format!(
+        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{"shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":3,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}}}}}"#,
+        endpoints.join(",")
+    );
+    mimic_core::mesh::view::View::from_json(&text, &mimic_core::mesh::view::Limits::default())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cbr_18_over_intercepted_tls_a_503_overloaded_bound_to_the_pod_counts_as_5xx() {
+    let _logs = capture_logs();
+    let (good_ca, good_root) = authority("good");
+    let refuser = tls_pod("refuser", &good_ca, names(&[NAME]), &[]).await;
+    let other = tls_pod("other", &good_ca, names(&[NAME]), &[]).await;
+    let rig = rig_with_view(
+        &good_root,
+        cluster(),
+        view_5xx(cluster(), &[refuser.addr, other.addr]),
+    )
+    .await;
+    for _ in 0..40 {
+        let mut tls = client(&rig, service(), &[]).await;
+        get(&mut tls).await;
+    }
+    assert_eq!(
+        refuser.requests.load(Ordering::SeqCst),
+        3,
+        "three 5xx heads, then it is ejected"
+    );
+    let scrape = rig.metrics.encode();
+    assert_eq!(
+        counter(
+            &scrape,
+            "mimic_mesh_ejections_total{backend=\"shop/cart:80\",reason=\"consecutive_5xx\"}"
+        ),
+        1.0,
+        "{scrape}"
+    );
+}
