@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use mimic_core::mesh::lb::Endpoints;
+use mimic_core::mesh::mirror::{self, Body, Candidate, Decision as Mirrored};
 use mimic_core::mesh::policy::Policy;
 use mimic_core::mesh::retry::{Budget, Decision, Next, Planner, Verdict, decide};
 use mimic_core::mesh::route::{RouteView, Table};
@@ -338,12 +339,50 @@ impl Backend {
     }
 }
 
+/// What bounds the copies sent to mirrors (spec §7.9 "Mirrors").
+pub(crate) struct MirrorConfig {
+    pub max_in_flight: usize,
+    pub max_in_flight_total: usize,
+    pub timeout: Duration,
+}
+
+/// The copies in flight: in total and per mirror Service port (`<namespace>/<name>:<port>`).
+struct Slots {
+    max_port: usize,
+    max_total: usize,
+    held: Mutex<(usize, BTreeMap<String, usize>)>,
+}
+
+/// A slot taken by a copy, given back when dropped.
+pub(crate) struct Slot {
+    slots: Arc<Slots>,
+    port: String,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut held = lock(&self.slots.held);
+        held.0 = held.0.saturating_sub(1);
+        if let Some(n) = held.1.get_mut(&self.port) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.1.remove(&self.port);
+            }
+        }
+    }
+}
+
 pub(crate) struct Router {
     started: Instant,
     /// SplitMix64 state: one atomic add per draw, no lock.
     seed: AtomicU64,
     backends: RwLock<BTreeMap<String, Arc<Backend>>>,
     pub(crate) pools: Arc<Pools>,
+    /// The pools of the copies sent to mirrors, apart from those of every other request.
+    pub(crate) mirror_pools: Arc<Pools>,
+    mirror_slots: Arc<Slots>,
+    /// The deadline of a copy when the rule has no shorter timeout.
+    pub(crate) mirror_timeout: Duration,
     pub(crate) metrics: MeshMetrics,
     /// `MIMIC_MESH_CONNECT_TIMEOUT`.
     pub(crate) connect_timeout: Duration,
@@ -365,12 +404,20 @@ impl Router {
         connect_timeout: Duration,
         avoid: Duration,
         refusal_delay: Duration,
+        mirrors: MirrorConfig,
     ) -> Router {
         Router {
             started: Instant::now(),
             seed: AtomicU64::new(seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX))),
             backends: RwLock::new(BTreeMap::new()),
             pools: Pools::new(idle_timeout),
+            mirror_pools: Pools::new(idle_timeout),
+            mirror_slots: Arc::new(Slots {
+                max_port: mirrors.max_in_flight,
+                max_total: mirrors.max_in_flight_total,
+                held: Mutex::new((0, BTreeMap::new())),
+            }),
+            mirror_timeout: mirrors.timeout,
             metrics: MeshMetrics::new(max_labels),
             connect_timeout,
             avoid,
@@ -378,6 +425,45 @@ impl Router {
             refusal_delay,
             timers: Arc::default(),
         }
+    }
+
+    /// What each mirror of a rule does (spec §7.9 "Mirrors"): `candidates` are drawn or not,
+    /// each drawn one that sends takes a slot, held until the guard is dropped.
+    pub(crate) fn mirror_decide(
+        &self,
+        candidates: &[Candidate<'_>],
+        body: Body,
+        share: u64,
+    ) -> Vec<Option<(Mirrored, Option<Slot>)>> {
+        let slots = &self.mirror_slots;
+        let mut held = lock(&slots.held);
+        let decided = mirror::decide(
+            candidates,
+            slots.max_total.saturating_sub(held.0),
+            |port| {
+                slots
+                    .max_port
+                    .saturating_sub(held.1.get(port).copied().unwrap_or(0))
+            },
+            body,
+            share,
+        );
+        decided
+            .into_iter()
+            .zip(candidates)
+            .map(|(decision, candidate)| {
+                let decision = decision?;
+                let slot = decision.holds_slot().then(|| {
+                    held.0 += 1;
+                    *held.1.entry(candidate.port.to_string()).or_insert(0) += 1;
+                    Slot {
+                        slots: slots.clone(),
+                        port: candidate.port.to_string(),
+                    }
+                });
+                Some((decision, slot))
+            })
+            .collect()
     }
 
     /// Connecting to the pod failed: the choice avoids it for a while.
@@ -509,6 +595,7 @@ impl Router {
             .collect();
         self.metrics.routes_in_view(&names, now);
         self.pools.retain(&live);
+        self.mirror_pools.retain(&live);
     }
 }
 

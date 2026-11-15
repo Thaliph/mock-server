@@ -17,16 +17,18 @@ use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
+use hyper::http::Extensions;
 use hyper::http::request::Parts;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::head::{Stop, leaves};
+use mimic_core::mesh::mirror::{self, Candidate};
 use mimic_core::mesh::retry::{
     Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
 };
 use mimic_core::mesh::route::{
-    FieldList, Pick, RequestParts, RouteView, TimeoutsView, draw, split_target,
+    FieldList, MirrorView, Pick, RequestParts, RouteView, TimeoutsView, draw, split_target,
 };
 use mimic_core::mesh::timeout::{self, Deadline, Kind};
 use mimic_core::proxy::authority::status_class;
@@ -38,8 +40,8 @@ use super::dial::CLUSTER_CONNECT_TIMEOUT;
 use super::gate::{Gate, Progress};
 use super::metrics::{Call, INVALID_BACKEND, NO_BACKEND};
 use super::pool::{self, Lease, Protocol, Sent};
-use super::replay::Source;
-use super::router::{Backend, InFlight, Plan, Routed};
+use super::replay::{Attempt, Source};
+use super::router::{Backend, InFlight, Plan, Routed, Slot};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
 use crate::mock::{self, Mock};
@@ -755,6 +757,7 @@ impl Serving {
         let (mut tracker, req) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
         let router = self.mesh.router();
         let (mut head, body) = req.into_parts();
+        let body_state = body_state(&head.headers, body.is_end_stream());
         let source = Source::new(body, self.mesh.replay());
         let direct = self.mesh.stale() || self.mesh.off();
         // The routes of the port now (spec §7.9 "Routing"): none for a stale view.
@@ -776,8 +779,23 @@ impl Serving {
                     route = &view.name;
                     tracker.matched(route, rule);
                     let filters = view.rules[rule].filters.as_ref();
+                    let mirrors = filters.map_or(&[][..], |f| &f.mirrors[..]);
+                    // A mirror written before the request modifier gets the app's fields.
+                    let as_sent = mirrors
+                        .iter()
+                        .any(|m| m.before_modifier)
+                        .then(|| head.headers.clone());
                     if let Some(modifier) = filters.and_then(|f| f.request_headers.as_ref()) {
                         modifier.apply(&mut Fields(&mut head.headers));
+                    }
+                    if self.mirror(
+                        mirrors,
+                        (&head, as_sent.as_ref()),
+                        body_state,
+                        (view.rules[rule].timeouts.as_ref(), began),
+                        protocol,
+                    ) {
+                        tracker.mirrored();
                     }
                     response_modifier = filters.and_then(|f| f.response_headers.as_ref());
                     timeouts = view.rules[rule].timeouts.as_ref();
@@ -1086,6 +1104,78 @@ impl Serving {
         }
     }
 
+    /// Decides the copies of the request for the `mirrors` of its rule and starts those that
+    /// can start now (spec §7.9 "Mirrors"): `true` when one was started. Nothing here waits.
+    fn mirror(
+        &self,
+        mirrors: &[MirrorView],
+        (head, as_sent): (&Parts, Option<&HeaderMap>),
+        body: mirror::Body,
+        (timeouts, began): (Option<&TimeoutsView>, Instant),
+        protocol: Protocol,
+    ) -> bool {
+        if mirrors.is_empty() {
+            return false;
+        }
+        let router = self.mesh.router();
+        let labels: Vec<String> = mirrors
+            .iter()
+            .map(|m| format!("{}:{}", m.service, m.port))
+            .collect();
+        // Each mirror takes its own random value, drawn or not.
+        let candidates: Vec<Candidate<'_>> = mirrors
+            .iter()
+            .zip(&labels)
+            .map(|(m, port)| Candidate {
+                port,
+                drawn: mirror::drawn(m.numerator, m.denominator, router.random()),
+            })
+            .collect();
+        let share = u64::try_from(self.mesh.replay_share()).unwrap_or(u64::MAX);
+        let timeout = u64::try_from(router.mirror_timeout.as_millis()).unwrap_or(u64::MAX);
+        let ms = mirror::deadline_ms(timeout, timeouts);
+        let deadline = began
+            .checked_add(Duration::from_millis(ms))
+            .unwrap_or_else(|| Instant::now() + router.mirror_timeout);
+        let mut started = false;
+        let decided = router.mirror_decide(&candidates, body, share);
+        for ((m, label), decision) in mirrors.iter().zip(&labels).zip(decided) {
+            let Some((decision, slot)) = decision else {
+                continue;
+            };
+            let result = match (decision, slot) {
+                (mirror::Decision::Send, Some(slot)) => {
+                    let Some(backend) = router.backend(&m.service, m.port) else {
+                        router.metrics.mirrored(label, "error");
+                        continue;
+                    };
+                    let copy = Copy {
+                        mesh: self.mesh.clone(),
+                        backend,
+                        protocol,
+                        origin: self.origin.clone(),
+                        head: CopyHead::of(
+                            head,
+                            as_sent
+                                .filter(|_| m.before_modifier)
+                                .unwrap_or(&head.headers),
+                        ),
+                        deadline,
+                        _slot: slot,
+                    };
+                    tokio::spawn(copy.run());
+                    started = true;
+                    continue;
+                }
+                (mirror::Decision::SkipLimit, _) => "skipped_limit",
+                // A copy that waits for the end of its body is not started yet.
+                _ => "skipped_body",
+            };
+            router.metrics.mirrored(label, result);
+        }
+        started
+    }
+
     /// The delay before the try that follows a try that ended with `outcome`.
     async fn pause(&self, outcome: Outcome) {
         let router = self.mesh.router();
@@ -1182,6 +1272,141 @@ impl Serving {
             },
             began.elapsed(),
         );
+    }
+}
+
+/// The body of a request as its head tells it (spec §7.9 "Mirrors").
+fn body_state(headers: &HeaderMap, ended: bool) -> mirror::Body {
+    if ended {
+        return mirror::Body::None;
+    }
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(mirror::Body::Unknown, mirror::Body::Declared)
+}
+
+/// The head of a copy: what the primary's first try sends, or what the app sent.
+struct CopyHead {
+    method: Method,
+    uri: hyper::Uri,
+    version: hyper::Version,
+    headers: HeaderMap,
+    extensions: Extensions,
+}
+
+impl CopyHead {
+    fn of(head: &Parts, headers: &HeaderMap) -> CopyHead {
+        CopyHead {
+            method: head.method.clone(),
+            uri: head.uri.clone(),
+            version: head.version,
+            headers: headers.clone(),
+            extensions: head.extensions.clone(),
+        }
+    }
+
+    fn request(&self) -> Request<Attempt> {
+        let mut request = Request::new(Attempt::bodiless());
+        *request.method_mut() = self.method.clone();
+        *request.uri_mut() = self.uri.clone();
+        *request.version_mut() = self.version;
+        *request.headers_mut() = self.headers.clone();
+        *request.extensions_mut() = self.extensions.clone();
+        request
+    }
+}
+
+/// A copy of a request on its way to a pod of a mirror (spec §7.9 "Mirrors"): one try, in its
+/// own task and on pools of its own, never awaited by the request. It holds its slot until it
+/// ends.
+struct Copy {
+    mesh: MeshState,
+    backend: Arc<Backend>,
+    protocol: Protocol,
+    origin: Option<Arc<Origin>>,
+    head: CopyHead,
+    /// When the copy is given up, wherever it is.
+    deadline: Instant,
+    _slot: Slot,
+}
+
+impl Copy {
+    async fn run(self) {
+        let router = self.mesh.router();
+        let _armed = Armed::new(&router.timers);
+        let result = self.attempt().await;
+        router.metrics.mirrored(&self.backend.label, result);
+    }
+
+    /// `sent` when a response head came back, else `error`.
+    async fn attempt(&self) -> &'static str {
+        let router = self.mesh.router();
+        let at = tokio::time::Instant::from(self.deadline);
+        let Plan::Pod(pick) = self.backend.plan(router, &mut Planner::new(0)) else {
+            return "error";
+        };
+        let upstream = pick.endpoint().addr;
+        let mut lease: Option<Lease> = None;
+        // An unwritten request, because the pod had closed the connection, goes once more on a
+        // new one: the same try.
+        let response = loop {
+            let connected = tokio::time::timeout_at(
+                at,
+                router.mirror_pools.checkout(
+                    upstream,
+                    self.protocol,
+                    self.origin.as_ref(),
+                    lease.as_ref(),
+                    router.connect_timeout,
+                ),
+            )
+            .await;
+            let mut connected = match connected {
+                Ok(Ok(connected)) => {
+                    router.succeeded(&pick);
+                    connected
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(%upstream, error = %e, "connect to the mirror's pod failed");
+                    router.failed(&pick);
+                    return "error";
+                }
+                Err(_) => return "error",
+            };
+            let sent = tokio::time::timeout_at(at, connected.send(self.head.request())).await;
+            match sent {
+                Err(_) => {
+                    connected.discard();
+                    return "error";
+                }
+                Ok(Sent::Response(response)) => {
+                    lease = Some(connected);
+                    break response;
+                }
+                Ok(Sent::Unsent) if lease.is_none() => lease = Some(connected),
+                Ok(Sent::Unsent | Sent::Failed(_)) => return "error",
+            }
+        };
+        // The answer is read and dropped as it comes; one that is not over at the deadline
+        // costs the connection.
+        let mut body = response.into_body();
+        let drained = tokio::time::timeout_at(at, async {
+            while let Some(frame) = body.frame().await {
+                if frame.is_err() {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+        if !matches!(drained, Ok(true))
+            && let Some(lease) = lease.as_mut()
+        {
+            lease.discard();
+        }
+        "sent"
     }
 }
 

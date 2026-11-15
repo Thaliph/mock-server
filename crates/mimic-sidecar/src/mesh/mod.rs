@@ -492,6 +492,11 @@ impl MeshState {
                 config.connect_timeout,
                 config.avoid_failed_for,
                 config.refusal_delay,
+                router::MirrorConfig {
+                    max_in_flight: config.mirror_max_in_flight,
+                    max_in_flight_total: config.mirror_max_in_flight_total,
+                    timeout: config.mirror_timeout,
+                },
             ),
             seen: AtomicBool::new(false),
         }))
@@ -541,6 +546,11 @@ impl MeshState {
     /// The buffer of a request that may be sent again (spec §7.9 "Retries", "Bodies").
     pub fn replay(&self) -> Replay {
         self.0.replay.replay(self.0.retry_buffer)
+    }
+
+    /// The bytes one request may hold, for retries and mirrors (`MIMIC_MESH_RETRY_BUFFER`).
+    pub(crate) fn replay_share(&self) -> usize {
+        self.0.retry_buffer
     }
 
     pub(crate) fn router(&self) -> &Router {

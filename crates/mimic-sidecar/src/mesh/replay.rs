@@ -323,7 +323,7 @@ impl Source {
             (shared.replay.snapshot(), shared.generation)
         };
         let mut request = Request::new(Attempt {
-            shared: self.shared.clone(),
+            shared: Some(self.shared.clone()),
             generation,
             queue,
             hint: self.hint,
@@ -352,7 +352,8 @@ impl Drop for Source {
 
 /// The body of one try.
 pub(crate) struct Attempt {
-    shared: Arc<Mutex<Shared>>,
+    /// The request's body; none for the copy of a request without one.
+    shared: Option<Arc<Mutex<Shared>>>,
     generation: u64,
     /// What was held when the try began, still to send.
     queue: VecDeque<Segment>,
@@ -362,6 +363,17 @@ pub(crate) struct Attempt {
 }
 
 impl Attempt {
+    /// The body of the copy of a request that has none (spec §7.9 "Mirrors").
+    pub(crate) fn bodiless() -> Attempt {
+        Attempt {
+            shared: None,
+            generation: 0,
+            queue: VecDeque::new(),
+            hint: SizeHint::with_exact(0),
+            trailed: true,
+        }
+    }
+
     /// A later try took the body, or the request is over: this one fails and reads nothing.
     fn stale(&self, shared: &Shared) -> bool {
         shared.closed || shared.generation != self.generation
@@ -377,7 +389,10 @@ impl Body for Attempt {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let this = self.get_mut();
-        let mut shared = lock(&this.shared);
+        let Some(shared) = &this.shared else {
+            return Poll::Ready(None);
+        };
+        let mut shared = lock(shared);
         if this.stale(&shared) {
             // An error, never the end of the body: the connection of this try must not be able
             // to complete a request that is cut (`hyper` closes an HTTP/1 connection, resets an
@@ -440,7 +455,10 @@ impl Body for Attempt {
     }
 
     fn is_end_stream(&self) -> bool {
-        let shared = lock(&self.shared);
+        let Some(shared) = &self.shared else {
+            return true;
+        };
+        let shared = lock(shared);
         if self.stale(&shared) {
             return false;
         }

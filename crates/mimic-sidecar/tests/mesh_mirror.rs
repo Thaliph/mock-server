@@ -417,21 +417,21 @@ async fn rte_83_an_http1_get_is_copied_with_the_modified_fields() {
         String::from_utf8_lossy(&original),
         "the copy is the request the backend got"
     );
-    let text = String::from_utf8_lossy(&copy).to_lowercase();
-    assert!(text.starts_with("get /cart?a=1 http/1.1\r\n"), "{text}");
-    assert!(text.contains("host: cart.shop.svc:80"), "{text}");
+    let wire = String::from_utf8_lossy(&copy).to_lowercase();
+    assert!(wire.starts_with("get /cart?a=1 http/1.1\r\n"), "{wire}");
+    assert!(wire.contains("host: cart.shop.svc:80"), "{wire}");
     assert!(
-        text.contains("x-env: prod") && !text.contains("x-debug"),
-        "{text}"
+        wire.contains("x-env: prod") && !wire.contains("x-debug"),
+        "{wire}"
     );
-    assert!(text.contains("X-Keep: Mixed Case".to_lowercase().as_str()));
+    assert!(wire.contains("X-Keep: Mixed Case".to_lowercase().as_str()));
     assert!(String::from_utf8_lossy(&copy).contains("X-Keep: Mixed Case\r\n"));
     assert_eq!(shadow.counts.requests(), 1, "exactly one request");
-    let line = &logs.access_exactly(1).await[0];
-    assert_eq!(line["mirrored"], true, "{line}");
-    assert_eq!(line["route"], "shop/mirror", "{line}");
-    assert_eq!(line["backend"], "shop/cart-v1:80", "{line}");
-    assert_eq!(line["upstream"], primary.addr.to_string(), "{line}");
+    let entry = &logs.access_exactly(1).await[0];
+    assert_eq!(entry["mirrored"], true, "{entry}");
+    assert_eq!(entry["route"], "shop/mirror", "{entry}");
+    assert_eq!(entry["backend"], "shop/cart-v1:80", "{entry}");
+    assert_eq!(entry["upstream"], primary.addr.to_string(), "{entry}");
 }
 
 #[tokio::test]
@@ -663,9 +663,9 @@ async fn ten(
         took.push(began.elapsed());
         answers.push((without_date(&head), body.into_bytes()));
     }
-    for line in logs.access_exactly(10).await {
-        assert_eq!(line["attempts"], 1, "{line}");
-        assert_eq!(line["upstream"], primary.addr.to_string(), "{line}");
+    for entry in logs.access_exactly(10).await {
+        assert_eq!(entry["attempts"], 1, "{entry}");
+        assert_eq!(entry["upstream"], primary.addr.to_string(), "{entry}");
     }
     if with_mirror {
         until("every copy is counted", || {
@@ -1287,7 +1287,7 @@ async fn rte_88_a_copy_is_not_routed_again() {
     );
     // The mirror Service has its own route to `shop/other`, with a mirror to `shop/third`.
     let shadow_svc = svc("shop/cart-shadow", &[shadow.addr])
-        .ip("127.0.0.1")
+        .ip("127.0.0.2")
         .rules(&[rule("/", "shop/other", &[mirror("shop/third")], None, None)]);
     let state = state_with(
         routed(
@@ -1357,7 +1357,7 @@ async fn rte_88_discovery_and_the_logs_hold_the_apps_exchange_once() {
     logs.access_exactly(3).await;
     let text = logs.text();
     assert!(
-        !text.contains("cart-shadow") || text.contains("\"mirrored\":true"),
+        !wire.contains("cart-shadow") || wire.contains("\"mirrored\":true"),
         "one access line per app request, no line per copy"
     );
 }

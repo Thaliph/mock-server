@@ -43,6 +43,8 @@ const RESULTS: [Outcome; 7] = [
     Outcome::QueueTimeout,
     Outcome::AppRefused,
 ];
+/// Every `result` of a copy sent to a mirror (spec §7.9 "Mirrors").
+const MIRRORED: [&str; 4] = ["sent", "error", "skipped_body", "skipped_limit"];
 const SKIPS: [&str; 3] = ["exhausted", "method", "buffer"];
 
 /// Every `status_class` value, to remove the series of an evicted endpoint.
@@ -156,6 +158,7 @@ pub(crate) struct MeshMetrics {
     attempts: Family<ResultLabels, Counter>,
     retries: Family<ReasonLabels, Counter>,
     skipped: Family<ReasonLabels, Counter>,
+    mirrored: Family<ResultLabels, Counter>,
     /// `x-mimic-*` fields removed from app responses by the inbound side (spec §4.1).
     /// Without labels, and made by the first removal: nothing of the mesh shows until then
     /// (MSH-51).
@@ -184,6 +187,7 @@ impl MeshMetrics {
             attempts: Family::default(),
             retries: Family::default(),
             skipped: Family::default(),
+            mirrored: Family::default(),
             stripped: Family::default(),
             unframed: Family::default(),
             inbound_refusals: Family::default(),
@@ -240,6 +244,11 @@ impl MeshMetrics {
             "mesh_retries_skipped",
             "Failures of a retried kind that were not retried, by reason",
             self.skipped.clone(),
+        );
+        registry.register(
+            "mesh_mirrored",
+            "Copies of routed requests for the mirrors of the rule, by mirror Service port and result",
+            self.mirrored.clone(),
         );
         registry.register(
             "mesh_reconnects",
@@ -328,6 +337,17 @@ impl MeshMetrics {
             .get_or_create(&ReasonLabels {
                 backend: backend.to_string(),
                 reason,
+            })
+            .inc();
+    }
+
+    /// A copy of a request for a mirror of `backend` ended with `result` (one of [`MIRRORED`]).
+    pub(crate) fn mirrored(&self, backend: &str, result: &'static str) {
+        self.track(backend, None);
+        self.mirrored
+            .get_or_create(&ResultLabels {
+                backend: backend.to_string(),
+                result,
             })
             .inc();
     }
@@ -529,6 +549,12 @@ impl MeshMetrics {
                 self.skipped.remove(&ReasonLabels {
                     backend: backend.clone(),
                     reason,
+                });
+            }
+            for result in MIRRORED {
+                self.mirrored.remove(&ResultLabels {
+                    backend: backend.clone(),
+                    result,
                 });
             }
             false
