@@ -782,8 +782,8 @@ async fn rte_84_a_mirror_answering_after_50_ms_is_sent() {
 async fn rte_84_a_primary_that_times_out_has_its_copy_sent() {
     let _logs = capture_logs();
     let (primary, shadow) = (
-        Pod::http1("own", 2000).await,
-        Pod::http1("shadow", 50).await,
+        Pod::http1("own", 5000).await,
+        Pod::http1("shadow", 150).await,
     );
     let state = state_with(
         routed(
@@ -794,7 +794,7 @@ async fn rte_84_a_primary_that_times_out_has_its_copy_sent() {
                 "shop/cart-v1",
                 &[mirror("shop/cart-shadow")],
                 None,
-                Some(r#"{"requestMs":100}"#),
+                Some(r#"{"requestMs":600}"#),
             ),
         ),
         |_| {},
@@ -806,6 +806,7 @@ async fn rte_84_a_primary_that_times_out_has_its_copy_sent() {
         mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
     })
     .await;
+    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "error"), 0.0);
 }
 
 // RTE-86: slots.
@@ -1605,4 +1606,801 @@ async fn rte_92_the_series_are_per_mirror_port_and_leave_5_minutes_after_the_vie
     assert_eq!(series(&f.metrics.encode()).len(), 300, "kept");
     state.evict(now + Duration::from_secs(301));
     assert!(series(&f.metrics.encode()).is_empty(), "gone");
+}
+
+// RTE-87: mode `mock` mirrors nothing.
+
+#[tokio::test]
+async fn rte_87_mode_mock_mirrors_nothing() {
+    let _logs = capture_logs();
+    let (primary, shadow) = (Pod::http1("own", 0).await, Pod::http1("shadow", 0).await);
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                None,
+                None,
+            ),
+        ),
+        |_| {},
+    );
+    let rig = common::mock_rig::rig_with(
+        common::mock_rig::users_set(5),
+        100,
+        1024,
+        None,
+        common::mock_rig::Options {
+            mode: Some(mimic_core::Mode::Discovery),
+            dst: Some(cluster_ip()),
+            mesh: Some(state),
+            ..common::mock_rig::Options::default()
+        },
+    )
+    .await;
+    let request = b"GET /users/1 HTTP/1.1\r\nhost: users.test:8080\r\n\r\n";
+    let mut client = H1Client::connect(rig.addr).await;
+    client.send(request).await;
+    let (head, body) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200") && body == b"own", "{head}");
+    let sent = || {
+        metric(
+            &rig.metrics.encode(),
+            "mimic_mesh_mirrored_total{",
+            &["result=\"sent\""],
+        )
+    };
+    until("the balanced request is mirrored", || {
+        shadow.counts.requests() == 1 && sent() == 1.0
+    })
+    .await;
+    rig.mode
+        .observe(mimic_sidecar::mode::Announced {
+            mode: Ok(mimic_core::Mode::Mock),
+            factor: None,
+        })
+        .await;
+    client.send(request).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(
+        head.to_ascii_lowercase().contains("x-mimic-match"),
+        "{head}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        shadow.counts.requests(),
+        1,
+        "the mocked request has no copy"
+    );
+    assert_eq!(sent(), 1.0);
+    let scrape = rig.metrics.encode();
+    assert_eq!(
+        metric(&scrape, "mimic_mesh_mirrored_total{", &[]),
+        1.0,
+        "nothing else is counted"
+    );
+}
+
+// RTE-83 (bodies), RTE-85, RTE-90: request bodies of copies.
+
+/// What a `BodyPod` read of one request, once its body ended.
+#[derive(Clone, Debug, Default)]
+struct Got {
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    trailers: Vec<(String, String)>,
+}
+
+/// An HTTP/1 or `h2c` pod that reads whole bodies and answers once it has them, after `wait`.
+struct BodyPod {
+    addr: SocketAddr,
+    got: Arc<Mutex<Vec<Got>>>,
+    /// Requests whose head came in, complete or not.
+    started: Arc<AtomicUsize>,
+}
+
+impl BodyPod {
+    async fn start(h2: bool, wait: Duration) -> BodyPod {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (got, started) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let (log, count) = (got.clone(), started.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (log, count) = (log.clone(), count.clone());
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let (log, count) = (log.clone(), count.clone());
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let (parts, mut body) = req.into_parts();
+                        let mut seen = Got {
+                            method: parts.method.to_string(),
+                            headers: parts
+                                .headers
+                                .iter()
+                                .filter(|(n, _)| *n != "host")
+                                .map(|(n, v)| (n.to_string(), v.to_str().unwrap().to_string()))
+                                .collect(),
+                            ..Got::default()
+                        };
+                        while let Some(frame) = body.frame().await {
+                            let frame = frame.map_err(std::io::Error::other)?;
+                            match frame.into_data() {
+                                Ok(data) => seen.body.extend_from_slice(&data),
+                                Err(frame) => {
+                                    for (n, v) in frame.into_trailers().unwrap_or_default().iter() {
+                                        seen.trailers
+                                            .push((n.to_string(), v.to_str().unwrap().to_string()));
+                                    }
+                                }
+                            }
+                        }
+                        log.lock().unwrap().push(seen);
+                        tokio::time::sleep(wait).await;
+                        Ok::<_, std::io::Error>(Response::new(http_body_util::Full::new(
+                            Bytes::from_static(b"seen"),
+                        )))
+                    }
+                });
+                tokio::spawn(async move {
+                    if h2 {
+                        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    } else {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    }
+                });
+            }
+        });
+        BodyPod { addr, got, started }
+    }
+
+    fn got(&self) -> Vec<Got> {
+        self.got.lock().unwrap().clone()
+    }
+
+    fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+}
+
+fn payload(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+fn post_head(extra: &str) -> Vec<u8> {
+    format!("POST /up HTTP/1.1\r\nHost: cart.shop.svc:80\r\nX-Debug: 1\r\n{extra}\r\n").into_bytes()
+}
+
+/// The head and the chunked encoding of `parts`, the last one ended.
+fn chunked(parts: &[&[u8]]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    for part in parts {
+        wire.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+        wire.extend_from_slice(part);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    wire
+}
+
+/// A primary and a mirror reading bodies behind a rule with the request modifier.
+async fn body_rig(
+    h2: bool,
+    configure: impl FnOnce(&mut MeshConfig),
+) -> (BodyPod, BodyPod, common::Fixture) {
+    let (primary, shadow) = (
+        BodyPod::start(h2, Duration::ZERO).await,
+        BodyPod::start(h2, Duration::ZERO).await,
+    );
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                Some(MODIFIER),
+                None,
+            ),
+        ),
+        configure,
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    (primary, shadow, f)
+}
+
+/// Samples `mimic_mesh_retry_buffer_bytes` every millisecond; the highest value seen so far.
+fn peak_buffer(f: &common::Fixture) -> Arc<std::sync::atomic::AtomicU64> {
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (metrics, top) = (f.metrics.clone(), peak.clone());
+    tokio::spawn(async move {
+        loop {
+            let now = metric(&metrics.encode(), "mimic_mesh_retry_buffer_bytes", &[]) as u64;
+            top.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    peak
+}
+
+fn buffer_bytes(f: &common::Fixture) -> f64 {
+    metric(&f.metrics.encode(), "mimic_mesh_retry_buffer_bytes", &[])
+}
+
+#[tokio::test]
+async fn rte_83_an_http1_post_with_a_content_length_is_copied_with_its_body() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(false, |_| {}).await;
+    let body = payload(1024);
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(&post_head("Content-Length: 1024\r\n")).await;
+    client.send(&body).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the copy is counted", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+    let (copy, original) = (shadow.got(), primary.got());
+    assert_eq!((copy.len(), original.len()), (1, 1));
+    assert_eq!(copy[0].method, "POST");
+    assert_eq!(copy[0].body, body);
+    assert_eq!(copy[0].headers, original[0].headers);
+    assert!(copy[0].headers.contains(&("x-env".into(), "prod".into())));
+    assert!(!copy[0].headers.iter().any(|(n, _)| n == "x-debug"));
+    assert!(
+        copy[0]
+            .headers
+            .contains(&("content-length".into(), "1024".into()))
+    );
+}
+
+#[tokio::test]
+async fn rte_83_an_http1_chunked_post_is_copied_with_its_body() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(false, |_| {}).await;
+    let body = payload(1024);
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(&post_head("Transfer-Encoding: chunked\r\n"))
+        .await;
+    client.send(&chunked(&[&body[..300], &body[300..]])).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the copy is counted", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+    let (copy, original) = (shadow.got(), primary.got());
+    assert_eq!(copy[0].body, body);
+    assert_eq!(copy[0].headers, original[0].headers);
+    assert!(
+        copy[0]
+            .headers
+            .contains(&("transfer-encoding".into(), "chunked".into()))
+    );
+}
+
+/// One `h2c` POST with `parts` as DATA frames and then `trailers`; the status.
+async fn h2c_post(addr: SocketAddr, parts: Vec<Vec<u8>>, trailers: &[(&str, &str)]) -> StatusCode {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, http_body_util::StreamBody<
+            futures::stream::Iter<
+                std::vec::IntoIter<Result<hyper::body::Frame<Bytes>, std::convert::Infallible>>,
+            >,
+        >>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let mut frames: Vec<_> = parts
+        .into_iter()
+        .map(|p| Ok(hyper::body::Frame::data(Bytes::from(p))))
+        .collect();
+    if !trailers.is_empty() {
+        let mut map = hyper::HeaderMap::new();
+        for (n, v) in trailers {
+            map.insert(
+                hyper::header::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                (*v).parse().unwrap(),
+            );
+        }
+        frames.push(Ok(hyper::body::Frame::trailers(map)));
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://cart.shop.svc/up")
+        .header("x-debug", "1")
+        .body(http_body_util::StreamBody::new(futures::stream::iter(
+            frames,
+        )))
+        .unwrap();
+    let response = sender.send_request(request).await.expect("an answer");
+    let status = response.status();
+    let _ = response.into_body().collect().await;
+    status
+}
+
+#[tokio::test]
+async fn rte_83_an_h2c_post_is_copied_with_its_body_and_trailers() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(true, |_| {}).await;
+    let body = payload(1024);
+    let status = h2c_post(
+        f.addr,
+        vec![body[..400].to_vec(), body[400..].to_vec()],
+        &[("x-sum", "abc")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    until("the copy is counted", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+    let (copy, original) = (shadow.got(), primary.got());
+    assert_eq!(copy[0].body, body);
+    assert_eq!(
+        copy[0].trailers,
+        vec![("x-sum".to_string(), "abc".to_string())]
+    );
+    assert_eq!(copy[0].trailers, original[0].trailers);
+    assert_eq!(copy[0].headers, original[0].headers);
+    assert!(copy[0].headers.contains(&("x-env".into(), "prod".into())));
+}
+
+#[tokio::test]
+async fn rte_85_a_body_of_exactly_the_buffer_is_mirrored_byte_for_byte() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 64 * 1024).await;
+    let body = payload(64 * 1024);
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(&post_head("Content-Length: 65536\r\n")).await;
+    client.send(&body).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the copy is counted", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+    assert_eq!(shadow.got()[0].body, body);
+    assert_eq!(primary.got()[0].body, body);
+    until("the buffer is given back", || buffer_bytes(&f) == 0.0).await;
+}
+
+#[tokio::test]
+async fn rte_85_a_declared_body_over_the_buffer_is_skipped_at_the_head() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 64 * 1024).await;
+    let peak = peak_buffer(&f);
+    let body = payload(64 * 1024 + 1);
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(&post_head("Content-Length: 65537\r\n")).await;
+    assert!(
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") <= 1.0,
+        "counted at most once"
+    );
+    until("skipped at the head", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    client.send(&body).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(primary.got()[0].body, body, "the primary has every byte");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(shadow.started(), 0);
+    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "sent"), 0.0);
+    assert_eq!(peak.load(Ordering::SeqCst), 0, "nothing was held for it");
+}
+
+#[tokio::test]
+async fn rte_85_a_chunked_body_is_skipped_once_it_passes_the_buffer() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 64 * 1024).await;
+    let body = payload(80_000);
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(&post_head("Transfer-Encoding: chunked\r\n"))
+        .await;
+    client
+        .send(&chunked(&[&body[..40_000], &body[40_000..]]))
+        .await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(primary.got()[0].body, body, "the primary has every byte");
+    until("skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    assert_eq!(shadow.started(), 0);
+    until("the buffer is given back", || buffer_bytes(&f) == 0.0).await;
+}
+
+#[tokio::test]
+async fn rte_85_a_body_is_skipped_when_the_total_is_held_by_other_requests() {
+    let _logs = capture_logs();
+    let (silent, shadow) = (
+        SilentPod::start().await,
+        BodyPod::start(false, Duration::ZERO).await,
+    );
+    let main = rule(
+        "/",
+        "shop/cart-v1",
+        &[mirror("shop/cart-shadow")],
+        None,
+        None,
+    );
+    let hold = rule("/hold", "shop/silent", &[], None, None);
+    let state = state_with(
+        routed(
+            silent.addr,
+            &[
+                svc("shop/cart-shadow", &[shadow.addr]),
+                svc("shop/silent", &[silent.addr]),
+            ],
+            format!("{hold},{main}"),
+        ),
+        |c| {
+            c.retry_buffer = 64 * 1024;
+            c.retry_buffer_total = 100 * 1024;
+        },
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let body = payload(64 * 1024);
+    let mut holder = H1Client::connect(f.addr).await;
+    holder
+        .send(b"POST /hold HTTP/1.1\r\nHost: cart.shop.svc:80\r\nContent-Length: 65536\r\n\r\n")
+        .await;
+    holder.send(&body).await;
+    until("the total is in use", || buffer_bytes(&f) >= 64.0 * 1024.0).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(&post_head("Content-Length: 65536\r\n")).await;
+    client.send(&body).await;
+    until("skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    assert_eq!(shadow.started(), 0);
+}
+
+#[tokio::test]
+async fn rte_85_a_client_that_leaves_in_the_middle_of_a_chunked_upload_sends_nothing() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(false, |_| {}).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(&post_head("Transfer-Encoding: chunked\r\n"))
+        .await;
+    client.send(b"3e8\r\n").await;
+    client.send(&payload(1000)).await;
+    until("the primary began", || primary.started() == 1).await;
+    drop(client);
+    until("skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(shadow.started(), 0);
+    until("the buffer is given back", || buffer_bytes(&f) == 0.0).await;
+}
+
+#[tokio::test]
+async fn rte_85_an_h2c_client_that_resets_its_stream_sends_nothing() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) = body_rig(true, |_| {}).await;
+    let stream = tokio::net::TcpStream::connect(f.addr).await.unwrap();
+    type Frames = futures::stream::Chain<
+        futures::stream::Iter<
+            std::vec::IntoIter<Result<hyper::body::Frame<Bytes>, std::convert::Infallible>>,
+        >,
+        futures::stream::Pending<Result<hyper::body::Frame<Bytes>, std::convert::Infallible>>,
+    >;
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, http_body_util::StreamBody<Frames>>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    use futures::StreamExt;
+    let frames = futures::stream::iter(vec![Ok(hyper::body::Frame::data(Bytes::from(payload(
+        500,
+    ))))])
+    .chain(futures::stream::pending());
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://cart.shop.svc/up")
+        .body(http_body_util::StreamBody::new(frames))
+        .unwrap();
+    let call = tokio::spawn(async move { sender.send_request(request).await });
+    until("the primary began", || primary.started() == 1).await;
+    call.abort();
+    until("skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    assert_eq!(shadow.started(), 0);
+}
+
+#[tokio::test]
+async fn rte_85_a_body_that_has_not_ended_at_the_deadline_is_skipped() {
+    let _logs = capture_logs();
+    let (primary, shadow, f) =
+        body_rig(false, |c| c.mirror_timeout = Duration::from_millis(500)).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let began = Instant::now();
+    client
+        .send(&post_head("Transfer-Encoding: chunked\r\n"))
+        .await;
+    client.send(b"5\r\nhello\r\n").await;
+    until("the primary began", || primary.started() == 1).await;
+    let took = until("skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    let took = took.max(began.elapsed());
+    assert!(
+        took >= Duration::from_millis(450) && took < Duration::from_millis(1200),
+        "skipped after {took:?}"
+    );
+    // The client finishes late: nothing is sent, nothing is counted twice.
+    client.send(b"0\r\n\r\n").await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(shadow.started(), 0);
+    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "skipped_body"), 1.0);
+    until("the buffer is given back", || buffer_bytes(&f) == 0.0).await;
+}
+
+#[tokio::test]
+async fn rte_85_without_a_buffer_a_get_is_sent_and_a_post_with_a_body_is_skipped() {
+    let _logs = capture_logs();
+    let (_primary, shadow, f) = body_rig(false, |c| c.retry_buffer = 0).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(&post_head("")).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the GET is sent", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+    client.send(&post_head("Content-Length: 5\r\n")).await;
+    client.send(b"hello").await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    until("the POST with a body is skipped", || {
+        mirrored(&f, "shop/cart-shadow:80", "skipped_body") == 1.0
+    })
+    .await;
+    assert_eq!(shadow.got().len(), 1, "only the request without a body");
+}
+
+#[tokio::test]
+async fn rte_85_three_mirrors_and_a_retried_primary_hold_one_copy_of_the_body() {
+    let _logs = capture_logs();
+    let primary = BodyPod::start(false, Duration::ZERO).await;
+    let shadows = [
+        BodyPod::start(false, Duration::ZERO).await,
+        BodyPod::start(false, Duration::ZERO).await,
+        BodyPod::start(false, Duration::ZERO).await,
+    ];
+    let services = [
+        svc("shop/shadow-a", &[shadows[0].addr]),
+        svc("shop/shadow-b", &[shadows[1].addr]),
+        svc("shop/shadow-c", &[shadows[2].addr]),
+    ];
+    let dead = closed_port().await;
+    let mut all = vec![
+        svc("shop/cart", &[]).ip("127.0.0.1").rules(&[rule(
+            "/",
+            "shop/cart-v1",
+            &[
+                mirror("shop/shadow-a"),
+                mirror("shop/shadow-b"),
+                mirror("shop/shadow-c"),
+            ],
+            None,
+            None,
+        )]),
+        svc("shop/cart-v1", &[dead, primary.addr]),
+    ];
+    all.extend(services);
+    let state = state_with(view(&all), |c| {
+        c.avoid_failed_for = Duration::from_millis(1)
+    });
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let peak = peak_buffer(&f);
+    let body = payload(32 * 1024);
+    let mut client = H1Client::connect(f.addr).await;
+    for _ in 0..10 {
+        client.send(&post_head("Content-Length: 32768\r\n")).await;
+        client.send(&body).await;
+        let (head, _) = client.read().await.expect("an answer");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    }
+    for shadow in &shadows {
+        until("every copy arrived", || shadow.got().len() == 10).await;
+    }
+    let scrape = f.metrics.encode();
+    assert!(
+        metric(&scrape, "mimic_mesh_retries_total", &[]) >= 1.0,
+        "a try was retried"
+    );
+    let top = peak.load(Ordering::SeqCst);
+    assert!(
+        (32 * 1024..=40 * 1024).contains(&top),
+        "the peak was {top}: one copy of the body, not four"
+    );
+    until("the buffer is back to 0", || buffer_bytes(&f) == 0.0).await;
+}
+
+#[tokio::test]
+async fn rte_90_a_client_that_goes_away_after_its_body_ended_does_not_cancel_the_copy() {
+    let _logs = capture_logs();
+    let primary = BodyPod::start(false, Duration::from_millis(500)).await;
+    let shadow = BodyPod::start(false, Duration::from_millis(300)).await;
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[shadow.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                None,
+                None,
+            ),
+        ),
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let body = payload(2048);
+    let mut client = H1Client::connect(f.addr).await;
+    client.send(&post_head("Content-Length: 2048\r\n")).await;
+    client.send(&body).await;
+    until("the primary has the body", || primary.got().len() == 1).await;
+    drop(client);
+    until("the copy is counted", || {
+        mirrored(&f, "shop/cart-shadow:80", "sent") == 1.0
+    })
+    .await;
+    assert_eq!(shadow.got()[0].body, body, "the mirror has the whole body");
+    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "skipped_body"), 0.0);
+}
+
+#[tokio::test]
+async fn rte_90_pending_copies_leave_no_timer_slot_connection_or_byte() {
+    let _logs = capture_logs();
+    let (primary, silent) = (Pod::http1("own", 0).await, SilentPod::start().await);
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[svc("shop/cart-shadow", &[silent.addr])],
+            rule(
+                "/",
+                "shop/cart-v1",
+                &[mirror("shop/cart-shadow")],
+                None,
+                None,
+            ),
+        ),
+        |c| {
+            c.mirror_max_in_flight = 1024;
+            c.mirror_timeout = Duration::from_millis(500);
+        },
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let tasks: Vec<_> = (0..20)
+        .map(|_| {
+            let addr = f.addr;
+            tokio::spawn(async move {
+                let mut client = H1Client::connect(addr).await;
+                for _ in 0..50 {
+                    client
+                        .send(b"POST /x HTTP/1.1\r\nHost: cart.shop.svc:80\r\nContent-Length: 4\r\n\r\nbody")
+                        .await;
+                    let (head, _) = client.read().await.expect("an answer");
+                    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    // Every primary ended: what is armed is at most one timer per copy still in flight.
+    assert!(state.armed_timers_for_test() <= 1000);
+    until("the copies ended", || {
+        mirrored(&f, "shop/cart-shadow:80", "error") == 1000.0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(state.armed_timers_for_test(), 0);
+    assert_eq!(buffer_bytes(&f), 0.0);
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(&scrape, "mimic_mesh_endpoint_in_flight{", &["cart-shadow"]),
+        0.0
+    );
+    assert_eq!(silent.open(), 0, "every copy connection was closed");
+}
+
+#[tokio::test]
+async fn rte_90_sigterm_starts_no_copy_and_does_not_wait_for_the_pending_ones() {
+    let _logs = capture_logs();
+    let (primary, shadow) = (
+        BodyPod::start(false, Duration::ZERO).await,
+        BodyPod::start(false, Duration::ZERO).await,
+    );
+    let silent = SilentPod::start().await;
+    let rules = format!(
+        "{},{}",
+        rule(
+            "/silent",
+            "shop/cart-v1",
+            &[mirror("shop/silent")],
+            None,
+            None
+        ),
+        rule(
+            "/",
+            "shop/cart-v1",
+            &[mirror("shop/cart-shadow")],
+            None,
+            None
+        )
+    );
+    let state = state_with(
+        routed(
+            primary.addr,
+            &[
+                svc("shop/cart-shadow", &[shadow.addr]),
+                svc("shop/silent", &[silent.addr]),
+            ],
+            rules,
+        ),
+        |c| c.mirror_timeout = Duration::from_secs(30),
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    // A copy in flight to a silent mirror, and a copy that waits for the end of its body.
+    let mut silent_client = H1Client::connect(f.addr).await;
+    silent_client
+        .send(b"GET /silent HTTP/1.1\r\nHost: cart.shop.svc:80\r\n\r\n")
+        .await;
+    silent_client.read().await.expect("an answer");
+    until("a copy is in flight", || silent.open() == 1).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(&post_head("Transfer-Encoding: chunked\r\n"))
+        .await;
+    client.send(b"5\r\nhello\r\n").await;
+    until("the primary began", || primary.started() == 1).await;
+    f.shared.shutdown();
+    // The body ends after the signal: no copy starts.
+    client.send(b"0\r\n\r\n").await;
+    let _ = client.read().await;
+    drop((client, silent_client));
+    let began = Instant::now();
+    f.shared.drain(Duration::from_secs(1)).await;
+    assert!(
+        began.elapsed() < Duration::from_millis(500),
+        "the pending copies did not hold the drain"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(shadow.started(), 0, "no copy starts after the signal");
+    assert_eq!(mirrored(&f, "shop/cart-shadow:80", "sent"), 0.0);
 }

@@ -249,6 +249,15 @@ struct Rig {
 /// The sidecar's outbound listener: the Service `shop/cart` with `pods` and the ClusterIP
 /// `cluster`, §5 interception with `trusted` in the image trust store.
 async fn rig(trusted: &CertificateDer<'static>, cluster: SocketAddr, pods: &[SocketAddr]) -> Rig {
+    rig_with_view(trusted, cluster, view_on(cluster, pods, 0, true)).await
+}
+
+/// Like [`rig`], the mesh view is `view`.
+async fn rig_with_view(
+    trusted: &CertificateDer<'static>,
+    cluster: SocketAddr,
+    view: mimic_core::mesh::view::View,
+) -> Rig {
     let trust = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(trust.path().join("trust/0")).unwrap();
     std::fs::write(trust.path().join("trust/0/image-ca.pem"), pem(trusted)).unwrap();
@@ -272,7 +281,7 @@ async fn rig(trusted: &CertificateDer<'static>, cluster: SocketAddr, pods: &[Soc
         ..MeshConfig::default()
     };
     let state = MeshState::new(&config);
-    state.hold(view_on(cluster, pods, 0, true), "\"1-a\"");
+    state.hold(view, "\"1-a\"");
     state.register(&mut metrics);
     let original: OriginalDst = Arc::new(move |_| Ok(cluster));
     let shared = Arc::new(
@@ -710,4 +719,98 @@ async fn rty_37_an_app_refusal_over_intercepted_tls_is_not_trusted() {
         0.0,
         "{scrape}"
     );
+}
+
+/// `shop/cart` (the ClusterIP the app dials) routed to `shop/cart-v1` with a mirror of every
+/// request to `shop/cart-shadow`.
+fn mirrored_view(primary: SocketAddr, shadow: SocketAddr) -> mimic_core::mesh::view::View {
+    let policy = r#""policy":{"loadBalancer":{"slowStartSeconds":0},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
+    let service = |key: &str, ips: &str, pod: Option<SocketAddr>, routes: &str| {
+        let pods = pod.map_or(String::new(), |p| {
+            format!(r#"{{"ip":"{}","port":{},"ready":true}}"#, p.ip(), p.port())
+        });
+        format!(
+            r#""{key}":{{"endpoints":{{"80":[{pods}]}},"generations":{{}},"ips":[{ips}],{policy},"ports":{{"80":{{"targetPort":8080}}}}{routes}}}"#
+        )
+    };
+    let routes = r#","routes":[{"name":"shop/mirror","rules":[{"backends":[{"port":80,"service":"shop/cart-v1","weight":1}],"filters":{"mirrors":[{"denominator":100,"numerator":100,"port":80,"service":"shop/cart-shadow"}]},"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}]"#;
+    let text = format!(
+        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{{},{},{}}}}}"#,
+        service("shop/cart", "\"127.0.0.1\"", None, routes),
+        service("shop/cart-v1", "", Some(primary), ""),
+        service("shop/cart-shadow", "", Some(shadow), ""),
+    );
+    mimic_core::mesh::view::View::from_json(&text, &mimic_core::mesh::view::Limits::default())
+        .unwrap()
+}
+
+fn mirrored(rig: &Rig, result: &str) -> f64 {
+    counter(
+        &rig.metrics
+            .encode()
+            .lines()
+            .filter(|l| l.contains("backend=\"shop/cart-shadow:80\"") && l.contains(result))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "mimic_mesh_mirrored_total",
+    )
+}
+
+#[tokio::test]
+async fn rte_91_mirror_pods_with_a_certificate_for_the_name_get_the_copy_over_tls() {
+    let _logs = capture_logs();
+    let (pod_ca, pod_root) = authority("pods");
+    let primary = tls_pod("primary", &pod_ca, names(&[NAME]), &[]).await;
+    let shadow = tls_pod("shadow", &pod_ca, names(&[NAME]), &[]).await;
+    let rig = rig_with_view(
+        &pod_root,
+        cluster(),
+        mirrored_view(primary.addr, shadow.addr),
+    )
+    .await;
+    let mut tls = client(&rig, service(), &[]).await;
+    let (status, body) = get(&mut tls).await;
+    assert_eq!(
+        (status.as_str(), body.as_str()),
+        ("HTTP/1.1 200 OK", "primary")
+    );
+    let began = std::time::Instant::now();
+    while mirrored(&rig, "result=\"sent\"") < 1.0 {
+        assert!(began.elapsed() < TIMEOUT, "the copy was never sent");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(shadow.requests.load(Ordering::SeqCst), 1);
+    let seen = shadow.sni.lock().unwrap().clone();
+    assert!(seen.iter().all(|s| s.as_deref() == Some(NAME)), "{seen:?}");
+}
+
+#[tokio::test]
+async fn rte_91_mirror_pods_with_a_certificate_for_another_name_fail_and_the_primary_answers() {
+    let _logs = capture_logs();
+    let (pod_ca, pod_root) = authority("pods");
+    let primary = tls_pod("primary", &pod_ca, names(&[NAME]), &[]).await;
+    let other = tls_pod("other", &pod_ca, names(&["pay.shop.svc"]), &[]).await;
+    let rig = rig_with_view(
+        &pod_root,
+        cluster(),
+        mirrored_view(primary.addr, other.addr),
+    )
+    .await;
+    let mut tls = client(&rig, service(), &[]).await;
+    let (status, body) = get(&mut tls).await;
+    assert_eq!(
+        (status.as_str(), body.as_str()),
+        ("HTTP/1.1 200 OK", "primary")
+    );
+    let began = std::time::Instant::now();
+    while mirrored(&rig, "result=\"error\"") < 1.0 {
+        assert!(began.elapsed() < TIMEOUT, "the copy was never counted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        other.requests.load(Ordering::SeqCst),
+        0,
+        "no byte reached it"
+    );
+    assert_eq!(mirrored(&rig, "result=\"sent\""), 0.0);
 }
