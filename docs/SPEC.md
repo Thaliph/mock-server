@@ -376,7 +376,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `attempts` | (M2) mesh-routed requests only: the number of tries (§7.9 "Retries"), 1 without a retry | (M2) L4-balanced connections only: the number of connects tried |
   | `route`, `rule` | (M3, #448) mesh-routed requests that a route rule matched (§7.9 "Routing"): the route's `<namespace>/<name>` and the index of the rule in it (0 first); absent otherwise. `backend` is then the backend Service port drawn, absent when none was (a `no-route`, `no-backend` or `invalid-backend` answer) | — |
   | `timeout` | (M3, #449) with `result: timeout` only: the route timeout that expired, `request` or `backendRequest` (§7.9 "Routing") | — |
-  | `mirrored` | (M3, #450) `true` when at least one copy of the request was sent to a mirror of the matched rule (§7.9 "Routing", "Mirrors"; result `sent` or `error`), absent otherwise (no mirror, none drawn, every one skipped) | — |
+  | `mirrored` | (M3, #450) `true` when at least one copy of the request was sent to a mirror of the matched rule (§7.9 "Routing", "Mirrors"; result `sent` or `error`), absent otherwise (no mirror, none drawn, every one skipped). It is read when the line is written: a copy still waiting for a body that has not ended then (HTTP/2 full duplex, the request body ending after the response) is not counted, so the field never claims a copy that was not sent | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace), (M3, #449) `timeout` (a route timeout expired: `status` 504 before the response head, the pod's status after it, §7.9 "Routing") | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
@@ -3079,7 +3079,7 @@ no insignificant whitespace):
       `mimic_mesh_endpoint_in_flight` (the shared `in_flight`) and `mimic_mesh_retry_buffer_bytes`;
       it writes no access line and no log line, and discovery records the app's request once,
       never a copy (`mimic_discovery_exchanges_total` does not count copies). The primary's
-      access line has `mirrored: true` when at least one copy was sent (`sent` or `error`).
+      access line has `mirrored: true` when, at the time the line is written, at least one copy was sent or failed (`sent` or `error` result): a copy of a request without a body counts from the decision, a copy with a body from the moment the body ended whole and held; a copy skipped (`skipped_body`, `skipped_limit`) or still waiting for the end of its body does not.
   - **Discovery** records the request as the app sent it (before the request modifier) and the
     response as the app received it (after the response modifier), under the app's authority:
     a value a route sets on a request is never recorded.
@@ -3163,8 +3163,10 @@ no insignificant whitespace):
     and the same body bytes. A request body that failed (the client left in the middle of a
     chunked upload, a decode error) is never replayed: the request is not retried and every later
     try fails its body, so no pod receives a cut body that looks complete. The budget counts what
-    is held in memory, the per-chunk bookkeeping included: small chunks are coalesced, so a body
-    of 1-byte chunks costs about its length, and `mimic_mesh_retry_buffer_bytes` reads that cost.
+    is held in memory, the per-chunk bookkeeping included: small chunks are coalesced into a buffer
+    that grows by doubling, and what is charged is its capacity, not the body's length: a body of
+    1-byte chunks costs about its length, but a body costs up to twice its length (never more than
+    the request's share), and `mimic_mesh_retry_buffer_bytes` reads that cost.
     The bytes of a request are released when its last try has read what it holds, or ended.
     From #450 the copies of a route's mirrors share these bytes and this accounting ("Routing",
     "Mirrors" above): the bytes are held until the copies waiting for them have them, and are

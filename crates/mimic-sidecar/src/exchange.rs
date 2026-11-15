@@ -254,7 +254,8 @@ pub(crate) struct Tracker {
     /// Mesh-routed: the route timeout that expired (spec §7.9 "Timeouts").
     timeout: Option<&'static str>,
     /// Mesh-routed: a copy of the request was sent to a mirror (spec §7.9 "Mirrors").
-    mirrored: bool,
+    /// Set by the request when a copy has its body and is sent (spec §4.1 `mirrored`).
+    mirrored: Arc<AtomicBool>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -346,7 +347,7 @@ impl Tracker {
             route: None,
             rule: None,
             timeout: None,
-            mirrored: false,
+            mirrored: Arc::new(AtomicBool::new(false)),
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -383,9 +384,10 @@ impl Tracker {
         self.rule = Some(rule);
     }
 
-    /// A copy of the request was sent to a mirror (spec §7.9 "Mirrors"): the access line says so.
-    pub(crate) fn mirrored(&mut self) {
-        self.mirrored = true;
+    /// The flag a copy of the request sets when it is sent to a mirror (spec §7.9 "Mirrors"): the
+    /// access line says so when it is written.
+    pub(crate) fn mirrored(&self) -> Arc<AtomicBool> {
+        self.mirrored.clone()
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
@@ -570,7 +572,7 @@ impl Tracker {
             route: self.route.take(),
             rule: self.rule,
             timeout: self.timeout,
-            mirrored: self.mirrored,
+            mirrored: self.mirrored.load(Ordering::SeqCst),
         });
     }
 }

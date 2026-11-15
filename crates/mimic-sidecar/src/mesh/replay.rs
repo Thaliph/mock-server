@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
@@ -255,7 +255,7 @@ struct Shared {
     /// Wakes the try that last waited for the app's body.
     waker: Option<Waker>,
     /// The copies that wait for the end of the body: they get it whole, or `None`.
-    copies: Vec<oneshot::Sender<Option<Held>>>,
+    copies: Vec<(oneshot::Sender<Option<Held>>, Arc<AtomicBool>)>,
     hint: SizeHint,
 }
 
@@ -272,7 +272,11 @@ impl Shared {
             trailers: self.trailers.clone(),
             hint: self.hint,
         });
-        for copy in self.copies.drain(..) {
+        for (copy, sent) in self.copies.drain(..) {
+            // The copy has its body and will be sent: the access line may say so.
+            if held.is_some() {
+                sent.store(true, Ordering::SeqCst);
+            }
             let _ = copy.send(held.clone());
         }
         if self.delivered {
@@ -379,7 +383,8 @@ impl Source {
 
     /// A copy that starts once the end of the body was read: `Some` with the whole body, or
     /// `None` when it does not fit the replay buffer or never came.
-    pub(crate) fn defer(&self) -> oneshot::Receiver<Option<Held>> {
+    /// `sent` is set once the copy has its body (it is then sent or fails, never skipped).
+    pub(crate) fn defer(&self, sent: &Arc<AtomicBool>) -> oneshot::Receiver<Option<Held>> {
         let (tx, rx) = oneshot::channel();
         let mut shared = lock(&self.shared);
         if shared.failed || shared.closed || !shared.replay.is_held() {
@@ -390,9 +395,10 @@ impl Source {
                 trailers: shared.trailers.clone(),
                 hint: shared.hint,
             };
+            sent.store(true, Ordering::SeqCst);
             let _ = tx.send(Some(held));
         } else {
-            shared.copies.push(tx);
+            shared.copies.push((tx, sent.clone()));
         }
         rx
     }

@@ -789,15 +789,13 @@ impl Serving {
                     if let Some(modifier) = filters.and_then(|f| f.request_headers.as_ref()) {
                         modifier.apply(&mut Fields(&mut head.headers));
                     }
-                    if self.mirror(
+                    self.mirror(
                         mirrors,
                         (&head, as_sent.as_ref()),
                         (body_state, &source),
                         (view.rules[rule].timeouts.as_ref(), began),
-                        protocol,
-                    ) {
-                        tracker.mirrored();
-                    }
+                        (protocol, &tracker.mirrored()),
+                    );
                     response_modifier = filters.and_then(|f| f.response_headers.as_ref());
                     timeouts = view.rules[rule].timeouts.as_ref();
                     if !Arc::ptr_eq(&backend, &self.backend) {
@@ -1106,17 +1104,18 @@ impl Serving {
     }
 
     /// Decides the copies of the request for the `mirrors` of its rule and starts those that
-    /// can start now (spec §7.9 "Mirrors"): `true` when one was started. Nothing here waits.
+    /// can start now (spec §7.9 "Mirrors"). Nothing here waits. `sent` is set when a copy is sure to be
+    /// sent: at once for a request without a body, else when its body ended whole.
     fn mirror(
         &self,
         mirrors: &[MirrorView],
         (head, as_sent): (&Parts, Option<&HeaderMap>),
         (body, source): (mirror::Body, &Source),
         (timeouts, began): (Option<&TimeoutsView>, Instant),
-        protocol: Protocol,
-    ) -> bool {
+        (protocol, sent): (Protocol, &Arc<AtomicBool>),
+    ) {
         if mirrors.is_empty() {
-            return false;
+            return;
         }
         let router = self.mesh.router();
         let labels: Vec<String> = mirrors
@@ -1138,7 +1137,6 @@ impl Serving {
         let deadline = began
             .checked_add(Duration::from_millis(ms))
             .unwrap_or_else(|| Instant::now() + router.mirror_timeout);
-        let mut started = false;
         let decided = router.mirror_decide(&candidates, body, share);
         for ((m, label), decision) in mirrors.iter().zip(&labels).zip(decided) {
             let Some((decision, slot)) = decision else {
@@ -1148,10 +1146,15 @@ impl Serving {
                 (decision @ (mirror::Decision::Send | mirror::Decision::AwaitBody), Some(slot)) => {
                     let Some(backend) = router.backend(&m.service, m.port) else {
                         router.metrics.mirrored(label, "error");
+                        sent.store(true, Ordering::SeqCst);
                         continue;
                     };
                     // A body is waited for by the copy, in its own task, never by the request.
-                    let body = (decision == mirror::Decision::AwaitBody).then(|| source.defer());
+                    let body =
+                        (decision == mirror::Decision::AwaitBody).then(|| source.defer(sent));
+                    if decision == mirror::Decision::Send {
+                        sent.store(true, Ordering::SeqCst);
+                    }
                     let copy = Copy {
                         body,
                         mesh: self.mesh.clone(),
@@ -1168,7 +1171,6 @@ impl Serving {
                         _slot: slot,
                     };
                     tokio::spawn(copy.run());
-                    started = true;
                     continue;
                 }
                 (mirror::Decision::SkipLimit, _) => "skipped_limit",
@@ -1176,7 +1178,6 @@ impl Serving {
             };
             router.metrics.mirrored(label, result);
         }
-        started
     }
 
     /// The delay before the try that follows a try that ended with `outcome`.
