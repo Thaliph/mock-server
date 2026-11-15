@@ -6,7 +6,7 @@
 # Changing a digest here is the only way to change these images.
 
 # Valkey exporter (#378): the chart's valkey.metrics image (deploy/helm/mimic/values.yaml), v1.95.0 published 2026-10-21.
-FROM docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb21407aba3df1b4010899f155fc6b1ba2026c97b725d72aca4019d772e7b6b AS redis-exporter
+FROM docker.io/oliver006/redis_exporter:v1.96.0@sha256:3d57b9eb142a62ffc600063606a41cd471cd53d81bed10be5b56b3a8918f2c26 AS redis-exporter
 
 # Bundled Prometheus (#379, spec §10.7): the chart's monitoring.prometheus.image, v3.15.1 published 2026-10-21
 # (GitHub release), outside the 14-day cooldown.
