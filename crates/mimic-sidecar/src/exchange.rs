@@ -591,6 +591,15 @@ pub(crate) struct RespBody {
 }
 
 impl RespBody {
+    /// A route timeout expired after the head: the exchange ends here, logged with
+    /// `result: timeout` and the timeout, and handed to discovery as a response cut short.
+    pub(crate) fn cut(&mut self, kind: Kind) {
+        if let Some(tracker) = self.tracker.as_mut() {
+            tracker.timeout = Some(kind.label());
+        }
+        self.end(Outcome::Timeout);
+    }
+
     fn end(&mut self, outcome: Outcome) {
         if self.inner.is_end_stream()
             && let Some(tee) = self.tee.as_mut()

@@ -1473,9 +1473,9 @@ async fn rte_66_http1(chunked: bool) {
         "closed after {took:?}"
     );
     let text = String::from_utf8_lossy(&got).into_owned();
-    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.starts_with("HTTP/1.1 200"), "{} bytes", text.len());
     assert_eq!(text.matches('y').count(), 100, "the head and 100 bytes");
-    assert!(!text.ends_with("0\r\n\r\n"), "no last chunk: {text:?}");
+    assert!(!text.ends_with("0\r\n\r\n"), "a last chunk");
     let lines = logs.access_exactly(1).await;
     assert_eq!(lines[0]["status"], 200, "{}", lines[0]);
     assert_eq!(lines[0]["result"], "timeout", "{}", lines[0]);

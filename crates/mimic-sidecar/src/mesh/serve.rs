@@ -8,7 +8,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ use mimic_core::mesh::route::{
 use mimic_core::mesh::timeout::{self, Deadline, Kind};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Sleep;
 
 use super::MeshState;
 use super::dial::CLUSTER_CONNECT_TIMEOUT;
@@ -100,14 +101,52 @@ impl Serving {
 /// body ends or is dropped.
 struct Hold {
     _in_flight: Option<InFlight>,
-    _lease: Lease,
+    lease: Lease,
 }
+
+/// A route deadline armed in the test hook's count while it lives.
+struct Armed(Arc<AtomicUsize>);
+
+impl Armed {
+    fn new(count: &Arc<AtomicUsize>) -> Armed {
+        count.fetch_add(1, Ordering::Relaxed);
+        Armed(count.clone())
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The deadline of a response that went on after its head (spec §7.9 "Timeouts").
+struct Cutoff {
+    sleep: Pin<Box<Sleep>>,
+    kind: Kind,
+    _armed: Armed,
+}
+
+/// The error that ends the app's HTTP/1 connection, or resets its HTTP/2 stream, when a route
+/// timeout expires after the response head.
+#[derive(Debug)]
+struct Expired(Kind);
+
+impl std::fmt::Display for Expired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "route timeout {} expired", self.0.label())
+    }
+}
+
+impl std::error::Error for Expired {}
 
 /// The body of a response: the pod's, or none for an answer of the sidecar.
 pub(crate) struct MeshBody {
     upstream: Option<RespBody>,
     mocked: Option<UnsyncBoxBody<Bytes, hyper::Error>>,
-    _hold: Option<Hold>,
+    hold: Option<Hold>,
+    /// The timeout that cuts a response that stalls after its head.
+    cutoff: Option<Cutoff>,
     done: Option<Done>,
 }
 
@@ -116,7 +155,8 @@ impl MeshBody {
         MeshBody {
             upstream: None,
             mocked: None,
-            _hold: None,
+            hold: None,
+            cutoff: None,
             done: None,
         }
     }
@@ -124,18 +164,39 @@ impl MeshBody {
 
 impl Body for MeshBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = BoxError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = self.get_mut();
-        match (this.upstream.as_mut(), this.mocked.as_mut()) {
-            (Some(body), _) => Pin::new(body).poll_frame(cx),
-            (None, Some(body)) => Pin::new(body).poll_frame(cx),
-            (None, None) => Poll::Ready(None),
+        if let (Some(body), Some(cutoff)) = (this.upstream.as_ref(), this.cutoff.as_mut())
+            && !body.is_end_stream()
+            && cutoff.sleep.as_mut().poll(cx).is_ready()
+        {
+            // The pod's connection is never reused (an HTTP/1 one closes, an HTTP/2 stream is
+            // reset by dropping it), and the app's connection or stream ends in an error.
+            let kind = cutoff.kind;
+            this.cutoff = None;
+            if let Some(mut body) = this.upstream.take() {
+                body.cut(kind);
+            }
+            if let Some(hold) = this.hold.as_mut() {
+                hold.lease.discard();
+            }
+            this.hold = None;
+            return Poll::Ready(Some(Err(Box::new(Expired(kind)))));
         }
+        let polled = match (this.upstream.as_mut(), this.mocked.as_mut()) {
+            (Some(body), _) => Pin::new(body).poll_frame(cx).map_err(BoxError::from),
+            (None, Some(body)) => Pin::new(body).poll_frame(cx).map_err(BoxError::from),
+            (None, None) => Poll::Ready(None),
+        };
+        if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
+            this.cutoff = None;
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -330,8 +391,10 @@ struct Conn {
 enum Tried {
     /// A response head came back.
     Answer {
-        response: Response<hyper::body::Incoming>,
+        response: Box<Response<hyper::body::Incoming>>,
         conn: Conn,
+        /// The deadline the response is read under, until its last byte.
+        deadline: Option<Deadline>,
     },
     /// No response head. `error` is the failure of a request that was written.
     Failed {
@@ -353,6 +416,8 @@ enum Tried {
 struct Bounds<'a> {
     timeouts: Option<&'a TimeoutsView>,
     began: Instant,
+    /// The deadlines armed now (test hook).
+    timers: &'a Arc<AtomicUsize>,
 }
 
 impl Bounds<'_> {
@@ -361,25 +426,40 @@ impl Bounds<'_> {
         u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Runs `fut` until `deadline`: the timeout that expired when it does. A deadline too far
-    /// to be an `Instant` is none.
+    /// When `deadline` falls: a deadline too far to be an `Instant` is none.
+    fn at(&self, deadline: Option<Deadline>) -> Option<(Instant, Kind)> {
+        let d = deadline?;
+        Some((
+            self.began.checked_add(Duration::from_millis(d.at_ms))?,
+            d.kind,
+        ))
+    }
+
+    /// Runs `fut` until `deadline`: the timeout that expired when it does.
     async fn within<T>(
         &self,
         fut: impl Future<Output = T>,
         deadline: Option<Deadline>,
     ) -> Result<T, Kind> {
-        let at = deadline.and_then(|d| {
-            Some((
-                self.began.checked_add(Duration::from_millis(d.at_ms))?,
-                d.kind,
-            ))
-        });
-        match at {
+        match self.at(deadline) {
             None => Ok(fut.await),
-            Some((at, kind)) => tokio::time::timeout_at(at.into(), fut)
-                .await
-                .map_err(|_| kind),
+            Some((at, kind)) => {
+                let _armed = Armed::new(self.timers);
+                tokio::time::timeout_at(at.into(), fut)
+                    .await
+                    .map_err(|_| kind)
+            }
         }
+    }
+
+    /// The deadline of a response read after its head.
+    fn cutoff(&self, deadline: Option<Deadline>) -> Option<Cutoff> {
+        let (at, kind) = self.at(deadline)?;
+        Some(Cutoff {
+            sleep: Box::pin(tokio::time::sleep_until(at.into())),
+            kind,
+            _armed: Armed::new(self.timers),
+        })
     }
 }
 
@@ -510,8 +590,9 @@ impl Serving {
         }
         match sent {
             Sent::Response(response) => Tried::Answer {
-                response,
+                response: Box::new(response),
                 conn: Conn { pick, lease },
+                deadline,
             },
             Sent::Failed(e) => Tried::Failed {
                 failure: pool::failure(&e, lease.goaway()),
@@ -645,7 +726,8 @@ impl Serving {
             return Ok(answered.map(|body| MeshBody {
                 upstream: None,
                 mocked: Some(body.map_err(|never| match never {}).boxed_unsync()),
-                _hold: None,
+                hold: None,
+                cutoff: None,
                 done: None,
             }));
         }
@@ -728,6 +810,11 @@ impl Serving {
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
         let mut next = self.plan(&drawn, original, direct, tries, &mut planner);
+        let bounds = Bounds {
+            timeouts,
+            began,
+            timers: &router.timers,
+        };
         loop {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
@@ -759,7 +846,6 @@ impl Serving {
             let dst = original.unwrap_or(self.ctx.dst);
             let upstream = pick.as_ref().map_or(dst, |p| p.endpoint().addr);
             tracker.route(backend, upstream, tries);
-            let bounds = Bounds { timeouts, began };
             match self
                 .try_once(
                     protocol,
@@ -774,6 +860,7 @@ impl Serving {
                 Tried::Answer {
                     mut response,
                     mut conn,
+                    deadline,
                 } => {
                     let status = response.status();
                     let refusal = refusal_of(&response, conn.pick.as_ref(), self.origin.is_some());
@@ -794,9 +881,35 @@ impl Serving {
                                 // The try in flight stops reading the app's body now, so that
                                 // what the next try replays is what was read.
                                 retry if source.detach() => {
-                                    Self::discard(response, &mut conn.lease).await;
+                                    // The refusal is read and the pause kept under the call's
+                                    // deadline: the route's promise wins over the retry.
+                                    let call = timeout::call_deadline(timeouts);
+                                    let drained = bounds
+                                        .within(Self::discard(*response, &mut conn.lease), call)
+                                        .await;
+                                    if let Err(kind) = drained {
+                                        conn.lease.discard();
+                                        drop(conn);
+                                        return Ok(self.cut(
+                                            tracker,
+                                            &source,
+                                            (route, backend, upstream),
+                                            (kind, protocol),
+                                            began,
+                                        ));
+                                    }
                                     drop(conn);
-                                    self.pause(verdict.outcome).await;
+                                    if let Err(kind) =
+                                        bounds.within(self.pause(verdict.outcome), call).await
+                                    {
+                                        return Ok(self.cut(
+                                            tracker,
+                                            &source,
+                                            (route, backend, upstream),
+                                            (kind, protocol),
+                                            began,
+                                        ));
+                                    }
                                     again = Some(verdict.outcome);
                                     next = retry;
                                     continue;
@@ -812,8 +925,8 @@ impl Serving {
                         modifier.apply(&mut Fields(response.headers_mut()));
                     }
                     let answered = match refusal {
-                        Some(_) => tracker.answered_unrecorded(response),
-                        None => tracker.answered(response),
+                        Some(_) => tracker.answered_unrecorded(*response),
+                        None => tracker.answered(*response),
                     };
                     let mut answered = answered;
                     if http1 {
@@ -828,10 +941,11 @@ impl Serving {
                     return Ok(answered.map(|body| MeshBody {
                         upstream: Some(body),
                         mocked: None,
-                        _hold: Some(Hold {
+                        hold: Some(Hold {
                             _in_flight: pick,
-                            _lease: lease,
+                            lease,
                         }),
+                        cutoff: bounds.cutoff(deadline),
                         done: None,
                     }));
                 }
@@ -848,20 +962,13 @@ impl Serving {
                         router.metrics.endpoint_try(backend, label, "none");
                     }
                     drop(pick);
-                    // The request body is read to its end, or the app's connection ends with
-                    // the answer.
-                    let close = http1 && !source.complete();
-                    source.cancel();
-                    tracing::debug!(%upstream, timeout = kind.label(), "the try timed out");
-                    self.count(
-                        route,
-                        backend,
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "timeout",
+                    return Ok(self.cut(
+                        tracker,
+                        &source,
+                        (route, backend, upstream),
+                        (kind, protocol),
                         began,
-                    );
-                    tracker.timed_out(kind);
-                    return Ok(answer(StatusCode::GATEWAY_TIMEOUT, "timeout", close));
+                    ));
                 }
                 Tried::Failed {
                     failure,
@@ -895,6 +1002,32 @@ impl Serving {
                 }
             }
         }
+    }
+
+    /// The call ends on a route timeout before the response head: the `504`, counted and
+    /// logged (spec §7.9 "Timeouts").
+    fn cut(
+        &self,
+        tracker: Tracker,
+        source: &Source,
+        (route, backend, upstream): (&str, &str, SocketAddr),
+        (kind, protocol): (Kind, Protocol),
+        began: Instant,
+    ) -> Response<MeshBody> {
+        // The request body is read to its end, or the app's connection ends with the answer.
+        let http1 = protocol == Protocol::Http1;
+        let close = http1 && !source.complete();
+        source.cancel();
+        tracing::debug!(%upstream, timeout = kind.label(), "the call timed out");
+        self.count(
+            route,
+            backend,
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            began,
+        );
+        tracker.timed_out(kind);
+        answer(StatusCode::GATEWAY_TIMEOUT, "timeout", close)
     }
 
     /// The rule of `routed` that matches the request and its drawn backend, or the answer of
