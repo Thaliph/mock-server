@@ -568,7 +568,7 @@ label carries a path, a header value or a caller-controlled string.
 | `mimic_mesh_endpoint_in_flight` | gauge | `backend`, `endpoint` |
 | `mimic_mesh_retries_total`, `mimic_mesh_retry_budget_exhausted_total` | counter | `backend`, `reason` |
 | `mimic_mesh_ejections_total`, `mimic_mesh_ejected_endpoints` | counter, gauge | `backend` |
-| `mimic_mesh_mirrored_total` | counter | `backend`, `result` (`sent`, `skipped_body`, `error`) |
+| `mimic_mesh_mirrored_total` | counter | `backend`, `result` (`sent`, `skipped_body`, `skipped_limit`, `error`) |
 | `mimic_mesh_faults_total` | counter | `service`, `kind` (`delay`, `abort`) |
 | `mimic_mesh_unscoped_connections_total` | counter | — |
 | `mimic_mesh_view_age_seconds`, `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge | — |
