@@ -580,12 +580,42 @@ fn cbr_02_the_policy_holds_both_objects_with_every_field_and_each_field_moves_th
         r#""outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3"#
     ));
     let sets: [fn(&mut Config); 6] = [
-        |c| c.outlier_detection = Some(OutlierSpec { consecutive_failures: Some(6), ..none_o() }),
-        |c| c.outlier_detection = Some(OutlierSpec { consecutive_5xx: Some(1), ..none_o() }),
-        |c| c.outlier_detection = Some(OutlierSpec { base_ejection_seconds: Some(31), ..none_o() }),
-        |c| c.outlier_detection = Some(OutlierSpec { max_ejection_percent: Some(51), ..none_o() }),
-        |c| c.circuit_breaker = Some(BreakerSpec { max_requests: Some(7), max_connections: None }),
-        |c| c.circuit_breaker = Some(BreakerSpec { max_requests: None, max_connections: Some(7) }),
+        |c| {
+            c.outlier_detection = Some(OutlierSpec {
+                consecutive_failures: Some(6),
+                ..none_o()
+            })
+        },
+        |c| {
+            c.outlier_detection = Some(OutlierSpec {
+                consecutive_5xx: Some(1),
+                ..none_o()
+            })
+        },
+        |c| {
+            c.outlier_detection = Some(OutlierSpec {
+                base_ejection_seconds: Some(31),
+                ..none_o()
+            })
+        },
+        |c| {
+            c.outlier_detection = Some(OutlierSpec {
+                max_ejection_percent: Some(51),
+                ..none_o()
+            })
+        },
+        |c| {
+            c.circuit_breaker = Some(BreakerSpec {
+                max_requests: Some(7),
+                max_connections: None,
+            })
+        },
+        |c| {
+            c.circuit_breaker = Some(BreakerSpec {
+                max_requests: None,
+                max_connections: Some(7),
+            })
+        },
     ];
     let mut etags = std::collections::BTreeSet::new();
     etags.insert(base.etag.clone());

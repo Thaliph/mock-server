@@ -495,15 +495,24 @@ fn cbr_01_each_field_the_winner_sets_is_taken_and_the_others_keep_their_default(
     let mut s = cluster();
     for (set, want) in [
         (outlier_spec(Some(1), None, None, None), od(1, 0, 30, 50)),
-        (outlier_spec(Some(100), None, None, None), od(100, 0, 30, 50)),
+        (
+            outlier_spec(Some(100), None, None, None),
+            od(100, 0, 30, 50),
+        ),
         (outlier_spec(None, Some(0), None, None), od(5, 0, 30, 50)),
-        (outlier_spec(None, Some(100), None, None), od(5, 100, 30, 50)),
+        (
+            outlier_spec(None, Some(100), None, None),
+            od(5, 100, 30, 50),
+        ),
         (outlier_spec(None, None, Some(1), None), od(5, 0, 1, 50)),
         (outlier_spec(None, None, Some(300), None), od(5, 0, 300, 50)),
         (outlier_spec(None, None, None, Some(0)), od(5, 0, 30, 0)),
         (outlier_spec(None, None, None, Some(100)), od(5, 0, 30, 100)),
         (outlier_spec(None, None, None, None), od(5, 0, 30, 50)),
-        (outlier_spec(Some(2), Some(3), Some(4), Some(5)), od(2, 3, 4, 5)),
+        (
+            outlier_spec(Some(2), Some(3), Some(4), Some(5)),
+            od(2, 3, 4, 5),
+        ),
     ] {
         s.configs = vec![mesh_cfg("shop", "a", "cart", Some(set), None)];
         assert_eq!(
@@ -575,12 +584,24 @@ fn cbr_01_validate_refuses_each_field_out_of_bounds_naming_it() {
         assert!(validate(&svc(None, Some(ok))).is_ok());
     }
     for (bad, field) in [
-        (outlier_spec(Some(0), None, None, None), "consecutiveFailures"),
-        (outlier_spec(Some(101), None, None, None), "consecutiveFailures"),
+        (
+            outlier_spec(Some(0), None, None, None),
+            "consecutiveFailures",
+        ),
+        (
+            outlier_spec(Some(101), None, None, None),
+            "consecutiveFailures",
+        ),
         (outlier_spec(None, Some(101), None, None), "consecutive5xx"),
         (outlier_spec(None, None, Some(0), None), "baseEjectionTime"),
-        (outlier_spec(None, None, Some(301), None), "baseEjectionTime"),
-        (outlier_spec(None, None, None, Some(101)), "maxEjectionPercent"),
+        (
+            outlier_spec(None, None, Some(301), None),
+            "baseEjectionTime",
+        ),
+        (
+            outlier_spec(None, None, None, Some(101)),
+            "maxEjectionPercent",
+        ),
     ] {
         let err = validate(&svc(Some(bad), None)).expect_err("out of bounds");
         assert!(err.contains(field), "{err}");

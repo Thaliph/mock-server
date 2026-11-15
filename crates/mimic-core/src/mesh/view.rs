@@ -128,6 +128,12 @@ impl View {
             if !service.policy.retry_budget.in_bounds() {
                 return Err("retryBudget out of bounds".into());
             }
+            if !service.policy.outlier_detection.in_bounds() {
+                return Err("outlierDetection out of bounds".into());
+            }
+            if !service.policy.circuit_breaker.in_bounds() {
+                return Err("circuitBreaker out of bounds".into());
+            }
         }
         check_routes(&view)?;
         Ok(view)

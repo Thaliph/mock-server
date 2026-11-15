@@ -724,7 +724,7 @@ async fn rty_37_an_app_refusal_over_intercepted_tls_is_not_trusted() {
 /// `shop/cart` (the ClusterIP the app dials) routed to `shop/cart-v1` with a mirror of every
 /// request to `shop/cart-shadow`.
 fn mirrored_view(primary: SocketAddr, shadow: SocketAddr) -> mimic_core::mesh::view::View {
-    let policy = r#""policy":{"loadBalancer":{"slowStartSeconds":0},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
+    let policy = r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":0},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
     let service = |key: &str, ips: &str, pod: Option<SocketAddr>, routes: &str| {
         let pods = pod.map_or(String::new(), |p| {
             format!(r#"{{"ip":"{}","port":{},"ready":true}}"#, p.ip(), p.port())

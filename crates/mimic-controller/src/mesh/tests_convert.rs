@@ -4,7 +4,8 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    BreakerSpec, Destination, GrantFrom, GrantTo, OutlierSpec, RetryBudgetSpec, Target, TargetKind, TargetPort,
+    BreakerSpec, Destination, GrantFrom, GrantTo, OutlierSpec, RetryBudgetSpec, Target, TargetKind,
+    TargetPort,
 };
 use mimic_core::mesh::policy::validate;
 use serde_json::json;
@@ -345,6 +346,8 @@ fn cbr_03_a_base_ejection_time_that_does_not_parse_makes_the_config_invalid_and_
     }
     let c = service_config(json!({"targetRefs": target, "circuitBreaker": {"maxRequests": "8"}}));
     assert!(validate(&c).is_err());
-    let c = service_config(json!({"targetRefs": target, "outlierDetection": {"consecutiveFailures": -1}}));
+    let c = service_config(
+        json!({"targetRefs": target, "outlierDetection": {"consecutiveFailures": -1}}),
+    );
     assert!(validate(&c).is_err());
 }

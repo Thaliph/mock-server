@@ -11,10 +11,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    BackendRef, Config, Destination, Endpoint, EndpointSlice, GATEWAY_GROUP, GrantFrom, GrantTo,
-    HeaderModifier, Mirror, NameMatch, ParentRef, PathMatch, ReferenceGrant, RetryBudgetSpec,
-    Route, RouteFilter, RouteMatch, RouteRule, Service, ServicePort, SlicePort, Target, TargetKind,
-    TargetPort,
+    BackendRef, BreakerSpec, Config, Destination, Endpoint, EndpointSlice, GATEWAY_GROUP,
+    GrantFrom, GrantTo, HeaderModifier, Mirror, NameMatch, OutlierSpec, ParentRef, PathMatch,
+    ReferenceGrant, RetryBudgetSpec, Route, RouteFilter, RouteMatch, RouteRule, Service,
+    ServicePort, SlicePort, Target, TargetKind, TargetPort,
 };
 use serde_json::Value;
 
@@ -202,6 +202,19 @@ pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
             window_seconds: b
                 .get("window")
                 .map(|w| w.as_str().and_then(seconds).unwrap_or(0)),
+        }),
+        outlier_detection: spec.get("outlierDetection").map(|o| OutlierSpec {
+            consecutive_failures: o.get("consecutiveFailures").map(bounded),
+            consecutive_5xx: o.get("consecutive5xx").map(bounded),
+            // Not `<n>s`: 0, which `validate` refuses (CBR-03).
+            base_ejection_seconds: o
+                .get("baseEjectionTime")
+                .map(|t| t.as_str().and_then(seconds).unwrap_or(0)),
+            max_ejection_percent: o.get("maxEjectionPercent").map(bounded),
+        }),
+        circuit_breaker: spec.get("circuitBreaker").map(|b| BreakerSpec {
+            max_requests: b.get("maxRequests").map(bounded),
+            max_connections: b.get("maxConnections").map(bounded),
         }),
     };
     Some((key, config))

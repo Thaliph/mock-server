@@ -27,6 +27,28 @@ pub const MAX_RETRY_MIN_PER_SECOND: u32 = 1000;
 pub const DEFAULT_RETRY_WINDOW_SECS: u32 = 10;
 /// Largest `retryBudget.window`, in seconds (the smallest is 1).
 pub const MAX_RETRY_WINDOW_SECS: u32 = 60;
+/// `outlierDetection.consecutiveFailures` when no `MimicConfig` sets it.
+pub const DEFAULT_CONSECUTIVE_FAILURES: u32 = 5;
+/// Bounds of `outlierDetection.consecutiveFailures`.
+pub const MAX_CONSECUTIVE_FAILURES: u32 = 100;
+/// `outlierDetection.consecutive5xx` when no `MimicConfig` sets it (0: off).
+pub const DEFAULT_CONSECUTIVE_5XX: u32 = 0;
+/// Largest `outlierDetection.consecutive5xx`.
+pub const MAX_CONSECUTIVE_5XX: u32 = 100;
+/// `outlierDetection.baseEjectionTime` when no `MimicConfig` sets it, in seconds.
+pub const DEFAULT_BASE_EJECTION_SECS: u32 = 30;
+/// Largest `outlierDetection.baseEjectionTime`, in seconds (the smallest is 1); also the cap of
+/// every ejection.
+pub const MAX_BASE_EJECTION_SECS: u32 = 300;
+/// `outlierDetection.maxEjectionPercent` when no `MimicConfig` sets it.
+pub const DEFAULT_MAX_EJECTION_PERCENT: u32 = 50;
+/// Largest `outlierDetection.maxEjectionPercent`.
+pub const MAX_MAX_EJECTION_PERCENT: u32 = 100;
+/// `circuitBreaker.maxRequests` and `maxConnections` when no `MimicConfig` sets them.
+pub const DEFAULT_MAX_REQUESTS: u32 = 1024;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
+/// Largest `circuitBreaker.maxRequests` and `maxConnections` (the smallest is 1).
+pub const MAX_BREAKER_LIMIT: u32 = 100_000;
 pub const MAX_TARGETS: usize = 16;
 pub const MAX_DESTINATIONS: usize = 256;
 
@@ -45,11 +67,31 @@ pub struct RetryBudget {
     pub window_seconds: u32,
 }
 
+/// Field order is alphabetical: the JSON is canonical (sorted keys).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OutlierDetection {
+    pub base_ejection_seconds: u32,
+    pub consecutive_5xx: u32,
+    pub consecutive_failures: u32,
+    pub max_ejection_percent: u32,
+}
+
+/// Field order is alphabetical: the JSON is canonical (sorted keys).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CircuitBreaker {
+    pub max_connections: u32,
+    pub max_requests: u32,
+}
+
 /// The effective policy of a Service, as the view carries it. Field order is alphabetical.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Policy {
+    pub circuit_breaker: CircuitBreaker,
     pub load_balancer: LoadBalancer,
+    pub outlier_detection: OutlierDetection,
     pub retries: u32,
     pub retry_budget: RetryBudget,
 }
@@ -63,9 +105,37 @@ impl RetryBudget {
     }
 }
 
+impl OutlierDetection {
+    /// Whether every field is inside its bound (the reader of a view uses it, CBR-02).
+    pub fn in_bounds(&self) -> bool {
+        (1..=MAX_CONSECUTIVE_FAILURES).contains(&self.consecutive_failures)
+            && self.consecutive_5xx <= MAX_CONSECUTIVE_5XX
+            && (1..=MAX_BASE_EJECTION_SECS).contains(&self.base_ejection_seconds)
+            && self.max_ejection_percent <= MAX_MAX_EJECTION_PERCENT
+    }
+}
+
+impl CircuitBreaker {
+    /// Whether every field is inside its bound (the reader of a view uses it, CBR-02).
+    pub fn in_bounds(&self) -> bool {
+        (1..=MAX_BREAKER_LIMIT).contains(&self.max_requests)
+            && (1..=MAX_BREAKER_LIMIT).contains(&self.max_connections)
+    }
+}
+
 /// The policy of a Service no `MimicConfig` targets.
 pub fn defaults() -> Policy {
     Policy {
+        circuit_breaker: CircuitBreaker {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_requests: DEFAULT_MAX_REQUESTS,
+        },
+        outlier_detection: OutlierDetection {
+            base_ejection_seconds: DEFAULT_BASE_EJECTION_SECS,
+            consecutive_5xx: DEFAULT_CONSECUTIVE_5XX,
+            consecutive_failures: DEFAULT_CONSECUTIVE_FAILURES,
+            max_ejection_percent: DEFAULT_MAX_EJECTION_PERCENT,
+        },
         load_balancer: LoadBalancer {
             slow_start_seconds: DEFAULT_SLOW_START_SECS,
         },
@@ -81,7 +151,31 @@ pub fn defaults() -> Policy {
 /// The effective policy of a Service from its winning `MimicConfig`, if any.
 pub fn effective(winner: Option<&Config>) -> Policy {
     let spec = winner.and_then(|c| c.retry_budget.as_ref());
+    let outlier = winner.and_then(|c| c.outlier_detection.as_ref());
+    let breaker = winner.and_then(|c| c.circuit_breaker.as_ref());
     Policy {
+        circuit_breaker: CircuitBreaker {
+            max_connections: breaker
+                .and_then(|b| b.max_connections)
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            max_requests: breaker
+                .and_then(|b| b.max_requests)
+                .unwrap_or(DEFAULT_MAX_REQUESTS),
+        },
+        outlier_detection: OutlierDetection {
+            base_ejection_seconds: outlier
+                .and_then(|o| o.base_ejection_seconds)
+                .unwrap_or(DEFAULT_BASE_EJECTION_SECS),
+            consecutive_5xx: outlier
+                .and_then(|o| o.consecutive_5xx)
+                .unwrap_or(DEFAULT_CONSECUTIVE_5XX),
+            consecutive_failures: outlier
+                .and_then(|o| o.consecutive_failures)
+                .unwrap_or(DEFAULT_CONSECUTIVE_FAILURES),
+            max_ejection_percent: outlier
+                .and_then(|o| o.max_ejection_percent)
+                .unwrap_or(DEFAULT_MAX_EJECTION_PERCENT),
+        },
         load_balancer: LoadBalancer {
             slow_start_seconds: winner
                 .and_then(|c| c.slow_start)
@@ -168,6 +262,58 @@ pub fn validate(config: &Config) -> Result<(), String> {
             return Err(format!(
                 "retryBudget.window is not 1s to {MAX_RETRY_WINDOW_SECS}s"
             ));
+        }
+    }
+    if let Some(spec) = &config.outlier_detection {
+        if !has(TargetKind::Service) {
+            return Err("outlierDetection fits a Service target only".into());
+        }
+        if spec
+            .consecutive_failures
+            .is_some_and(|n| !(1..=MAX_CONSECUTIVE_FAILURES).contains(&n))
+        {
+            return Err(format!(
+                "outlierDetection.consecutiveFailures is not 1 to {MAX_CONSECUTIVE_FAILURES}"
+            ));
+        }
+        if spec
+            .consecutive_5xx
+            .is_some_and(|n| n > MAX_CONSECUTIVE_5XX)
+        {
+            return Err(format!(
+                "outlierDetection.consecutive5xx is over {MAX_CONSECUTIVE_5XX}"
+            ));
+        }
+        if spec
+            .base_ejection_seconds
+            .is_some_and(|n| !(1..=MAX_BASE_EJECTION_SECS).contains(&n))
+        {
+            return Err(format!(
+                "outlierDetection.baseEjectionTime is not 1s to {MAX_BASE_EJECTION_SECS}s"
+            ));
+        }
+        if spec
+            .max_ejection_percent
+            .is_some_and(|n| n > MAX_MAX_EJECTION_PERCENT)
+        {
+            return Err(format!(
+                "outlierDetection.maxEjectionPercent is over {MAX_MAX_EJECTION_PERCENT}"
+            ));
+        }
+    }
+    if let Some(spec) = &config.circuit_breaker {
+        if !has(TargetKind::Service) {
+            return Err("circuitBreaker fits a Service target only".into());
+        }
+        for (name, value) in [
+            ("maxRequests", spec.max_requests),
+            ("maxConnections", spec.max_connections),
+        ] {
+            if value.is_some_and(|n| !(1..=MAX_BREAKER_LIMIT).contains(&n)) {
+                return Err(format!(
+                    "circuitBreaker.{name} is not 1 to {MAX_BREAKER_LIMIT}"
+                ));
+            }
         }
     }
     Ok(())
