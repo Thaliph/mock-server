@@ -79,6 +79,8 @@ fn sorted(headers: &HeaderMap) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn prx_04_concurrent_streams_share_one_destination_connection() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     for direction in [Direction::Inbound, Direction::Outbound] {
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
@@ -310,6 +312,8 @@ async fn prx_07_h2_destination_reset_resets_only_that_stream() {
 
 #[tokio::test]
 async fn prx_07_h2_refused_destination_closes_without_a_byte() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dst = closed_port().await;
     let f = fixture(Direction::Outbound, move |_| Some(dst)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
@@ -367,6 +371,8 @@ impl hyper::body::Body for Unsized {
 
 #[tokio::test]
 async fn prx_16_h2_adds_no_content_length() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _) = dest(move |req: Request<Incoming>| {
         let tx = tx.clone();
@@ -424,6 +430,8 @@ async fn silent() -> SocketAddr {
 
 #[tokio::test]
 async fn prx_19_h2_silent_destination_is_waited_for_without_timeout() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let silent = silent().await;
     let (live, _) = dest(|_| async { Ok(Response::new(full("ok"))) }).await;
     let f = fixture(Direction::Outbound, move |_| Some(silent)).await;
@@ -452,6 +460,8 @@ async fn prx_19_h2_silent_destination_is_waited_for_without_timeout() {
 
 #[tokio::test]
 async fn prx_19_h2_client_closing_releases_the_destination_connection() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted = tokio::spawn(async move { listener.accept().await.unwrap().0 });

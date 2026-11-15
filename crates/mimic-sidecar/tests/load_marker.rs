@@ -597,6 +597,8 @@ fn meshed() -> mimic_sidecar::mesh::MeshState {
 
 #[tokio::test]
 async fn rty_18_http1_a_load_answer_has_one_ok_and_none_of_the_app_mimic_fields() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let root = root("deployment root");
     let app = app_h1(
         "x-mimic-load: refused; reason=mode\r\nX-Mimic-Error: overloaded\r\nx-mimic-endpoint: 10.0.0.9:80\r\nX-Keep: 1\r\n",
@@ -619,6 +621,8 @@ async fn rty_18_http1_a_load_answer_has_one_ok_and_none_of_the_app_mimic_fields(
 
 #[tokio::test]
 async fn rty_18_h2c_a_load_answer_has_one_ok_and_none_of_the_app_mimic_fields() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let root = root("deployment root");
     let app = app_h2(&[
         ("x-mimic-load", "refused; reason=mode"),

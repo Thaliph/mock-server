@@ -102,6 +102,8 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 
 #[tokio::test]
 async fn mon_08_active_connections_follow_the_open_connections_per_direction() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let app = http_app(Duration::ZERO).await;
     let echo = echo_server().await;
     let mut metrics = Metrics::new("sidecar", "test");
@@ -169,6 +171,8 @@ async fn mon_08_active_connections_follow_the_open_connections_per_direction() {
 
 #[tokio::test]
 async fn mon_08_active_connections_never_exceed_the_cap() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let echo = echo_server().await;
     let f = fixture_configured(
         Direction::Inbound,
@@ -205,6 +209,8 @@ fn overhead(metrics: &Metrics, direction: &str) -> (f64, f64) {
 
 #[tokio::test]
 async fn mon_09_http1_overhead_excludes_the_upstream_wait() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     for direction in [Direction::Inbound, Direction::Outbound] {
         let d = direction.as_str();
         let app = http_app(Duration::from_millis(200)).await;
@@ -243,6 +249,8 @@ type Body = BoxBody<Bytes, io::Error>;
 
 #[tokio::test]
 async fn mon_09_h2_overhead_excludes_the_upstream_wait() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let app = listener.local_addr().unwrap();
     tokio::spawn(async move {

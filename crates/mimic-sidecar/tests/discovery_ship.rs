@@ -1340,6 +1340,8 @@ async fn first_then_400(first: Reply) -> (Rig, common::Logs) {
 
 #[tokio::test]
 async fn shr_16_after_an_unknown_first_attempt_a_400_drops_the_outbound_part() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let (rig, logs) = first_then_400(Reply::Reset).await;
     let posts = rig.api.versions();
     assert_eq!(posts[0], (1, 2, 0), "{posts:?}");
@@ -1382,6 +1384,8 @@ async fn shr_16_after_an_unknown_first_attempt_a_400_drops_the_outbound_part() {
 
 #[tokio::test]
 async fn shr_16_500_502_504_and_malformed_answers_are_unknown_outcomes() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     for first in [
         Reply::Status(500),
         Reply::Status(502),
@@ -1400,6 +1404,8 @@ async fn shr_16_500_502_504_and_malformed_answers_are_unknown_outcomes() {
 
 #[tokio::test]
 async fn shr_16_answered_attempts_before_the_400_keep_the_outbound_part() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     for first in [
         Reply::Status(503),
         Reply::Status(429),
@@ -1640,6 +1646,8 @@ async fn sidecar(api: &FakeApi, dir: &std::path::Path, grace: &str) -> Process {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     if !in_namespace(
         "ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain",
     ) {
@@ -1680,6 +1688,8 @@ async fn ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_lo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_loss() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     if !in_namespace("ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_loss")
     {
         return;

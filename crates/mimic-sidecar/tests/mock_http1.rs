@@ -353,6 +353,8 @@ async fn mck_11_connect_and_websocket_upgrades_are_misses() {
 
 #[tokio::test]
 async fn mck_11_nothing_listens_at_the_destination_and_the_answer_is_the_same() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dst = closed_port().await;
     let rig = rig_to(users_set(5), 100, 1024, dst, Arc::default()).await;
     let hit = once(rig.addr, &get("/users/3", AUTHORITY)).await;

@@ -169,6 +169,8 @@ async fn exchange(addr: SocketAddr, request: &[u8], times: usize, want: &[u8], t
 
 #[tokio::test]
 async fn rty_18_http1_content_length_answers_lose_the_fields_on_a_keep_alive_connection() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nContent-Type: text/plain\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nx-mimic-other: 1\r\nContent-Length: 2\r\n\r\nok";
     let want: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
     let state = meshed();
@@ -179,6 +181,8 @@ async fn rty_18_http1_content_length_answers_lose_the_fields_on_a_keep_alive_con
 
 #[tokio::test]
 async fn rty_18_http1_chunked_and_close_delimited_bodies_are_untouched() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let chunked: &'static [u8] = b"HTTP/1.1 200 OK\r\nx-mimic-error: overloaded\r\nTransfer-Encoding: chunked\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nx-mimic-other: 1\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let want: &[u8] =
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
@@ -197,6 +201,8 @@ async fn rty_18_http1_chunked_and_close_delimited_bodies_are_untouched() {
 
 #[tokio::test]
 async fn rty_18_http1_a_head_answer_loses_the_fields() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &'static [u8] = b"HTTP/1.1 200 OK\r\nx-mimic-error: overloaded\r\nContent-Length: 10\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nx-mimic-other: 1\r\n\r\n";
     let want: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
     let state = meshed();
@@ -207,6 +213,8 @@ async fn rty_18_http1_a_head_answer_loses_the_fields() {
 
 #[tokio::test]
 async fn rty_18_http1_an_answer_without_such_a_field_is_byte_exact_and_counts_nothing() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &'static [u8] = b"HTTP/1.1 200 OK\r\ncontent-TYPE: a\r\nX-Mimicry: 1\r\nSet-Cookie: a=1\r\nset-cookie: b=2\r\nContent-Length: 2\r\n\r\nok";
     let state = meshed();
     let rig = start(app(reply, false).await, Some(&state)).await;
@@ -216,6 +224,8 @@ async fn rty_18_http1_an_answer_without_such_a_field_is_byte_exact_and_counts_no
 
 #[tokio::test]
 async fn rty_18_http1_a_100_continue_is_relayed_unchanged_and_the_final_head_is_stripped() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &'static [u8] = b"HTTP/1.1 100 Continue\r\nx-mimic-interim: 1\r\n\r\nHTTP/1.1 200 OK\r\nx-mimic-error: overloaded\r\nContent-Length: 2\r\n\r\nok";
     let want: &[u8] = b"HTTP/1.1 100 Continue\r\nx-mimic-interim: 1\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     let state = meshed();
@@ -226,6 +236,8 @@ async fn rty_18_http1_a_100_continue_is_relayed_unchanged_and_the_final_head_is_
 
 #[tokio::test]
 async fn rty_18_http1_the_head_arriving_in_pieces_is_judged_whole() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -259,6 +271,8 @@ async fn rty_18_http1_the_head_arriving_in_pieces_is_judged_whole() {
 
 #[tokio::test]
 async fn rty_18_with_the_mesh_off_the_fields_stay_byte_for_byte() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &'static [u8] = b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nContent-Type: text/plain\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nx-mimic-other: 1\r\nContent-Length: 2\r\n\r\nok";
     let rig = start(app(reply, false).await, None).await;
     exchange(rig.addr, GET, 2, reply, false).await;
@@ -266,6 +280,8 @@ async fn rty_18_with_the_mesh_off_the_fields_stay_byte_for_byte() {
 
 #[tokio::test]
 async fn rty_18_with_a_view_of_mesh_false_the_fields_stay_and_with_the_view_back_on_they_go() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &'static [u8] = b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nContent-Type: text/plain\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nx-mimic-other: 1\r\nContent-Length: 2\r\n\r\nok";
     let want: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok";
     let state = meshed();
@@ -281,6 +297,8 @@ async fn rty_18_with_a_view_of_mesh_false_the_fields_stay_and_with_the_view_back
 
 #[tokio::test]
 async fn rty_18_h2c_the_fields_are_gone_and_the_others_kept() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     const HEADERS: &[(&str, &str)] = &[
         ("x-mimic-error", "overloaded"),
         ("x-mimic-endpoint", "10.0.0.9:80"),
@@ -344,6 +362,8 @@ async fn app_with(reply: Vec<u8>) -> SocketAddr {
 
 #[tokio::test]
 async fn rty_18_blank_lines_before_the_status_line_do_not_hide_the_fields_from_a_large_body() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     // The codec skips the blank lines and frames the head; a 64 KiB body behind it must not
     // make the relay give up holding the head.
     let body = vec![b'a'; 70_000];
@@ -367,6 +387,8 @@ async fn rty_18_blank_lines_before_the_status_line_do_not_hide_the_fields_from_a
 
 #[tokio::test]
 async fn rty_18_a_reason_phrase_that_is_not_utf8_does_not_hide_the_fields() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let reply: &'static [u8] =
         b"HTTP/1.1 503 Unavail\xffable\r\nx-mimic-error: overloaded\r\nContent-Length: 2\r\n\r\nok";
     let want: &[u8] = b"HTTP/1.1 503 Unavail\xffable\r\nContent-Length: 2\r\n\r\nok";
@@ -456,6 +478,8 @@ async fn rty_18_an_invalid_body_framing_closes_the_connection_before_the_forged_
 
 #[tokio::test]
 async fn rty_18_with_the_fields_not_removed_an_unframeable_response_is_relayed_unchanged() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     for (name, reply) in unframeable() {
         let rig = start(app_with(reply.clone()).await, None).await;
         let mut c = TcpStream::connect(rig.addr).await.unwrap();
