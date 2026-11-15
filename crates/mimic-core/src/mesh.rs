@@ -2,6 +2,7 @@
 //! the plain input structs the controller fills from its watches, the policy of `MimicConfig`s
 //! (precedence, validation, defaults) and the scoped view of a deployment.
 
+pub mod fault;
 pub mod head;
 pub mod input;
 pub mod lb;
@@ -26,6 +27,8 @@ mod tests_budget;
 mod tests_consent;
 #[cfg(test)]
 mod tests_eject;
+#[cfg(test)]
+mod tests_fault;
 #[cfg(test)]
 mod tests_from_json;
 #[cfg(test)]
