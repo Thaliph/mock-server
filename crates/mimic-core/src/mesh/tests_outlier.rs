@@ -532,3 +532,20 @@ proptest! {
         prop_assert_eq!(first, second, "the same sequence gives the same reports");
     }
 }
+
+#[test]
+fn cbr_08_an_outcome_of_an_endpoint_ejected_at_the_time_counts_nothing() {
+    // A try in flight when its endpoint got ejected ends with an outcome: it is ignored, so
+    // the counters stay at 0 and the ejection is neither extended nor counted twice.
+    let p = policy(2, 0, 30, 100);
+    let mut o = state(&p, 2);
+    assert!(fail(&mut o, addr(1), 2, ms(1)).is_some());
+    assert_eq!(o.record(addr(1), Outcome::Reset, ms(2)), None);
+    assert_eq!(o.record(addr(1), Outcome::Head(200), ms(3)), None);
+    assert_eq!(counters(&o, addr(1)), (0, 0));
+    assert!(o.is_ejected(addr(1), secs(30)));
+    assert!(!o.is_ejected(addr(1), ms(30_001)));
+    // The same for an endpoint the view does not hold.
+    assert_eq!(o.record(addr(9), Outcome::Reset, ms(4)), None);
+    assert_eq!(o.counters(addr(9)), None);
+}
