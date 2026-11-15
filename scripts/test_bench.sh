@@ -251,12 +251,43 @@ ben_11_16_mesh_setups_plan() {
   check "nothing is run without mesh-lb" no_calls
 }
 
+# ben_12: the mesh-eject and mesh-breaker setups (CBR-34, #451) are accepted, run after mesh-refuse, and their plan
+# lines name the resetting pod, the ejection budget, the breaker and its budget. Only mesh-breaker asks for the delay.
+ben_12_mesh_eject_and_breaker_planned() {
+  mkdir -p "$tmp/out-eject"
+  outdir="$tmp/out-eject"
+  run "SETUPS=mesh-breaker mesh-eject mesh-refuse mesh-lb" "PROTOCOLS=http1" "RATES=200" -- --dry-run
+  check "the four mesh setups are accepted" rc_is 0
+  check "four runs" runs_is 4
+  check "mesh-lb runs first whatever the order of SETUPS" has "run 1/4 setup mesh-lb protocol http1"
+  check "mesh-refuse runs third" has "run 2/4 setup mesh-refuse protocol http1"
+  check "mesh-eject runs after mesh-refuse" has "run 3/4 setup mesh-eject protocol http1 rate 200 rps"
+  check "mesh-breaker runs last" has "run 4/4 setup mesh-breaker protocol http1 rate 200 rps"
+  check "the plan has 2 injected and 1 resetting pod" has "mesh-eject: backend 3 pods, 2 injected and 1 not injected and resetting every connection"
+  check "the plan names the budget of mesh-eject" has "at most 5 requests per ejection of the caller sidecar"
+  check "the plan names the breaker" has "mesh-breaker: backend 3 pods answering after 50 ms, MimicConfig circuitBreaker.maxRequests 8"
+  check "the plan names the budget of mesh-breaker" has "duration_ms of every breaker-open line must be at most 1 ms"
+  check "only mesh-breaker asks for the delay" count_is "delay=50ms" 1
+  check "the results file of mesh-eject is named" has "$today-mesh-eject.json"
+  check "the results file of mesh-breaker is named" has "$today-mesh-breaker.json"
+  check "nothing is run" no_calls
+  run "SETUPS=mesh-eject mesh-breaker" "PROTOCOLS=http1" "RATES=50" -- --dry-run
+  check "no propagation measure" lacks "propagation"
+  check "no rollout restart" lacks "rollout restart"
+  run -- --dry-run
+  check "the default matrix has none of them" lacks "mesh-eject"
+  run "SETUPS=mesh-eject-x" -- --dry-run
+  check "a misspelt setup exits 2" rc_is 2
+  check "the message names the new setups" has "mesh-eject or mesh-breaker"
+  outdir=""
+}
+
 for name in ben_01_arguments_only_dry_run ben_02_invalid_configuration_refused \
   ben_03_rate_cap_and_sequential_runs ben_04_defaults_are_the_matrix \
   ben_05_images_pinned_by_digest ben_06_lock_held_refused_stale_reclaimed \
   ben_07_outputs_named_and_dry_run_writes_nothing ben_08_namespace_cleanup_trap_planned \
   ben_09_machine_description_fields_no_host_identity ben_10_mesh_refuse_setup_planned \
-  ben_11_16_mesh_setups_plan; do
+  ben_11_16_mesh_setups_plan ben_12_mesh_eject_and_breaker_planned; do
   lock="$tmp/locks-$name"
   mkdir -p "$lock"
   outdir=""
