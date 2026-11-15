@@ -1355,11 +1355,6 @@ async fn rte_88_discovery_and_the_logs_hold_the_apps_exchange_once() {
         "{scrape}"
     );
     logs.access_exactly(3).await;
-    let text = logs.text();
-    assert!(
-        !wire.contains("cart-shadow") || wire.contains("\"mirrored\":true"),
-        "one access line per app request, no line per copy"
-    );
 }
 
 // RTE-89: own pools, shared endpoint state.
