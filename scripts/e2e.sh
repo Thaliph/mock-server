@@ -109,6 +109,9 @@ cleanup() {
     kubectl delete namespace rte-71 --ignore-not-found --wait=false >/dev/null 2>&1 || true
     [[ -z ${RTE_71_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${CBR_32_CLEANUP:-} ]]; then
+    kubectl delete namespace cbr-32 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n ${RTE_55_CLEANUP:-} ]]; then
     kubectl delete namespace rte-55 --ignore-not-found --wait=false >/dev/null 2>&1 || true
     [[ -z ${RTE_55_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -6053,6 +6056,290 @@ kubectl delete namespace rte-93 --wait=false >/dev/null
 RTE_93_CLEANUP=
 RTE_93_CRDS=
 echo "rte_93: copies reached cart-shadow with their bodies while the route mirrored, stopped within a view update after it did not, and cart always answered 200"
+
+# --- Outlier detection and circuit breaker (#451, spec §12.27 CBR-32) ------------------------------------------------------
+# Objects of this section only: cbr-32 (injected: client, which calls; good, reset, ok, err and slow, the backends of the
+# Services broken, five and slow). Python test services: one script, its behaviour set by environment variables.
+log "cbr_32: a resetting pod ejected and restored, a 500 pod ejected by consecutive5xx, maxRequests 2 answering breaker-open"
+CBR_32_CLEANUP=1
+ns_fresh cbr-32 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+cat > "$WORK/cbr32-pod.py" <<'PY'
+import http.server
+import os
+import socket
+import threading
+import time
+
+NAME = socket.gethostname().encode()
+STATUS = int(os.environ.get("STATUS", "200"))
+DELAY = float(os.environ.get("DELAY", "0"))
+RESET = os.environ.get("MODE") == "reset"
+lock = threading.Lock()
+count = 0
+
+
+def close_after_request(conn):
+    global count
+    try:
+        if conn.recv(65536):
+            with lock:
+                count += 1
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+
+def raw_server():
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("", 8080))
+    server.listen(128)
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=close_after_request, args=(conn,), daemon=True).start()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def answer(self):
+        global count
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        status, body = STATUS, NAME
+        if self.path == "/__count":
+            with lock:
+                status, body = 200, str(count).encode()
+        elif not RESET:
+            with lock:
+                count += 1
+            time.sleep(DELAY)
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+if RESET:
+    # The app closes every connection after reading a request; it is Ready through the probe on 8081.
+    threading.Thread(target=raw_server, daemon=True).start()
+    Server(("", 8081), Handler).serve_forever()
+else:
+    Server(("", 8080), Handler).serve_forever()
+PY
+kubectl -n cbr-32 create configmap pod --from-file=pod.py="$WORK/cbr32-pod.py" >/dev/null
+# cbr_32_app <name> <service label> <replicas> <extra env yaml>: a Deployment of pods labelled app=<name> and svc=<service label>.
+# The readiness probe is GET /__count, which the pods do not count; a resetting pod (MODE reset) has it on 8081, the others
+# on 8080.
+cbr_32_app() {
+  local port=8080
+  [[ $4 == *reset* ]] && port=8081
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $1, namespace: cbr-32}
+spec:
+  replicas: $3
+  selector: {matchLabels: {app: $1}}
+  template:
+    metadata: {labels: {app: $1, svc: $2}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, /srv/pod.py]
+          env: [$4]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /__count, port: $port}, periodSeconds: 1}
+          volumeMounts: [{name: srv, mountPath: /srv}]
+      volumes: [{name: srv, configMap: {name: pod}}]
+YAML
+}
+cbr_32_service() { # cbr_32_service <name>
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Service
+metadata: {name: $1, namespace: cbr-32}
+spec:
+  selector: {svc: $1}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+}
+cbr_32_app good broken 2 '{name: MODE, value: http}'
+cbr_32_app reset broken 1 '{name: MODE, value: reset}'
+cbr_32_app ok five 2 '{name: STATUS, value: "200"}'
+cbr_32_app err five 1 '{name: STATUS, value: "500"}'
+cbr_32_app slow slow 2 '{name: DELAY, value: "1"}'
+for svc in broken five slow; do cbr_32_service "$svc"; done
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: cbr-32}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for d in good reset ok err slow client; do
+  kubectl -n cbr-32 rollout status deploy/$d --timeout=3m >/dev/null || fail "cbr_32: $d did not roll out Ready"
+done
+cbr_32_client=$(kubectl -n cbr-32 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+# cbr_32_until <timeout seconds> <description> <command...>: polls the command once a second.
+cbr_32_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "cbr_32: $desc"
+}
+cbr_32_view() { [[ $(rty_metric cbr-32 "$cbr_32_client" mimic_mesh_view_endpoints) == 8 ]]; }
+cbr_32_until 60 "the sidecar of client never held a view with the 8 endpoints of broken, five and slow" cbr_32_view
+# Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
+sleep 31
+cat > "$WORK/cbr32-client.py" <<'PY'
+import collections
+import http.client
+import sys
+import threading
+
+host, total, parallel = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "par"
+results = []
+lock = threading.Lock()
+
+
+def one():
+    try:
+        c = http.client.HTTPConnection(host, 80, timeout=20)
+        c.request("GET", "/")
+        r = c.getresponse()
+        body = r.read().decode()
+        c.close()
+        result = (r.status, r.getheader("x-mimic-error") or "-")
+    except Exception:
+        result = (0, "-")
+    with lock:
+        results.append(result)
+
+
+if parallel:
+    threads = [threading.Thread(target=one) for _ in range(total)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+else:
+    for _ in range(total):
+        one()
+for (status, error), n in sorted(collections.Counter(results).items()):
+    print("status", status, error, n)
+PY
+kubectl -n cbr-32 exec -i "$cbr_32_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/cbr32-client.py" || fail "cbr_32: cannot copy the client script"
+# cbr_32_run <service> <n> <seq|par>: the lines "status <code> <x-mimic-error or -> <count>" of n GETs from client.
+cbr_32_run() { kubectl -n cbr-32 exec "$cbr_32_client" -c app -- python3 /tmp/client.py "$1.cbr-32.svc" "$2" "$3"; }
+# cbr_32_status <output> <code> <error>: the count of the answers with that status and x-mimic-error.
+cbr_32_status() { awk -v s="$2" -v e="$3" '$1 == "status" && $2 == s && $3 == e { n += $4 } END { print n + 0 }' <<<"$1"; }
+# cbr_32_count <app> <port>: the requests counted by the pods of an app (GET /__count on each, from inside it).
+cbr_32_count() {
+  local pod n total=0
+  for pod in $(kubectl -n cbr-32 get pods -l "app=$1" -o jsonpath='{.items[*].metadata.name}'); do
+    n=$(kubectl -n cbr-32 exec "$pod" -c app -- python3 -c 'import sys, urllib.request; print(urllib.request.urlopen("http://127.0.0.1:%s/__count" % sys.argv[1]).read().decode())' "$2") || return 1
+    total=$((total + n))
+  done
+  echo "$total"
+}
+cbr_32_log() { tls_line cbr-32 "$cbr_32_client" "$1"; }
+cbr_32_log_count() { tls_count cbr-32 "$cbr_32_client" "$1"; }
+
+# 300 GETs to broken: one pod resets every connection after reading its request.
+cbr_32_out=$(cbr_32_run broken 300 seq) || fail "cbr_32: the client script failed on broken"
+cbr_32_ok=$(cbr_32_status "$cbr_32_out" 200 -)
+(( cbr_32_ok == 300 )) || fail "cbr_32: $cbr_32_ok of 300 GET to broken were answered 200: $cbr_32_out"
+cbr_32_reset=$(cbr_32_count reset 8081) || fail "cbr_32: cannot read the counter of the resetting pod"
+(( cbr_32_reset <= 5 )) || fail "cbr_32: the resetting pod received $cbr_32_reset requests, at most 5 expected"
+cbr_32_ejected=$(rty_metric_sum cbr-32 "$cbr_32_client" mimic_mesh_ejections_total 'reason="consecutive_failures"')
+(( ${cbr_32_ejected%.*} == 1 )) || fail "cbr_32: mimic_mesh_ejections_total{reason=\"consecutive_failures\"} is $cbr_32_ejected, 1 expected"
+cbr_32_until 10 "no endpoint ejected line with consecutive_failures on the sidecar of client" \
+  cbr_32_log '.message == "endpoint ejected" and .reason == "consecutive_failures"'
+# The ejection ends after 30 s (the default): the endpoint is restored, one INFO line, the gauge back to 0.
+cbr_32_until 90 "no endpoint restored line with cause elapsed on the sidecar of client within 90 s" \
+  cbr_32_log '.message == "endpoint restored" and .cause == "elapsed"'
+cbr_32_gauge_zero() { (( $(rty_metric_sum cbr-32 "$cbr_32_client" mimic_mesh_ejected_endpoints | cut -d. -f1) == 0 )); }
+cbr_32_until 10 "mimic_mesh_ejected_endpoints is not back to 0 after the restoration" cbr_32_gauge_zero
+echo "cbr_32: 300 GET to a Service with a resetting pod were all 200, the pod received $cbr_32_reset of them before its ejection (1 consecutive_failures), then it was restored"
+
+# five: one pod answers 500. consecutive5xx: 3 on the Service, applied once the sidecar holds the view.
+cbr_32_applied_before=$(cbr_32_log_count '.message == "mesh view applied"')
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: five-outlier, namespace: cbr-32}
+spec:
+  targetRefs: [{group: "", kind: Service, name: five}]
+  outlierDetection: {consecutive5xx: 3}
+YAML
+cbr_32_accepted() { [[ $(kubectl -n cbr-32 get mimicconfig "$1" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}') == True ]]; }
+cbr_32_until 30 "the MimicConfig five-outlier is not Accepted: True" cbr_32_accepted five-outlier
+cbr_32_applied() { (( $(cbr_32_log_count '.message == "mesh view applied"') > cbr_32_applied_before )); }
+cbr_32_until 60 "no mesh view applied line on the sidecar of client after the MimicConfig five-outlier" cbr_32_applied
+sleep 3
+cbr_32_err_before=$(cbr_32_count err 8080) || fail "cbr_32: cannot read the counter of the 500 pod"
+cbr_32_out=$(cbr_32_run five 100 seq) || fail "cbr_32: the client script failed on five"
+cbr_32_err_after=$(cbr_32_count err 8080) || fail "cbr_32: cannot read the counter of the 500 pod"
+cbr_32_err=$((cbr_32_err_after - cbr_32_err_before))
+(( cbr_32_err <= 3 )) || fail "cbr_32: the pod answering 500 received $cbr_32_err of the 100 requests, at most 3 expected: $cbr_32_out"
+cbr_32_5xx=$(rty_metric_sum cbr-32 "$cbr_32_client" mimic_mesh_ejections_total 'reason="consecutive_5xx"')
+(( ${cbr_32_5xx%.*} == 1 )) || fail "cbr_32: mimic_mesh_ejections_total{reason=\"consecutive_5xx\"} is $cbr_32_5xx, 1 expected"
+cbr_32_until 10 "no endpoint ejected line with consecutive_5xx on the sidecar of client" \
+  cbr_32_log '.message == "endpoint ejected" and .reason == "consecutive_5xx"'
+echo "cbr_32: with consecutive5xx: 3 the pod answering 500 received $cbr_32_err of 100 requests, then was ejected"
+
+# slow: maxRequests 2 over pods answering after 1 s. The first run may precede the view that carries the config: poll.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: slow-breaker, namespace: cbr-32}
+spec:
+  targetRefs: [{group: "", kind: Service, name: slow}]
+  circuitBreaker: {maxRequests: 2}
+YAML
+cbr_32_until 30 "the MimicConfig slow-breaker is not Accepted: True" cbr_32_accepted slow-breaker
+cbr_32_breaker_open() {
+  cbr_32_out=$(cbr_32_run slow 10 par) || return 1
+  [[ $(cbr_32_status "$cbr_32_out" 200 -) == 2 && $(cbr_32_status "$cbr_32_out" 503 breaker-open) == 8 ]]
+}
+cbr_32_until 60 "10 concurrent requests were not 2 x 200 and 8 x 503 breaker-open within 60 s of maxRequests: 2" cbr_32_breaker_open
+cbr_32_open=$(rty_metric_sum cbr-32 "$cbr_32_client" mimic_mesh_requests_total 'reason="breaker-open"')
+(( ${cbr_32_open%.*} >= 8 )) || fail "cbr_32: mimic_mesh_requests_total{reason=\"breaker-open\"} is $cbr_32_open, at least 8 expected"
+cbr_32_until 10 "no breaker open line on the sidecar of client" cbr_32_log '.message == "breaker open"'
+cbr_32_until 10 "no access line with reason breaker-open on the sidecar of client" \
+  cbr_32_log '.target == "access" and .reason == "breaker-open"'
+# The config is deleted: once the view carries that, the same 10 concurrent requests are all 200.
+kubectl -n cbr-32 delete mimicconfig slow-breaker >/dev/null
+cbr_32_all_ok() {
+  cbr_32_out=$(cbr_32_run slow 10 par) || return 1
+  [[ $(cbr_32_status "$cbr_32_out" 200 -) == 10 ]]
+}
+cbr_32_until 60 "10 concurrent requests were not all 200 within 60 s of the MimicConfig being deleted" cbr_32_all_ok
+
+kubectl delete namespace cbr-32 --wait=false >/dev/null
+CBR_32_CLEANUP=
+echo "cbr_32: maxRequests: 2 answered 2 of 10 concurrent requests 200 and 8 503 breaker-open, and all 10 were 200 once the config was deleted"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
