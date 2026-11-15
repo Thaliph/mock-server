@@ -2,6 +2,8 @@
 //! copy, from the random values, the free slots and the body's state passed in, and the
 //! deadline of a copy. Pure: there is no random source, no clock, no counter of slots here.
 
+use std::collections::BTreeMap;
+
 use super::route::TimeoutsView;
 
 /// Copies in flight per mirror Service port (default of `mirror_max_in_flight`).
@@ -14,7 +16,7 @@ pub const TIMEOUT_MS: u64 = 10_000;
 /// Whether the mirror `numerator / denominator` is drawn for the uniform 64-bit value `r`:
 /// `⌊r × denominator / 2⁶⁴⌋ < numerator`.
 pub fn drawn(numerator: u32, denominator: u32, r: u64) -> bool {
-    unimplemented!("{numerator} {denominator} {r}")
+    ((u128::from(r) * u128::from(denominator)) >> 64) < u128::from(numerator)
 }
 
 /// The request body as known at the head.
@@ -65,13 +67,37 @@ pub fn decide(
     body: Body,
     share: u64,
 ) -> Vec<Option<Decision>> {
-    let _ = (candidates, free_total, free_port, body, share);
-    unimplemented!()
+    let mut total = 0usize;
+    let mut per_port: BTreeMap<&str, usize> = BTreeMap::new();
+    candidates
+        .iter()
+        .map(|c| {
+            if !c.drawn {
+                return None;
+            }
+            let taken = per_port.entry(c.port).or_insert(0);
+            if total >= free_total || *taken >= free_port(c.port) {
+                return Some(Decision::SkipLimit);
+            }
+            let decision = match body {
+                Body::None => Decision::Send,
+                Body::Declared(len) if len > share => return Some(Decision::SkipBody),
+                Body::Declared(_) | Body::Unknown => Decision::AwaitBody,
+            };
+            total += 1;
+            *taken += 1;
+            Some(decision)
+        })
+        .collect()
 }
 
 /// The deadline of a copy, in milliseconds from the request head: the earliest of
 /// `mirror_timeout_ms` and the rule's non-zero timeouts.
 pub fn deadline_ms(mirror_timeout_ms: u64, timeouts: Option<&TimeoutsView>) -> u64 {
-    let _ = (mirror_timeout_ms, timeouts);
-    unimplemented!()
+    let rule = timeouts
+        .into_iter()
+        .flat_map(|t| [t.request_ms, t.backend_request_ms])
+        .flatten()
+        .filter(|ms| *ms > 0);
+    rule.fold(mirror_timeout_ms, u64::min)
 }
