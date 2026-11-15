@@ -626,6 +626,46 @@ async fn cbr_26_an_upgrade_and_a_connect_with_a_full_breaker_reach_the_pod_and_h
         2.0,
         "the two probes only: {scrape}"
     );
+    // The same two as the first request of a connection (the byte relay, no slot either).
+    let state = state_with(
+        &[svc("shop/cart", Some("127.0.0.1"), pod.addr.port(), &[pod.addr]).breaker(1, 1024)],
+        |_| {},
+    );
+    let g = fixture_mesh(pod.addr, &state, None).await;
+    let mut holder2 = H1Client::connect(g.addr).await;
+    holder2
+        .send(b"GET /hold HTTP/1.1\r\nHost: cart.shop.svc\r\n\r\n")
+        .await;
+    let first = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n12345".len();
+    holder2.read_raw(first).await;
+    let (head, body, _) = spawn_get(g.addr, "/").await.unwrap();
+    assert_open(&head, &body);
+    for (opening, answer) in [
+        (
+            "GET /ws HTTP/1.1\r\nHost: cart.shop.svc\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            "HTTP/1.1 101",
+        ),
+        (
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            "HTTP/1.1 200",
+        ),
+    ] {
+        let mut client = H1Client::connect(g.addr).await;
+        client.send(opening.as_bytes()).await;
+        let (head, _) = client.read().await.expect("an answer");
+        assert!(head.starts_with(answer), "first {opening}: {head}");
+        tunnels.push(client);
+    }
+    assert_eq!(
+        metric(
+            &g.metrics.encode(),
+            "mimic_mesh_requests_total{",
+            &["reason=\"breaker-open\""]
+        ),
+        1.0,
+        "only the probe"
+    );
+    drop(holder2);
     // The tunnels hold no slot: once the long response ends, a request is served.
     drop(holder);
     free_again(f.addr).await;
