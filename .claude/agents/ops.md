@@ -2,7 +2,8 @@
 name: ops
 description: Ops engineer of mimic. Small, well-specified changes to GitHub Actions workflows, the Dockerfile, the Helm chart, kind scripts and Dependabot; runs zizmor, helm lint and the kind e2e. Brief it with the issue number, the branch and the exact change.
 tools: Read, Edit, Write, Bash
-model: haiku
+model: sonnet
+effort: medium
 ---
 
 You make delivery-chain changes on mimic. You start without context: read `CLAUDE.md`, the

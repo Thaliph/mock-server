@@ -9,16 +9,23 @@ The main session runs this; sub-agents cannot spawn sub-agents. Agents start **w
 conversation: each brief is a few lines with the issue number, the branch, the step and the
 criterion IDs. Never paste the conversation into a brief.
 
-| Agent | Model | Used for |
+| Agent | Model (effort) | Used for |
 |---|---|---|
-| `architect` | Opus | once per feature: criteria, design, threat model, steps |
-| `spec-writer` | Opus | each step with Rust code: the step spec (contract, reuse, tests) |
-| `rust-dev` | Sonnet | each Rust step, test-first, from the step spec |
-| `ops` | Haiku | each CI / Dockerfile / Helm / kind step |
-| `code-critic` | Opus | each PR, before the reviewer: duplication, layering, coherence |
-| `reviewer` | Sonnet | each PR, one pass, plus delta re-reviews |
-| `ci-triage` | Haiku | a failing CI run: diff, flake or infra |
-| `security-auditor` | Opus | once per milestone, on `main`, after its last merge |
+| `architect` | Fable (high) | once per feature: criteria, design, threat model, steps |
+| `spec-writer` | Opus (high) | each step with Rust code: the step spec (contract, reuse, tests) |
+| `rust-dev` | Opus (high) | each Rust step, test-first, from the step spec |
+| `ops` | Sonnet (medium) | each CI / Dockerfile / Helm / kind step |
+| `code-critic` | Opus (high) | each PR, before the reviewer: duplication, layering, coherence |
+| `reviewer` | Opus (high) | each PR, one pass, plus delta re-reviews |
+| `ci-triage` | Haiku (low) | a failing CI run: diff, flake or infra |
+| `security-auditor` | Fable (high) | once per milestone, on `main`, after its last merge |
+
+Why (2026-11-18): Fable, the most capable and most expensive tier, only for the two rare,
+highest-leverage roles (a wrong criterion or a missed threat costs a whole feature). The
+concurrent data-plane code and its gate review go to Opus: on Sonnet they needed repeated fix
+rounds (weak tests, wrong counters). Ops moves from Haiku to Sonnet because workflow
+changes are security-sensitive (pins, permissions). Haiku stays for log reading. Spreading the
+roles over tiers also spreads the usage limits (Sonnet's weekly limit stopped #452 once).
 
 Do small mechanical things yourself instead of spawning an agent (a typo, a version bump, a
 one-line fix asked by a review): a spawn costs more than the fix.
@@ -97,7 +104,8 @@ commit range. Its `[high]` and `[medium]` findings are fixed before the next mil
 ## Cost rules
 
 - Read only the spec sections and files a step needs; prefer `gh … --json` with `-q`.
-- Opus only for the judgment roles (architect, spec-writer, code-critic, security-auditor); never
-  for implementation or the correctness review. No second review pass for non-blocking findings.
+- Model per role as in the table; override with the Agent tool's `model` only for a reason
+  written in the brief (e.g. a usage limit reached on that tier). No second review pass for
+  non-blocking findings.
 - Benchmarks follow the `bench` skill; e2e the `kind-e2e` skill.
 - Public repo + GitHub-hosted runners + GHCR only (free tier).

@@ -3,6 +3,7 @@ name: spec-writer
 description: Writes the step spec of one feature step of mimic before any code - the exact contract a rust-dev implements (types, signatures, module placement, error cases, helpers to reuse, the test list with inputs and expected outputs, pitfalls). Brief it with the issue number, the branch and the step number, after the architect has written the criteria.
 tools: Read, Bash
 model: opus
+effort: high
 ---
 
 You turn one step of a mimic feature into a **step spec**: a document precise enough that a
