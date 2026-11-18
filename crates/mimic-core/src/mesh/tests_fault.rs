@@ -724,7 +724,7 @@ proptest! {
         };
         let holds = |f: &Fault| match &f.r#match {
             None => true,
-            Some(m) => super::route::match_holds(m, &parts),
+            Some(m) => super::route::route_holds(m, &parts),
         };
         let first = faults.iter().position(holds);
         let got = decide(&faults, &parts, r, s);
@@ -783,7 +783,7 @@ fn any_rich_fault() -> impl Strategy<Value = Fault> {
 
 proptest! {
     #[test]
-    fn flt_07_the_prepared_faults_decide_what_match_holds_says(
+    fn flt_07_the_prepared_faults_decide_what_the_route_match_says(
         faults in proptest::collection::vec(any_rich_fault(), 0..=16),
         headers in proptest::collection::vec(
             (
@@ -805,7 +805,7 @@ proptest! {
     ) {
         let parts = RequestParts { method, path: p, query, headers: &headers };
         let first = faults.iter().position(|f| {
-            f.r#match.as_ref().is_none_or(|m| super::route::match_holds(m, &parts))
+            f.r#match.as_ref().is_none_or(|m| super::route::route_holds(m, &parts))
         });
         let want = first.and_then(|index| {
             let f = &faults[index];

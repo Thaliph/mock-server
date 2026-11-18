@@ -38,17 +38,17 @@ pub fn split_target(target: &str) -> (&str, Option<&str>) {
     }
 }
 
-enum PathItem<S> {
-    Exact(S),
+enum PathItem {
+    Exact(String),
     /// The prefix without its one trailing `/`.
-    Prefix(S),
+    Prefix(String),
 }
 
 /// One match of one rule, with the items it holds once per name.
 struct Entry {
     route: usize,
     rule: usize,
-    path: Option<PathItem<String>>,
+    path: Option<PathItem>,
     method: Option<String>,
     headers: Vec<(String, String)>,
     query: Vec<(String, String)>,
@@ -146,36 +146,13 @@ fn entry(route: usize, rule: usize, m: &MatchView) -> Entry {
     }
 }
 
-/// Whether `m` holds for `req` as the match of a route does (the first item of a name counts),
-/// without building a table: a fault's `match` (spec §7.9 "Fault injection").
-pub fn match_holds(m: &MatchView, req: &RequestParts) -> bool {
-    if let Some(p) = &m.path {
-        let item = if p.kind == "Exact" {
-            PathItem::Exact(p.value.as_str())
-        } else {
-            PathItem::Prefix(p.value.strip_suffix('/').unwrap_or(p.value.as_str()))
-        };
-        if !path_holds(&item, req.path) {
-            return false;
-        }
-    }
-    if m.method.as_deref().is_some_and(|want| want != req.method) {
-        return false;
-    }
-    // A repeated name is ignored (the first item of a name counts); it is looked for only when
-    // an item does not hold, which keeps the cost of a holding match low.
-    m.headers.iter().enumerate().all(|(i, h)| {
-        header_equals(req.headers, &h.name, h.value.as_bytes())
-            || m.headers[..i]
-                .iter()
-                .any(|e| e.name.eq_ignore_ascii_case(&h.name))
-    }) && m.query_params.iter().enumerate().all(|(i, q)| {
-        query_equals(req.query, &q.name, &q.value)
-            || m.query_params[..i].iter().any(|e| e.name == q.name)
-    })
+/// Whether `m` holds for `req` as the match of a route: the oracle of the fault tests (FLT-07).
+#[cfg(test)]
+pub(crate) fn route_holds(m: &MatchView, req: &RequestParts) -> bool {
+    entry(0, 0, m).holds(req)
 }
 
-/// Matches tried in their order, each holding as [`match_holds`] says, made once (when a view
+/// Matches tried in their order, each holding as it does in a route, made once (when a view
 /// is built) so that a request looks each header name up once and compares each header item
 /// once, however many matches hold it: a policy's faults (spec §7.9 "Fault injection", FLT-10).
 pub struct Matches {
@@ -334,19 +311,6 @@ fn name_key(name: &str) -> u64 {
     (head | FOLD).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (tail | FOLD) ^ name.len() as u64
 }
 
-fn path_holds(item: &PathItem<&str>, path: &str) -> bool {
-    // `*` and an empty path match no path item.
-    if !path.starts_with('/') {
-        return false;
-    }
-    match item {
-        PathItem::Exact(v) => path == *v,
-        PathItem::Prefix(v) => path
-            .strip_prefix(v)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
-    }
-}
-
 impl Entry {
     fn holds(&self, req: &RequestParts) -> bool {
         self.path_and_method_hold(req)
@@ -359,11 +323,18 @@ impl Entry {
 
     fn path_and_method_hold(&self, req: &RequestParts) -> bool {
         if let Some(item) = &self.path {
-            let borrowed = match item {
-                PathItem::Exact(v) => PathItem::Exact(v.as_str()),
-                PathItem::Prefix(v) => PathItem::Prefix(v.as_str()),
+            // `*` and an empty path match no path item.
+            if !req.path.starts_with('/') {
+                return false;
+            }
+            let ok = match item {
+                PathItem::Exact(v) => req.path == v,
+                PathItem::Prefix(v) => req
+                    .path
+                    .strip_prefix(v.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
             };
-            if !path_holds(&borrowed, req.path) {
+            if !ok {
                 return false;
             }
         }
