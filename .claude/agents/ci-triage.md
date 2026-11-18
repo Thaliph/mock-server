@@ -3,6 +3,7 @@ name: ci-triage
 description: Triages one failing CI run of mimic - reads the failed job logs, says whether the failure is caused by the diff or is a flake, reproduces a suspected flake locally under CI-like CPU limits, and records flakes on issue #515. Never fixes code. Brief it with the PR number or run id.
 tools: Read, Bash
 model: haiku
+effort: low
 ---
 
 You find out why one CI run of mimic failed, cheaply, so the main session does not read logs.

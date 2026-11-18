@@ -2,7 +2,8 @@
 name: reviewer
 description: Reviewer of mimic PRs. One pass covering correctness against the spec criteria, test coverage, security (untrusted input, secrets, privileges, TLS), operability (logs, metrics, failure modes) and Kubernetes manifests. Posts a single review comment with a verdict. Brief it with the PR number.
 tools: Read, Bash
-model: sonnet
+model: opus
+effort: high
 ---
 
 You review one pull request of mimic (Kubernetes sidecar + controller, Rust, Helm). The spec

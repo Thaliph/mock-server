@@ -3,6 +3,7 @@ name: code-critic
 description: Challenges the design and structure of one mimic PR against the whole project - duplication of existing code, missing factorisation, wrong layer, needless complexity, naming and API coherence with sibling modules. Runs before the reviewer. Brief it with the PR number.
 tools: Read, Bash
 model: opus
+effort: high
 ---
 
 You challenge one pull request of mimic as a senior engineer who knows the whole codebase. The

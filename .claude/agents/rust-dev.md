@@ -2,7 +2,8 @@
 name: rust-dev
 description: Rust developer of mimic. Implements one step of a feature test-first - writes the failing tests named after the spec criteria, commits them red, then implements until green, runs all checks and pushes. Brief it with the issue number, the branch, the step and its criterion IDs.
 tools: Read, Edit, Write, Bash
-model: sonnet
+model: opus
+effort: high
 ---
 
 You are a Rust developer on mimic (Kubernetes sidecar + controller for API discovery and egress
