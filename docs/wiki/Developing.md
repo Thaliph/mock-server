@@ -24,6 +24,51 @@ Rules that shape the code:
 - No traces: logs and metrics only.
 - Free tier only: public repo, GitHub-hosted runners, GHCR.
 
+## How features are delivered
+
+One GitHub issue per feature, delivered by the main session with the agent team of
+`.claude/agents/` and the `deliver-feature` skill (`.claude/skills/deliver-feature/SKILL.md`).
+
+```mermaid
+flowchart LR
+  Issue["Issue"] --> Spec["Architect: criteria in SPEC.md section 12, design, threat model, steps"]
+  Spec --> Red["Tests named after the criterion IDs, seen failing"]
+  Red --> Code["Code until they pass"]
+  Code --> Review["Code critic, then reviewer"]
+  Review --> Gate{"ci-ok green and an APPROVE marker newer than the head?"}
+  Gate -->|no| Code
+  Gate -->|yes| Merge["Merge"]
+```
+
+1. **Spec first.** The architect writes the acceptance criteria into `docs/SPEC.md` §12 (a table
+   `ID | Criterion`, each with its test level: unit in `mimic-core`, integration in `crates/*/tests`,
+   kind e2e in `scripts/e2e.sh`), updates the spec sections the feature changes, and posts the design,
+   the threat model and PR-sized steps on the issue. A product question goes to the maintainer and is
+   recorded on the issue.
+2. **Red tests.** Each step writes its tests first, named after the criterion IDs (`rty_03_…`), and sees
+   them fail.
+3. **Code** until they pass, then `cargo fmt`, `clippy` and `cargo test` as in [Build and test](#build-and-test).
+
+| Agent | Used for |
+|---|---|
+| `architect` | once per feature: criteria, design, threat model, steps |
+| `spec-writer` | each step with Rust code: the step spec (contract, reuse, tests) |
+| `rust-dev` | each Rust step, test-first, from the step spec |
+| `ops` | each CI, Dockerfile, Helm or kind step |
+| `code-critic` | each PR, before the reviewer: duplication, layering, coherence |
+| `reviewer` | each PR, one pass, plus delta re-reviews |
+| `ci-triage` | a failing CI run: the diff, a flake or the infrastructure |
+| `security-auditor` | once per milestone, on `main`, after its last merge |
+
+**The merge gate.** A PR merges only when `ci-ok` is green **and** the last `<!-- mimic-review: … -->`
+marker of the reviewer is `APPROVE` and newer than the PR's head commit: any new commit, or a merge of
+`main`, needs a delta re-review first. `.claude/skills/deliver-feature/ship.sh <pr>` waits for both, then
+merges.
+
+**One e2e or bench at a time.** `scripts/e2e.sh`, `scripts/e2e-load.sh` and `scripts/bench.sh` use fixed
+ports and a shared kubeconfig, and `docker build` shares one cargo cache mount: run one of them at a time
+on a machine, never two. Agents do not run them; the main session runs them one after the other.
+
 ## Repository layout
 
 | Path | Content |
@@ -39,7 +84,7 @@ Rules that shape the code:
 | `images/`, `Dockerfile` | Pinned images (controller/sidecar, init, e2e app) |
 | `scripts/` | `e2e.sh`, `e2e/apps/` (Python test services), pin and cooldown checks |
 | `fuzz/` | `cargo-fuzz` targets (`http1`, `discovery`) |
-| `.claude/` | Agent team (`architect`, `rust-dev`, `reviewer`, `ops`) and skills |
+| `.claude/` | Agent team ([How features are delivered](#how-features-are-delivered)) and skills |
 
 ## Build and test
 
