@@ -22,7 +22,7 @@ use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const POLICY: &str = r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":0},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
+const POLICY: &str = r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"faults":[],"loadBalancer":{"slowStartSeconds":0},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
 
 /// A Service of the view: its pods, its ClusterIPs and the routes it carries.
 struct Svc {

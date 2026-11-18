@@ -336,7 +336,7 @@ const GOLDEN: &str = concat!(
     r#"{"cluster":"local","format":1,"generations":{},"mesh":true,"mode":"none","services":{"shop/cart":{"#,
     r#""endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},"#,
     r#""generations":{"endpointslice/shop/cart-x7k2p@uid-cart-x7k2p":41},"ips":["10.96.12.7"],"#,
-    r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":30},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
+    r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"faults":[],"loadBalancer":{"slowStartSeconds":30},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
 );
 
 #[test]
@@ -533,7 +533,7 @@ fn rty_45_the_policy_holds_retries_and_every_budget_field_and_a_change_moves_the
     let base = view_of(&s, "shop", "cart");
     assert!(
         base.json.contains(
-            r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":30},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#
+            r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"faults":[],"loadBalancer":{"slowStartSeconds":30},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#
         ),
         "{}",
         base.json
@@ -571,7 +571,7 @@ fn cbr_02_the_policy_holds_both_objects_with_every_field_and_each_field_moves_th
     let base = view_of(&s, "shop", "cart");
     assert!(
         base.json.contains(
-            r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer""#
+            r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"faults":[],"loadBalancer""#
         ),
         "{}",
         base.json

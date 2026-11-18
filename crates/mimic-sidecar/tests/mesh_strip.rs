@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::capture_logs;
-use common::mesh_pods::view_text;
+use common::faults::no_series;
+use common::mesh_pods::{Svc, view_services, view_text};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::service::service_fn;
@@ -177,6 +178,18 @@ async fn rty_18_http1_content_length_answers_lose_the_fields_on_a_keep_alive_con
     let rig = start(app(reply, false).await, Some(&state)).await;
     exchange(rig.addr, GET, 3, want, false).await;
     assert_eq!(rig.stripped(), 9, "3 per response");
+}
+
+#[tokio::test]
+async fn flt_24_an_inbound_sidecar_strips_a_forwarded_fault_injected() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
+    let reply: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: fault-injected\r\nContent-Length: 0\r\n\r\n";
+    let want: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    let state = meshed();
+    let rig = start(app(reply, false).await, Some(&state)).await;
+    exchange(rig.addr, GET, 3, want, false).await;
+    assert_eq!(rig.stripped(), 3);
 }
 
 #[tokio::test]
@@ -540,4 +553,22 @@ async fn rty_18_endless_blank_lines_before_the_status_line_close_the_connection_
         !got.windows(7).any(|w| w == b"x-mimic"),
         "no field reaches the client"
     );
+}
+
+#[tokio::test]
+async fn flt_23_an_inbound_sidecar_never_aborts_the_requests_to_its_pod() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
+    let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let app = app(reply, false).await;
+    let state = meshed();
+    state.hold(
+        view_services(&[Svc::new("shop/cart", "127.0.0.1", app.port(), &[app])
+            .faults(r#"[{"abort":{"percent":100,"status":503}}]"#)]),
+        "\"1-a\"",
+    );
+    let rig = start(app, Some(&state)).await;
+    exchange(rig.addr, GET, 5, reply, false).await;
+    let scrape = rig.metrics.encode();
+    assert!(no_series(&scrape, "mimic_mesh_faults_total{"), "{scrape}");
 }

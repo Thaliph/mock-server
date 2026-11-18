@@ -686,3 +686,44 @@ fn cbr_06_the_fuzz_seed_view_holds_both_objects_and_reads_back_equal() {
     });
     assert!(non_default, "the seed carries a non-default value");
 }
+
+#[test]
+fn flt_06_the_fuzz_seed_view_holds_16_faults_with_every_kind_of_match_item() {
+    let seed = include_str!("../../../../fuzz/seeds/mesh/view");
+    let view = read(seed.trim_end()).expect("the seed view is accepted");
+    assert_eq!(view.to_json(), seed.trim_end());
+    let faults = view
+        .services
+        .values()
+        .map(|s| &s.policy.faults)
+        .max_by_key(|f| f.len())
+        .expect("a service");
+    assert_eq!(faults.len(), 16);
+    let matches: Vec<_> = faults.iter().filter_map(|f| f.r#match.as_ref()).collect();
+    assert!(matches.iter().any(|m| m.method.is_some()));
+    assert!(matches.iter().any(|m| !m.headers.is_empty()));
+    assert!(matches.iter().any(|m| !m.query_params.is_empty()));
+    for kind in ["Exact", "PathPrefix"] {
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.path.as_ref().is_some_and(|p| p.kind == kind))
+        );
+    }
+    assert!(
+        faults
+            .iter()
+            .any(|f| f.abort.is_some() && f.delay.is_none())
+    );
+    assert!(
+        faults
+            .iter()
+            .any(|f| f.delay.is_some() && f.abort.is_none())
+    );
+    assert!(
+        faults
+            .iter()
+            .any(|f| f.delay.is_some() && f.abort.is_some())
+    );
+    assert!(faults.iter().any(|f| f.r#match.is_none()));
+}

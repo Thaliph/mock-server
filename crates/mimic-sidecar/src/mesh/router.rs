@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use mimic_core::mesh::fault::Faults;
 use mimic_core::mesh::lb::Endpoints;
 use mimic_core::mesh::mirror::{self, Body, Candidate, Decision as Mirrored};
 use mimic_core::mesh::outlier::{self, Outlier, Restoration};
@@ -111,6 +112,8 @@ pub(crate) struct ServiceRetry {
     max_requests: AtomicU32,
     max_connections: pool::Limit,
     opened: Mutex<Limiter>,
+    /// The faults of the Service (spec §7.9 "Fault injection"), made once per view.
+    faults: RwLock<Arc<Faults>>,
 }
 
 /// A slot of a Service's breaker, taken by a request and given back when dropped (the count it
@@ -140,12 +143,16 @@ impl ServiceRetry {
             max_requests: AtomicU32::new(policy.circuit_breaker.max_requests),
             max_connections: Arc::new(AtomicU32::new(policy.circuit_breaker.max_connections)),
             opened: Mutex::new(Limiter::default()),
+            faults: RwLock::new(Arc::new(Faults::new(&policy.faults))),
         }
     }
 
-    /// A new view: `retries` and the rates apply at once; a new window starts the budget empty.
+    /// A new view: `retries`, the rates and the faults apply at once; a new window starts the
+    /// budget empty.
     fn configure(&self, policy: &Policy) {
         self.retries.store(policy.retries, Ordering::Release);
+        *self.faults.write().unwrap_or_else(PoisonError::into_inner) =
+            Arc::new(Faults::new(&policy.faults));
         self.max_requests
             .store(policy.circuit_breaker.max_requests, Ordering::Release);
         self.max_connections
@@ -164,6 +171,23 @@ impl ServiceRetry {
 
     pub(crate) fn retries(&self) -> u32 {
         self.retries.load(Ordering::Acquire)
+    }
+
+    /// The faults of the view held, in its order; empty when it has none.
+    pub(crate) fn faults(&self) -> Arc<Faults> {
+        self.faults
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the view held gives the Service faults (no clone of them).
+    pub(crate) fn has_faults(&self) -> bool {
+        !self
+            .faults
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 
     /// The HTTP/1 connections a pool may hold for a request of this Service, as the view now
@@ -434,6 +458,12 @@ impl Backend {
         );
     }
 
+    /// Whether the port has an endpoint in the view held (the check `plan` makes at its first
+    /// try).
+    pub(crate) fn has_endpoints(&self) -> bool {
+        !lock(&self.state).endpoints.is_empty()
+    }
+
     /// The addresses of the endpoints now.
     fn addrs(&self) -> Vec<SocketAddr> {
         lock(&self.state).endpoints.iter().map(|e| e.addr).collect()
@@ -542,10 +572,34 @@ impl Drop for Slot {
     }
 }
 
+/// SplitMix64's increment, added to the state at each draw.
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The inverse of [`GOLDEN`] (odd) modulo 2^64, by Newton's iteration: a state difference
+/// times it is the number of draws.
+const GOLDEN_INVERSE: u64 = {
+    let mut inverse = GOLDEN;
+    let mut i = 0;
+    while i < 6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(GOLDEN.wrapping_mul(inverse)));
+        i += 1;
+    }
+    inverse
+};
+
+/// SplitMix64's output function of a state.
+fn splitmix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 pub(crate) struct Router {
     started: Instant,
     /// SplitMix64 state: one atomic add per draw, no lock.
     seed: AtomicU64,
+    /// The state at start, to count the draws (test hook).
+    first_seed: u64,
     backends: RwLock<BTreeMap<String, Arc<Backend>>>,
     pub(crate) pools: Arc<Pools>,
     /// The pools of the copies sent to mirrors, apart from those of every other request.
@@ -576,9 +630,11 @@ impl Router {
         refusal_delay: Duration,
         mirrors: MirrorConfig,
     ) -> Router {
+        let seed = seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX));
         Router {
             started: Instant::now(),
-            seed: AtomicU64::new(seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX))),
+            seed: AtomicU64::new(seed),
+            first_seed: seed,
             backends: RwLock::new(BTreeMap::new()),
             pools: Pools::new(idle_timeout),
             mirror_pools: Pools::new(idle_timeout),
@@ -659,15 +715,30 @@ impl Router {
         ((u128::from(self.random()) * n as u128) >> 64) as usize
     }
 
+    /// The `k`-th next value `random` gives (1: the next), without drawing it (test hook).
+    pub(crate) fn peek_random(&self, k: u64) -> u64 {
+        splitmix(
+            self.seed
+                .load(Ordering::Relaxed)
+                .wrapping_add(GOLDEN.wrapping_mul(k)),
+        )
+    }
+
+    /// How many values were drawn since the router was made (test hook).
+    pub(crate) fn draws(&self) -> u64 {
+        self.seed
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.first_seed)
+            .wrapping_mul(GOLDEN_INVERSE)
+    }
+
     /// A uniform 64-bit value (SplitMix64).
     pub(crate) fn random(&self) -> u64 {
-        let mut z = self
-            .seed
-            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
-            .wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        splitmix(
+            self.seed
+                .fetch_add(GOLDEN, Ordering::Relaxed)
+                .wrapping_add(GOLDEN),
+        )
     }
 
     /// The sidecar's monotonic clock, the one the retry budget is given.
@@ -699,6 +770,12 @@ impl Router {
     pub(crate) fn window_retries(&self, key: &str) -> u64 {
         let now = self.started.elapsed();
         lock(&self.services).get(key).map_or(0, |s| s.counts(now).1)
+    }
+
+    /// The requests the budget of Service `key` counts in its window.
+    pub(crate) fn window_requests(&self, key: &str) -> u64 {
+        let now = self.started.elapsed();
+        lock(&self.services).get(key).map_or(0, |s| s.counts(now).0)
     }
 
     /// The backend of a Service port.
@@ -804,6 +881,37 @@ mod tests {
         // A clock that goes back never logs early.
         assert_eq!(limiter.refused(at(500)), None);
         assert_eq!(limiter.refused(at(2000)), Some(1));
+    }
+
+    #[test]
+    fn flt_13_service_faults_follow_the_view() {
+        use mimic_core::mesh::fault::Kind;
+        use mimic_core::mesh::policy::{Fault, FaultAbort, defaults};
+        use mimic_core::mesh::route::RequestParts;
+        let abort = |status| Fault {
+            abort: Some(FaultAbort {
+                percent: 100,
+                status,
+            }),
+            delay: None,
+            r#match: None,
+        };
+        let mut policy = defaults();
+        policy.faults = vec![abort(500), abort(503)];
+        let retry = ServiceRetry::new(&policy);
+        let req = RequestParts {
+            method: "GET",
+            path: "/",
+            query: None,
+            headers: &[],
+        };
+        let decided = retry.faults().decide(&req, 0, 0).map(|d| (d.index, d.kind));
+        assert_eq!(decided, Some((0, Kind::Abort { status: 500 })));
+        retry.configure(&defaults());
+        assert!(retry.faults().is_empty());
+        assert_eq!(retry.faults().decide(&req, 0, 0), None);
+        retry.configure(&policy);
+        assert!(!retry.faults().is_empty());
     }
 
     #[test]

@@ -460,9 +460,10 @@ would see without mimic, except for the limits listed at the end of this section
   | `backend`, `upstream` | (M1) mesh-routed requests only (§7.9): `<namespace>/<name>:<port>` of the Service port and the pod `ip:port` the request went to | (M1) L4-balanced connections only (§7.9): the same two fields |
   | `attempts` | (M2) mesh-routed requests only: the number of tries (§7.9 "Retries"), 1 without a retry | (M2) L4-balanced connections only: the number of connects tried |
   | `route`, `rule` | (M3, #448) mesh-routed requests that a route rule matched (§7.9 "Routing"): the route's `<namespace>/<name>` and the index of the rule in it (0 first); absent otherwise. `backend` is then the backend Service port drawn, absent when none was (a `no-route`, `no-backend` or `invalid-backend` answer) | — |
-  | `reason` | (M4, #451) mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, …; §7.9); from M5 (#453) inbound requests the admission refused (`overloaded`, `queue-timeout`, §4.1 "Admission contract"); absent otherwise, also for a trusted refusal passed as received. A `breaker-open` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts` | — |
+  | `reason` | (M4, #451) mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, from #452 `fault-injected`, …; §7.9); from M5 (#453) inbound requests the admission refused (`overloaded`, `queue-timeout`, §4.1 "Admission contract"); absent otherwise, also for a trusted refusal passed as received. A `breaker-open` or `fault-injected` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts` | — |
   | `timeout` | (M3, #449) with `result: timeout` only: the route timeout that expired, `request` or `backendRequest` (§7.9 "Routing") | — |
   | `mirrored` | (M3, #450) `true` when at least one copy of the request was sent to a mirror of the matched rule (§7.9 "Routing", "Mirrors"; result `sent` or `error`), absent otherwise (no mirror, none drawn, every one skipped). It is read when the line is written: a copy still waiting for a body that has not ended then (HTTP/2 full duplex, the request body ending after the response) is not counted, so the field never claims a copy that was not sent | — |
+  | `fault` | (M4, #452) mesh-routed requests a fault of the backend Service's policy was injected into (§7.9 "Fault injection"): `abort` (the line has `status` the configured one and `reason: fault-injected`) or `delay` (the line is otherwise the request's own; `duration_ms` and `head_ms` include the delay; `fault_delay_ms` the delay injected); absent otherwise | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace), (M3, #449) `timeout` (a route timeout expired: `status` 504 before the response head, the pod's status after it, §7.9 "Routing") | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
@@ -575,7 +576,9 @@ Accepted limits of the proxy:
   no endpoint) and `503` `x-mimic-error: connect-failed`, `502` `x-mimic-error:
   invalid-response`, from #448 `404` `no-route` and `500` `no-backend` and `invalid-backend`,
   from #449 `504` `x-mimic-error: timeout` (a route timeout, §7.9 "Routing"), from #451 `503`
-  `x-mimic-error: breaker-open` (§7.9 "Circuit breaker"), all with `content-length: 0`. They are not recorded by discovery.
+  `x-mimic-error: breaker-open` (§7.9 "Circuit breaker"), from #452 the configured status with
+  `x-mimic-error: fault-injected` (§7.9 "Fault injection"), all with `content-length: 0` (none
+  for a `204` or `304` abort). They are not recorded by discovery.
   From M2 a mesh-routed request whose failure came before the app could process it is tried
   again on another pod (§7.9 "Retries"): an app sees no difference, a pod can see a request
   another pod refused, and an idempotent request that a pod read and then dropped without an
@@ -1275,9 +1278,16 @@ the recorder keeps the first message of each side:
   `baseEjectionTime`, `<n>s`, 1 to 300 s, default 30 s; `maxEjectionPercent`, integer 0 to
   100, default 50, `0` turns ejection off; §7.9 "Outlier detection") and `circuitBreaker`
   (`maxRequests`, integer 1 to 100000, default 1024; `maxConnections`, integer 1 to 100000,
-  default 1024; §7.9 "Circuit breaker"), each field absent taking its default alone. A field
-  that fits no target kind of the object is rejected by CEL. Faults and admission are added by
-  later milestones (#452, M5). `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
+  default 1024; §7.9 "Circuit breaker"), each field absent taking its default alone; from M4
+  (#452) `faults` (at most 16 items, default none; each item `match`, optional, one Gateway API
+  `HTTPRouteMatch`: `path` of type `Exact` or `PathPrefix` (default `PathPrefix` `/`) with a
+  value of 1 to 1024 bytes starting with `/`, `method` one of the nine of the HTTPRoute CRD,
+  `headers` and `queryParams` (at most 16 each, type `Exact`, names and values as in the
+  HTTPRoute CRD), absent matching every request; `delay` (`percent`, integer 0 to 100, required;
+  `fixed`, a Gateway API duration, 1 ms to 60 s, required); `abort` (`percent`, integer 0 to
+  100, required; `status`, integer 200 to 599, required); at least one of `delay` and `abort`;
+  §7.9 "Fault injection"). A field
+  that fits no target kind of the object is rejected by CEL. Admission is added by M5. `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
   `Invalid`) and `ResolvedRefs` (False: `RefNotPermitted`). **Precedence** (pure, `mimic-core`
   `mesh::policy`): for each target object, the valid `MimicConfig`s that target it are ordered by
   `creationTimestamp`, then by name; the first wins as a whole, the others are `Conflicted` (a config
@@ -1286,7 +1296,8 @@ the recorder keeps the first message of each side:
   `Conflicted`. Defaults without any `MimicConfig`: slow start 30 s, `mesh.enabled: true`,
   `retries: 3`, `retryBudget: {percent: 20, minPerSecond: 10, window: 10s}`, from M4
   `outlierDetection: {consecutiveFailures: 5, consecutive5xx: 0, baseEjectionTime: 30s,
-  maxEjectionPercent: 50}` and `circuitBreaker: {maxRequests: 1024, maxConnections: 1024}`.
+  maxEjectionPercent: 50}` and `circuitBreaker: {maxRequests: 1024, maxConnections: 1024}`, and
+  from #452 no faults.
 - From M5 (#453), `MimicConfig.spec.admission` sets the admission contract of a Deployment
   target; CEL rejects it on a config without a Deployment target. It has two fields, both
   required, and each applies **per pod** of the Deployment:
@@ -2672,7 +2683,7 @@ no insignificant whitespace):
 {"cluster":"local","format":1,"generations":{"mimicconfig/shop/cart@5b1c":3},"mesh":true,"mode":"none",
  "services":{"shop/cart":{"endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},
   "generations":{"endpointslice/shop/cart-x7k2p@9f3a":41},"ips":["10.96.12.7"],
-  "policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":30},
+  "policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"faults":[],"loadBalancer":{"slowStartSeconds":30},
    "outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},
    "retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},
   "ports":{"80":{"name":"http","targetPort":"http"}}}}}
@@ -2698,10 +2709,15 @@ no insignificant whitespace):
   port, without duplicates, with the `zone` when there is one; the `generations` of those
   EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none
   (from #446 the policy always holds `retries` and `retryBudget`, every field set, and from
-  #451 `outlierDetection` and `circuitBreaker`, every field set; the mesh view is in no release
+  #451 `outlierDetection` and `circuitBreaker`, every field set, and from #452 `faults`, `[]`
+  when none; the mesh view is in no release
   yet, so its `format` stays 1 and `from_json` refuses any other policy field and a missing
-  one; a later policy field, such as the `faults` of #452, is added the same way while the view
-  is unreleased, and with a new `format` after the first release that carries it).
+  one; a later policy field is added the same way while the view
+  is unreleased, and with a new `format` after the first release that carries it). A fault in
+  the view is `{"abort":{"percent":1,"status":503},"delay":{"fixedMs":500,"percent":10},
+  "match":{"method":"POST","path":{"type":"PathPrefix","value":"/checkout"}}}`, in the order of
+  the config, `abort`, `delay` and `match` absent when not set and `match` holding the
+  `MatchView` of "Routes" below (header names lower-cased, values as written).
   `mesh: false` (the winning config of `d` says so) gives a view without Services and without
   `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The `generations` of a consented Service name its winning `MimicConfig` of the destination's namespace
   (`mimicconfig/<namespace>/<name>@<uid>`): decided, kept as is, because the consent already shares that
@@ -2730,7 +2746,11 @@ no insignificant whitespace):
   header name that is not a lower-case token of 1 to 256 bytes (from #448), a refused modifier name ("Routes" below), a header or
   query value with a `CR`, `LF` or `NUL` or over 4096 bytes, a path value that does not start with
   `/` or is over 1024 bytes, a method not among the nine of the CRD, a weight over 1 000 000, a
-  mirror fraction with a denominator of 0 or a numerator over it.
+  mirror fraction with a denominator of 0 or a numerator over it. From #452 it refuses, in a
+  policy's `faults`: more than 16 items, an item with neither `abort` nor `delay`, a `percent`
+  over 100, a `status` outside 200 to 599, a `fixedMs` outside 1 to 60 000, and in `match` what
+  it refuses in a route match (more than 16 header or query items, the names, values, paths and
+  methods above).
 - **Routes** (M3, #447; design §5; Gateway API GAMMA). The controller reads every `HTTPRoute`
   (`gateway.networking.k8s.io/v1`) as `mimic-core` `mesh::input::Route` (namespace, name, UID,
   generation, creation time, parent refs, rules) and compiles it in `mimic-core` `mesh::route`
@@ -3082,7 +3102,7 @@ no insignificant whitespace):
     `x-mimic-*` field are relayed or stripped as before and never read).
     - `requestMs` bounds the **whole call**: it starts when the sidecar has the request head
       (before the route is matched) and covers every try, the connects, the pool waits, the
-      delays between tries, the fallback to the original destination and the response body up to
+      delays between tries, from #452 an injected delay ("Fault injection" below), the fallback to the original destination and the response body up to
       its last byte (trailers included).
     - `backendRequestMs` bounds **one try**: it starts when the try's request is handed to its
       connection (after the connect or the pool wait, which keep their own bounds,
@@ -3140,8 +3160,10 @@ no insignificant whitespace):
     app. The decisions are `mimic-core` `mesh::mirror` (pure: the random values, the free slots
     and the body's state are passed in):
     - **When**: only for a request the rule sends to a backend (a valid backend was drawn); a
-      `no-route`, `no-backend` or `invalid-backend` answer, a stale view, `"mesh": false`, mode
-      `mock`, an `Upgrade`, a `CONNECT` and L4 traffic mirror nothing. Each mirror is drawn on
+      `no-route`, `no-backend` or `invalid-backend` answer, from #452 an injected abort, a stale
+      view, `"mesh": false`, mode `mock`, an `Upgrade`, a `CONNECT` and L4 traffic mirror
+      nothing; a request with an injected delay is mirrored as any other (its copy starts after
+      its response head, so after the delay, and its deadline counts the delay). Each mirror is drawn on
       its own with a uniform 64-bit value `r`: it is drawn when `⌊r × denominator / 2⁶⁴⌋ <
       numerator`, so 100/100 always, 0/100 never, and `n`/`d` for a share `n / d` of the
       requests. A mirror not drawn is not counted.
@@ -3323,7 +3345,7 @@ no insignificant whitespace):
     app's stream reset with `REFUSED_STREAM`; a route timeout (#449) → `504` `x-mimic-error:
     timeout` before the response head, the response cut after it ("Routing" above).
   - **Never retried**: requests answered by the mock (mode `mock`), the `no-endpoint` answer,
-    a try whose route timeout expired (#449),
+    a try whose route timeout expired (#449), an injected abort (#452),
     an `Upgrade` or `CONNECT` once its head was written (§4.1 limit 8; its connect is retried like
     any), an L4 connection once a byte was sent, and nothing at all on the byte relay.
   - **Who sets the signal.** `x-mimic-error: overloaded|queue-timeout` with `x-mimic-endpoint`
@@ -3429,8 +3451,8 @@ no insignificant whitespace):
   - **What holds a slot**: a mesh-routed request (cleartext HTTP/1, `h2c`, intercepted TLS;
     routed or not, counted on the drawn backend's Service when routed), from the moment its
     first try is planned (after the route match, the backend draw and, from #452, the fault
-    injection: an injected abort takes no slot, an injected delay is waited before the slot is
-    taken) until its response is complete (its last body byte, trailers included) or it ends
+    decision: an injected abort takes no slot; a request with an injected delay takes its slot
+    first and waits the delay inside it, as a slow pod would hold it, "Fault injection" below) until its response is complete (its last body byte, trailers included) or it ends
     (failed, cut by a route timeout, the app gone). Its tries, reconnects, pool waits, the delay
     before a retry and the fallback to the original destination are all inside its one slot.
     Long-lived responses (SSE, gRPC streams) hold their slot for their whole life. Hold no slot:
@@ -3438,8 +3460,9 @@ no insignificant whitespace):
     answered `breaker-open`, like an L4 connection), mirror copies (their own bounds, "Mirrors" above), L4-balanced
     connections (they cannot be answered `503`; the app's own connections bound them), the
     requests the mock answers, the requests of a stale view or a view of `"mesh": false`, and
-    the sidecar's own answers that come before (`no-route`, `no-backend`, `invalid-backend`,
-    `no-endpoint`).
+    the sidecar's own answers that come before (`no-route`, `no-backend`, `invalid-backend`).
+    `no-endpoint` is found after the slot is taken and frees it at once (so a request finding
+    `maxRequests` in flight is answered `breaker-open` even on a port without endpoints).
   - **Breaker open**: a request that finds `maxRequests` requests of its Service in flight, or
     every endpoint of its port ejected, is answered by the caller's sidecar at once: `503`,
     exactly one `x-mimic-error: breaker-open`, `content-length: 0`, no `x-mimic-endpoint` (it
@@ -3462,6 +3485,87 @@ no insignificant whitespace):
     connection, inside its breaker slot and its route timeouts. A lower value closes nothing:
     connections over it close as they go idle (they are not given back to the pool). HTTP/2
     pools keep their 16 connections per pod, whatever `maxConnections`.
+  **Fault injection** (M4, #452; design §6, §9, §12; Istio's and Envoy's HTTP fault filter, on
+  the caller's side). The `faults` of a Service's policy (§7, at most 16) are injected by the
+  sidecar of **every caller** into its mesh-routed requests to that Service; the inbound side
+  injects nothing. The decision is `mimic-core` `mesh::fault` (pure: the request parts and two
+  random values are passed in; no clock):
+  - **Which policy**: the drawn backend's ("Routing" above), as for retries and the breaker: a
+    request to a Service port without routes uses the Service's own `faults`, a routed one those
+    of the backend Service it is sent to (never those of the parent Service when another backend
+    was drawn), so a Service's faults reach only requests sent to its own pods.
+  - **Order** of a mesh-routed request: mode `mock` answers first (no fault); then the route
+    match and the backend draw (`no-route`, `no-backend`, `invalid-backend` answered without a
+    fault); then the **fault decision**; an abort is answered at once; otherwise the breaker
+    slot (`breaker-open`: no mirror drawn), the mirror draws, the `no-endpoint` check (the slot
+    freed at once, drawn copies started as for any answer of the sidecar, "Mirrors" "Start"),
+    then the **delay**, then the first try. A fault is decided **once per request**: retries, reconnects and the fallback
+    to the original destination are never delayed again nor aborted.
+  - **Match**: the faults are tried in the order of the config and the **first** whose `match`
+    holds applies (no Gateway API precedence: the author orders them); a fault without `match`
+    holds for every request. A match holds as a route match does ("Routing" above, the same
+    `MatchView` and the same request seen by the match, before the request modifier: path byte
+    for byte, `PathPrefix` on segment boundaries, `method`, `Exact` headers and query
+    parameters, the first item of a name). When no fault holds, nothing is injected.
+  - **Draws**: the matched fault's `abort` and `delay` are drawn **independently**, each with a
+    uniform 64-bit value `r`, drawn when `⌊r × 100 / 2⁶⁴⌋ < percent` (100 always, 0 never). An
+    abort drawn wins: the request is aborted and not delayed (a request is counted under one
+    `kind` only), so with both set the share of delayed requests is `delay.percent × (1 −
+    abort.percent / 100)`.
+  - **Abort**: the caller's sidecar answers the configured `status`, exactly one `x-mimic-error:
+    fault-injected`, `content-length: 0` (no `content-length` and no body for `204` and `304`),
+    no `x-mimic-endpoint` (it names no pod, so no sidecar trusts it), on the app's connection or
+    stream as the `no-route` answer of #448 (HTTP/1 keep-alive kept, the request body handled the
+    same way). Nothing is sent to a pod or to the original destination: no try, no outcome for
+    outlier detection ("Outlier detection" above), no breaker slot, no deposit on or ask of the
+    retry budget, no mirror, no response modifier, never retried, never recorded by discovery
+    (`mimic_discovery_exchanges_total{result="synthetic"}`). A caller sidecar that receives a
+    `fault-injected` answer from a pod (an app forwarding its own sidecar's abort) treats it as an
+    app response: passed as received, never retried, and removed by a meshed callee's strip (§4.1).
+  - **Delay**: the request waits `fixedMs` after taking its breaker slot and before its first try
+    is planned. During the wait the sidecar holds the request head it read, the breaker slot and
+    one timer, and reads nothing of the body (HTTP/1 leaves it in the socket, HTTP/2 within the
+    stream's flow-control window), so no retry buffer is held; with the route's `requestMs` timer
+    a request has at most **two timers** at once, as in #449 (the delay timer is dropped before
+    a try timer is armed). The delay counts against the route's `requestMs` (which starts at the
+    request head), never against `backendRequestMs` (it starts with a try); a `requestMs` that
+    expires during the delay answers `504` `timeout` and starts no try (`fault: delay` and
+    `result: timeout` on its line). The app leaving during the delay ends the wait at once and
+    frees the slot and the timer, nothing reaching a pod, for an HTTP/2 stream (reset, or its
+    connection closed) and for an HTTP/1 request without a body (neither `content-length` nor
+    `transfer-encoding`, or `content-length: 0`; its connection closed or reset). An HTTP/1
+    request with a body is seen leaving only when the delay ends: the wait runs to its end, then
+    the try reads the body and the request ends as any whose app left during its try (§11.1).
+    Mesh-level counts are
+    the request's own after the delay (tries, budget, outlier outcomes, endpoint `in_flight`: a
+    delayed request is in no pod's `in_flight` while it waits). Endpoints ejected during the wait
+    are seen by the plan that follows it: when every endpoint is ejected by then, the request is
+    answered `breaker-open` after the delay, which was waited and is counted (`fault: delay` on
+    its line). On `SIGTERM` a delay in flight is
+    not shortened: the grace bounds it like any slow request.
+  - **Not faulted**: requests the mock answers (a passthrough request on a mesh-routed
+    connection, accepted in `none` or `discovery` and then switched to `mock`, is faulted like
+    any; a passthrough connection accepted while in `mock` is on the byte relay, §8, because
+    mesh routing is decided when the connection is accepted, and is not faulted; §11.1),
+    out-of-scope destinations (not in the view), a stale view
+    and `"mesh": false` (no policy applies), an `Upgrade` or a `CONNECT` request (not routed),
+    L4-balanced connections (opaque TCP, TLS passed through: there is no request to answer;
+    §11.1), inbound traffic and the copies of mirrors. Every mesh-routed request is faulted the
+    same way whatever its protocol: cleartext HTTP/1, `h2c` and intercepted TLS.
+  - **Discovery** (mode `discovery`): an abort is never recorded; a delayed exchange is recorded
+    as any other with `head_ms` minus the injected delay, so the recorded latency is the
+    destination's and a mock built from it never replays a test fault; the access line keeps
+    the latency the app saw.
+  - **Observability**: `mimic_mesh_faults_total{service,kind}` counts each injection once
+    (`service` the `<namespace>/<name>` of the Service whose policy injected it, the drawn
+    backend's; `kind` `delay` or `abort`; a delay that a route timeout cut is counted, a delay
+    drawn for a request answered `no-endpoint` or `breaker-open` before its wait is not injected
+    and not counted); an abort
+    also counts `mimic_mesh_requests_total` with `reason="fault-injected"` and the `status_class`
+    of its status, `backend` the drawn Service port. The access line has `fault` (§4.1). No
+    component log line per fault: the policy is visible in the view and `mesh view applied`.
+  - The faults of a request are those of the view it was routed with: a new view applies from
+    the next request, a delay in flight finishes with its own.
   **Configuration**: the time a failed pod is avoided (5 s) is the `avoid_failed_for` field of
   the sidecar's `MeshConfig`, not an environment variable: no `MIMIC_*` variable sets it; nor
   does the refusal delay (25 ms ± 50 %), a field of the same struct. From #446 `retries` and the
@@ -3472,7 +3576,10 @@ no insignificant whitespace):
   From #451 outlier detection and the breaker come from the view's policy only; the 300 s cap
   of an ejection, the 300 s that end a streak and the 1 s sweep are constants, and no
   `MIMIC_*` variable sets any of them; the fixed 1024 HTTP/1 connections per pool are
-  replaced by the policy's `maxConnections`.
+  replaced by the policy's `maxConnections`. From #452 faults come from the view's policy only;
+  the 60 s cap of a delay is the CRD's and `from_json`'s bound, and no `MIMIC_*` variable sets
+  or disables fault injection (a caller turns it off for itself only with
+  `MimicConfig.spec.mesh.enabled: false`, which turns its whole mesh off).
   **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
   `<namespace>/<name>` and `<namespace>/<name>:<port>`; `service` is the Service the app called
   and `backend` the Service port the request went to: from #448 the drawn backend of a routed
@@ -3481,7 +3588,8 @@ no insignificant whitespace):
   when the Service port has no route or none matched; `reason` is `none`, the `x-mimic-error` of
   an answer of the sidecar (from #448 also `no-route`, `no-backend`, `invalid-backend`, from
   #449 `timeout` for the `504` of a route timeout, from #451 `breaker-open`, with `backend` the
-  Service port the request would have gone to), or (M2) that of a trusted refusal passed to
+  Service port the request would have gone to, from #452 `fault-injected`, with `backend` the
+  drawn Service port), or (M2) that of a trusted refusal passed to
   the app; a route timeout after the response head leaves the request counted with the pod's
   `status_class` and its `reason` at the head, `none`, and shows in the access line, `result:
   timeout`):
@@ -3504,6 +3612,7 @@ no insignificant whitespace):
   | `mimic_mesh_retry_budget_exhausted_total` | counter (M2, #446), failures that `classify` and the planner would have retried but the retry budget refused, one per request or L4 connection at most; a series is created by its first refusal | `backend` |
   | `mimic_mesh_mirrored_total` | counter (M3, #450), one per drawn mirror of a routed request ("Routing", "Mirrors"); a series is created by its first count | `backend` (the mirror Service port), `result` (`sent`, `error`, `skipped_body`, `skipped_limit`) |
   | `mimic_mesh_ejections_total` | counter (M4, #451), one per ejection ("Outlier detection"); a series is created by its first count | `backend`, `reason` (`consecutive_failures`, `consecutive_5xx`) |
+  | `mimic_mesh_faults_total` | counter (M4, #452), one per injected fault ("Fault injection"); a series is created by its first count | `service` (the Service whose policy injected it, `<namespace>/<name>`), `kind` (`delay`, `abort`) |
   | `mimic_mesh_ejected_endpoints` | gauge (M4, #451), endpoints of the Service port ejected now, updated by the 1 s sweep and at each ejection; 0 for every Service port of the view | `backend` |
 
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
@@ -3513,7 +3622,8 @@ no insignificant whitespace):
   left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`,
   `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`, and from M2
   `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, and
-  from #446 `mimic_mesh_retry_budget_exhausted_total`, from #450 `mimic_mesh_mirrored_total`, from #451 `mimic_mesh_ejections_total` and `mimic_mesh_ejected_endpoints`). From #448 at most 256 distinct routes
+  from #446 `mimic_mesh_retry_budget_exhausted_total`, from #450 `mimic_mesh_mirrored_total`, from #451 `mimic_mesh_ejections_total` and `mimic_mesh_ejected_endpoints`; from #452 the
+  series of a Service that left the view in `mimic_mesh_faults_total`). From #448 at most 256 distinct routes
   have a `route` label of their own, in the order the sidecar first counts them, the next ones
   are `other`; the series of a route that left the view are removed 5 minutes after it left, as
   above, and its slot is free again. A route adds at most one `backend` value per distinct
@@ -3778,6 +3888,24 @@ random numbers it hands to the draw.
   | `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`, `mimic_mesh_endpoint_in_flight` | (M1, #443, sidecar) mesh-routed requests, in total, their duration, and per pod; labels, bounds and eviction in §7.9 "Load balancing" | `service`, `route`, `backend`, `endpoint`, `status_class`, `reason` |
   | `mimic_mesh_mirrored_total` | (M3, #450, sidecar) copies of routed requests for the rule's mirrors, by outcome; §7.9 "Routing" "Mirrors" and "Metrics" | `backend`, `result` |
   | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total`, `mimic_mesh_retry_budget_exhausted_total` | (M2, #445, #518 and #446, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses, connections closed on an unframeable response, retries refused by the budget; §7.9 "Retries" and "Metrics" (from #449 `result="timeout"` and, in `mimic_mesh_requests_total`, `reason="timeout"`: route timeouts, §7.9 "Routing") | `backend`, `result`, `reason` |
+  | `mimic_mesh_faults_total` | (M4, #452, sidecar) faults injected into the calls to a Service by its policy; §7.9 "Fault injection" and "Metrics" | `service`, `kind` |
+
+  **`x-mimic-error` reasons** of the answers the sidecars generate (§4.1, §7.9; the same value is
+  the access line's `reason` and the `reason` label of `mimic_mesh_requests_total`). None is ever
+  recorded by discovery; only the two trusted refusals, bound to the pod of the try, are retried:
+
+  | Reason | Status | Who answers | Retried by the caller's sidecar |
+  |---|---|---|---|
+  | `overloaded`, `queue-timeout` | 503 | callee's inbound sidecar, admission (M5) | yes, another pod (trusted refusal) |
+  | `connect-failed` | 503 | caller's sidecar, every try failed to connect; callee's inbound sidecar with `x-mimic-origin`, its app refused the connection (#518) | already retried; the callee's: yes (trusted app refusal) |
+  | `no-endpoint` | 503 | caller's sidecar, the Service port has no endpoint | no |
+  | `no-route`, `no-backend`, `invalid-backend` | 404, 500, 500 | caller's sidecar, route rules (#448) | no |
+  | `timeout` | 504 | caller's sidecar, route timeout (#449) | no |
+  | `breaker-open` | 503 | caller's sidecar, `maxRequests` or every endpoint ejected (#451) | no |
+  | `fault-injected` | `faults[].abort.status` | caller's sidecar, injected abort (#452) | no |
+  | `invalid-response` | 502 | caller's sidecar, a response head `hyper` rejects | no |
+  | `invalid-request` | 400 | caller's sidecar, a request head `hyper` rejects (§4.1) | no |
+  | `unsupported` | 501 | sidecar, an `Upgrade` or `CONNECT` it cannot relay (§4.1 limit 8) | no |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -5061,6 +5189,44 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   size `maxRequests` for them. An author of a `MimicConfig` of the Service sets it for every
   caller (`maxRequests: 1` throttles all of them), as for every destination policy (RBAC of
   `mimicconfigs` in the Service's namespace). L4-balanced connections are not bounded by it.
+- (M4, #452) **A Service's faults degrade every caller, by design.** Whoever may write
+  `mimicconfigs` in the Service's namespace (and, for a consented destination, in the
+  destination's namespace, which gave the `ReferenceGrant`) makes every injected caller's
+  sidecar abort or delay its calls to that Service; `targetRefs` cannot leave the namespace, so
+  no one injects faults into another namespace's Services. The harm is bounded: an abort never
+  reaches a pod and costs the caller nothing but the answer; a delay lasts at most 60 s and
+  holds, per delayed request, the request head already read, one breaker slot, one timer and the
+  app's connection or stream (no body bytes); the number held at once per caller pod is bounded
+  by that Service's `maxRequests` (set by the same owner, at most 100 000) and by the app's own
+  connections and streams (`MIMIC_MAX_CONNECTIONS`). A caller cannot opt out of one Service's
+  faults; it can only turn its whole mesh off (`MimicConfig.spec.mesh.enabled: false`).
+- (M4, #452) **An HTTP/1 app leaving a delayed request with a body is seen when the delay
+  ends.** While a delay waits, nothing reads the request body (no body byte is held, FLT-16),
+  and `hyper` watches an HTTP/1 connection for its close only once the request body is read: a
+  closed or reset connection of a request with a body (`content-length` over 0 or
+  `transfer-encoding`) keeps its breaker slot and its timer until the delay ends; then the try
+  reads the body and the request ends as any whose app left during its try (a body sent whole
+  may still reach the pod, whose answer has nowhere to go). HTTP/2 streams and HTTP/1 requests
+  without a body are released at once (FLT-16). Seeing it sooner means reading the body into
+  the retry buffer during the wait. The cost is bounded by `fixedMs` (at most 60 s), the
+  Service's `maxRequests` and the grace.
+- (M4, #452) **Faults reach injected callers only, at the shares drawn by each.** Callers without
+  a sidecar, with the mesh off, in mode `mock` (mocked calls), on a stale view, and
+  L4-balanced connections (opaque TCP, TLS passed through: no request to answer) and `Upgrade`
+  or `CONNECT` requests are never faulted, and neither is inbound traffic: a resilience test
+  runs from injected callers over HTTP. Each sidecar draws on its own, so `percent` is a share
+  in expectation (10 % of 10 000 requests is 1000 ± about 60 at 2σ), not an exact count per
+  window. An abort may carry any status from 200 to 599: a `200` `fault-injected` with an empty
+  body is a success to an app that ignores the header; the author chose it.
+- (M4, #452) **A passthrough connection accepted in mode `mock` is never faulted.** Mesh routing
+  is decided when a connection is accepted (§8): a connection to a `spec.mock.passthrough`
+  destination accepted while the mode is `mock` takes the byte relay to the original
+  destination (the ClusterIP), so no route, retry, breaker or fault applies to it, even when the
+  destination is in the view. Only a passthrough connection accepted in `none` or `discovery`
+  and still open after the switch to `mock` stays mesh-routed (MSH-62), and its requests are
+  faulted (FLT-23). A fault test of a passthrough destination runs in `discovery`. Mesh-routing
+  passthrough connections accepted in `mock` changes the routing of every mesh feature, not
+  only faults: follow-up #549.
 - (M5, #453) **The contract is per pod and does not tell callers apart.** Each sidecar admits
   from what it sees itself. The workload's capacity is `replicas × contract`, and nothing is
   shared between pods. One caller, or one attacker that can reach the pod IP, can take every
@@ -5129,6 +5295,7 @@ names contain the criterion ID (`fnd_02_…`).
 | M1 | `MimicConfig` CRD and the pure mesh view (#440, design `docs/design/mimic-mesh.md` §4.2, §6, §16) | (added 2026-11-12) |
 | M2 | Retries of proxy-level failures on another pod (#445, design `docs/design/mimic-mesh.md` §7); the retry budget is #446 | (added 2026-11-14) |
 | M3 | Gateway API prerequisite and HTTPRoute (GAMMA) ingestion in the controller (#447, design `docs/design/mimic-mesh.md` §4.2, §5); route matching, header modifiers and weighted backends in the sidecar (#448); timeouts #449, mirrors #450 | (added 2026-11-14) |
+| M4 | Outlier detection and circuit breaker (#451), fault injection (#452) (design `docs/design/mimic-mesh.md` §3.2, §6, §9) | (added 2026-11-15) |
 | M5 | Admission contract in the inbound sidecar, concurrency and rps (#453, design `docs/design/mimic-mesh.md` §9); signalling and dashboards #454, autoscaling #455 | (added 2026-11-18) |
 
 ### 12.1 F0 — Foundations
@@ -6261,6 +6428,69 @@ criterion says so and `baseEjectionSeconds` is set in the view (1 s at least).
 | CBR-35 | **D** (documentation review). `docs/wiki/Mesh.md` has "Outlier detection and circuit breaker": the fields and defaults, what counts as a failure and what is neutral, `consecutive5xx` off by default and why, the rounding of `maxEjectionPercent` (one endpoint is never ejected at 50 %), the doubling and the 300 s cap, avoidance and ejection together, the breaker per caller pod, held streams, mirrors and L4 outside it; `Troubleshooting.md` `breaker-open` with its two causes and the WARN `cause`; `Monitoring.md` the two metrics; `Access-logs.md` `reason`. |
 | CBR-36 | **D** (security review). An app or a peer forging failures ejects only its own pod (CBR-18, CBR-19); admission refusals and timeouts cannot be used to eject (CBR-17); the state is per caller pod and bounded by the view (CBR-12, CBR-21, CBR-24); `breaker-open` names no pod and is never trusted (CBR-28); labels and lines carry no request data (CBR-24); the §11.1 limits of #451 are written; `mimic-core` `mesh::outlier` has no clock, I/O or random source. |
 
+### 12.28 M4 — Fault injection (#452)
+
+Design: `docs/design/mimic-mesh.md` §6, §9, §10, §12, §15. Spec text: §4.1 (the mesh's answers,
+access line `fault`, `fault_delay_ms` and `reason`), §7 (`MimicConfig` `faults`), §7.9 (view
+`policy.faults` and `View::from_json`, "Routing" "Timeouts" and "Mirrors", "Retries" "Never
+retried", "Circuit breaker" "What holds a slot", "Fault injection", "Configuration", "Metrics"),
+§9 (metric and the `x-mimic-error` reasons table), §11.1 (M4 #452). Levels as in §12.2, plus
+**F** (fuzz), **B** (criterion micro-benchmark) and **D** (review). FLT-01 to FLT-39 are #452
+(FLT-33 to FLT-39 reserved). Decisions recorded on #452: a fault is decided once per request,
+after the route match and the backend draw and with the **drawn backend's** policy, before the
+mirror draws, the `no-endpoint` check and the breaker; `match` is one `HTTPRouteMatch` (path,
+method, headers and query parameters, the route matcher of #448), absent matching everything,
+the first fault that holds wins in the config's order; `abort` and `delay` are drawn
+independently from two random values passed in and an abort drawn wins (no delayed abort); an
+abort takes no breaker slot, no try, no budget, no mirror and is never retried nor recorded; a
+delay is waited **inside** the breaker slot, before the first try, counts against `request` and
+never against `backendRequest`, holds no body byte, and is subtracted from the latency that
+discovery records; mirror copies, L4 connections, `Upgrade`, `CONNECT`, mocked calls, stale
+views and inbound traffic are never faulted (a passthrough request on a mesh-routed connection
+switched to mode `mock` is; a passthrough connection accepted in `mock` takes the byte relay and
+is not, §11.1, follow-up #549);
+`mimic_mesh_faults_total{service,kind}` labels the Service whose policy injected the fault.
+Out of scope: inbound faults, bandwidth, reset and gRPC-status faults, a percentage finer than 1 %,
+a delay drawn from a distribution, `MIMIC_*` switches (v2). In the **I** tests the sidecar runs in
+process as in §12.27, fed views by a fake controller; pods are in-process servers that record the
+time and bytes of what they receive and can be **silent**, **slow**, **refusing** or answer a set
+status. Upper time bounds take at least 150 ms of margin over the expected time and stay
+below the time the wrong behaviour would give, as RTE-63 to RTE-66 (181ad61).
+
+| ID | Criterion |
+|---|---|
+| FLT-01 | **U** (`mimic-core` `mesh::policy`). Without any `MimicConfig` a Service's policy has `faults` `[]`; the winning config's `faults` are taken whole, in order (16 items included), also for a consented Service of another namespace (its own namespace's config, as MSH-07). `validate` gives `Invalid`, the message naming the field and the item index, for 17 items, an item with neither `delay` nor `abort`, `percent` 101 in either, `status` 199 and 600, a `fixed` of 0 ms and of 60 001 ms, a `match` with a `RegularExpression` path, header or query item, more than 16 header or query items, a path not starting with `/` or over 1024 bytes, an unknown method, and `faults` in a config without a Service target; `percent` 0 and 100, `status` 200 and 599, `fixed` 1 ms and 60 s are valid. |
+| FLT-02 | **U** (`mesh::view`). The view's `policy` holds `faults` (`[]` for the defaults, the JSON of §7.9), each item with sorted keys and its absent members left out, `fixed` as `fixedMs`, header names lower-cased; a change of any member of any item (and of the order of two items) gives a new ETag; `View::from_json` reads back what `build` wrote and refuses a missing `faults`, an unknown field at any level of an item, and every value FLT-01 refuses; MSH-12, RTY-45, RTE-12 and CBR-02 still hold with `faults` in their fixtures. |
+| FLT-03 | **U** (next to the controller's adapters, as CBR-03). A `MimicConfig` object converts `faults` (`fixed: 500ms` → 500, `1s` → 1000, `1m` → 60 000, with the Gateway API duration parser of #449; absent `match`, `delay` or `abort` → `None`); a `fixed` that does not parse (`500`, `-1s`, `1.5s`) or is over 60 s makes the config `Invalid`, not a panic. |
+| FLT-04 | **E** (chart, `scripts/check-chart.sh`, as CBR-04). The rendered CRD has `faults` (array, at most 16 items) with `match` (`path.type` `Exact` or `PathPrefix`, `path.value`, `method` enum of nine, `headers` and `queryParams` at most 16 each, type `Exact`), `delay.percent` and `abort.percent` (integer, 0 to 100, required), `delay.fixed` (string, required), `abort.status` (integer, 200 to 599, required), and the CEL rules: at least one of `delay` and `abort` per item, `fixed` a duration of 1 ms to 60 s, `faults` on a Service target only. |
+| FLT-05 | **E** (kind, `scripts/e2e.sh` section `msh_17`, its objects only). The API server accepts a config with 16 faults, one with only `abort` and one with only `delay`, `fixed` `1ms` and `60s`, `status` 200 and 599; it refuses 17 faults, an item with neither, `percent` 101, `status` 600, `fixed` `0s`, `61s` and `500`, a `RegularExpression` path, and `faults` in a config whose only target is a Deployment, each with the CEL message or schema error naming the field. |
+| FLT-06 | **F** (fuzz target `mesh`). The seed corpus holds a view with 16 faults whose matches use every kind of item; MSH-13 holds (`View::from_json` never panics, an accepted document holds the bounds and reads back equal). |
+| FLT-07 | **U** (`mimic-core` `mesh::fault`, match). Over the request parts of RTE-41 and RTE-42 (path byte for byte, `PathPrefix` on segment boundaries, `Exact`, method, headers in any case joined with `,`, query pairs decoded and the first of a name compared): a fault's `match` holds exactly when the same `MatchView` holds as a route match; a fault without `match` holds for every request (`*` and an empty path included); the faults are tried in their order and the first that holds is the one decided (`[PathPrefix /, Exact /checkout]` never decides the second; `[Exact /checkout, PathPrefix /]` decides the first for `/checkout` and the second for `/cart`), whatever the Gateway API precedence would say; no fault holding decides nothing. |
+| FLT-08 | **U** (draws). With `r` the abort value and `s` the delay value: `percent` 0 is never drawn (`r` = 0), 100 always (`r` = `u64::MAX`); with 10 the largest `r` drawn is `⌈10 × 2⁶⁴ / 100⌉ − 1` and the next is not; the abort decision reads only `r` and the delay decision only `s`; an abort drawn with a delay drawn decides `Abort` (status, item index) and no delay; a delay alone decides `Delay` (`fixedMs`, item index); the same inputs give the same decision (no hidden clock or random source). |
+| FLT-09 | **U** (`proptest` and distribution). Over any `faults` within the bounds and any request parts and values, the decision never panics, names an item that holds and is the first that holds; over the 100 000 pairs of a fixed-seed generator, `abort` 10 and `delay` 20 decide 10 % ± 0.5 % aborts and 18 % ± 0.5 % delays (`20 × (1 − 0.1)`). |
+| FLT-10 | **B** (criterion, results in `docs/bench/`). The decision over 16 faults of 16 header items each, none holding, takes at most 2 µs, and over `faults: []` at most 50 ns. |
+| FLT-11 | **I** (abort, HTTP/1 keep-alive, `h2c` and intercepted TLS). A fault `{match: {path: {type: PathPrefix, value: /checkout}, method: POST}, abort: {percent: 100, status: 503}}`: a `POST /checkout/1` is answered `503`, exactly one `x-mimic-error: fault-injected`, `content-length: 0`, no `x-mimic-endpoint`, the median time from the request head read to the answer written at most 1 ms; no pod and no ClusterIP receives anything; the HTTP/1 connection carries the next request (a `GET /cart` reaching a pod) and the other `h2c` streams go on; a `POST /checkout` with a 1 MiB body is answered the same way, its connection handled as for `no-route` (RTE-49). `status` 200, 418 and 599 are answered as configured; `204` and `304` carry neither `content-length` nor a body; a `HEAD` is answered without a body. |
+| FLT-12 | **I** (abort share). `abort` 10 % over 10 000 sequential requests: 1000 ± 200 are answered `fault-injected`, the pods receive exactly the others, and `mimic_mesh_faults_total{service="shop/cart",kind="abort"}` equals the number answered; `percent` 0 aborts none and creates no series. |
+| FLT-13 | **I** (accounting of an abort). With `abort` 100 % and `status` 500 or 503: no try (`mimic_mesh_attempts_total` unchanged), nothing to the budget's `window_requests` or `window_retries`, no retry, no pod ejected with `consecutive5xx: 1` after 100 aborts, no response modifier field; with `maxRequests: 1` and a silent request holding the slot, a matching request is still answered `fault-injected`, never `breaker-open`; a rule with a 100/100 mirror sends no copy (`mimic_mesh_mirrored_total` absent, the mirror pod receives nothing); `mimic_mesh_requests_total{reason="fault-injected",status_class="5xx"}` with `backend` the Service port and `route`/`rule` when matched; `mimic_discovery_exchanges_total{result="synthetic"}` + 1 and, in mode `discovery`, the pushed report holds no exchange for the aborted path. |
+| FLT-14 | **I** (access lines). An aborted request's line has `fault: abort`, `reason: fault-injected`, `status` the configured one, `backend`, `route` and `rule` when a rule matched, no `upstream` and no `attempts`; a delayed request's line has `fault: delay`, `fault_delay_ms` the delay, `upstream`, `attempts`, and a `duration_ms` and `head_ms` that include the delay; a request no fault matched, or matched but not drawn, has neither field. |
+| FLT-15 | **I** (delay measured, HTTP/1 and `h2c`). `delay` 100 % `fixed: 200ms` over a pod answering at once: of 50 sequential HTTP/1 keep-alive requests, and of 20 streams on one `h2c` connection, each reaches the pod at least 200 ms after the client wrote its head, the client's median latency is within 200 ms and 350 ms (two delays would give at least 400 ms), and `mimic_mesh_faults_total{service="shop/cart",kind="delay"}` counts each request once; `delay` 10 % over 2000 requests (20 concurrent keep-alive clients) delays 200 ± 40 (a latency of at least 200 ms, as many as counted), and each of the others is answered in under 150 ms with a median under 50 ms; with `abort` 50 % and `delay` 100 % over 400 requests, 200 ± 20 are aborted, each in under 150 ms with a median of at most 10 ms, every other one is answered `200` after at least 200 ms, and `kind="abort"` and `kind="delay"` count exactly those. |
+| FLT-16 | **I** (what a delay holds). During a `fixed: 1s` delay of a `POST` whose client sent a 32 KiB body, on a rule with `requestMs` and no mirror: the pod has received nothing, `mimic_mesh_retry_buffer_bytes` and the pod's `mimic_mesh_endpoint_in_flight` are 0, the armed timers (test hook) are exactly 2 (the route's and the delay's, no try timer); after the delay the pod receives the head and the whole body byte for byte. With `maxRequests: 2`, two concurrent delayed `GET`s hold both slots and a third is answered `breaker-open` in under 150 ms (no `fault` on its line, no delay counted); an app that leaves during the delay, an HTTP/1 `GET` whose connection closes and an `h2c` stream reset, frees its slot and its timer within 250 ms (a new request is admitted and answered `200` after its own delay), and nothing reaches the pod (an HTTP/1 request with a body is seen leaving only when the delay ends, §11.1). A Service port with no endpoint answers `no-endpoint` in under 150 ms, without the delay and without counting it. |
+| FLT-17 | **I** (timeouts). A rule with `request: 100ms` and a fault `delay` 100 % `fixed: 500ms`: answered `504` `timeout` 100 to 250 ms after the request (the un-cut answer comes after 500 ms), access `result: timeout`, `timeout: request`, `fault: delay`, `fault_delay_ms: 500`, no `upstream` and no `attempts`; no try (`mimic_mesh_attempts_total` absent), nothing in the budget's `window_requests`, the pod receives nothing (checked 600 ms after the request), the delay counted; `backendRequest: 100ms` with the same delay and a pod answering in 10 ms gives `200` after at least 500 ms (the delay does not count against it); `request: 700ms` with the delay and a pod answering in 300 ms gives `504` after at least 700 ms, the pod having received the request (the delay and the try add up). |
+| FLT-18 | **I** (retries). `delay` 100 % `fixed: 200ms` on a Service of one refusing and two healthy pods: a request whose first try failed to connect is answered `200` with `attempts` 2 in under 350 ms (one delay per try would give at least 400 ms); with three refusing pods and the ClusterIP answering, a request whose tries all fail is answered by the ClusterIP with `attempts` 4 in under 350 ms (delayed once, `mimic_mesh_fallbacks_total` + 1); each delayed request is counted once in `mimic_mesh_faults_total{kind="delay"}` and once in the budget's `window_requests`. |
+| FLT-19 | **I** (mirrors). A rule with a 100/100 mirror and `delay` 100 % `fixed: 200ms` on its backend: the mirror pod receives each copy after the primary pod received its request, the primary's line has `mirrored: true`; with `mirror_timeout` 500 ms and `fixed: 1s` every copy is `error` and the primaries are answered `200`; a mirror Service with `abort` 100 % in its own policy still receives every copy (copies are never faulted). |
+| FLT-20 | **I** (outlier detection). With `consecutiveFailures: 1` and `consecutive5xx: 1`: 100 requests aborted with `500` or `503` and 100 delayed requests to healthy pods eject nothing (`mimic_mesh_ejections_total` absent); a delayed request whose try is reset counts that one failure as without a fault (CBR-08). |
+| FLT-21 | **I** (which policy). A route of `shop/cart` sending 100 % to `shop/cart-v1`: `abort` 100 % on `cart` aborts nothing, on `cart-v1` aborts every request with `mimic_mesh_faults_total{service="shop/cart-v1"}`; a rule 50/50 to `cart-v1` (abort 100 %) and `cart-v2` (no faults) aborts 50 % ± 5 % of 2000 requests, all of them drawn to `cart-v1`; a request answered `no-route`, `no-backend` or `invalid-backend` on a port whose Service has `abort` 100 % carries that answer, not a fault. |
+| FLT-22 | **I** (match through the sidecar). Faults `[{match: POST PathPrefix /checkout, abort 100 %}, {match: {headers: [{name: x-chaos, value: "on"}]}, delay 100 % 50ms}, {delay 100 % 10ms}]`: `POST /checkout` is aborted (also with `x-chaos: on`), `GET /checkout` with `X-Chaos: on` is delayed 50 ms, `GET /cart` 10 ms; a query match `?v=2` behaves as in RTE-42; the request modifier of the rule (`set x-chaos: on`) changes no decision (the match sees the request as the app sent it). |
+| FLT-23 | **I** (not faulted). With `abort` 100 % on every Service of the view: in mode `mock` the mocked calls are answered by the mock (MCK criteria unchanged) and `mimic_mesh_faults_total` stays absent; on a connection to a `spec.mock.passthrough` destination of the view accepted in `discovery`, the requests before and after the switch to `mock` are aborted (not mocked), while a new connection to it accepted in `mock` reaches the ClusterIP on the byte relay and leaves the count unchanged; a destination outside the view, a stale view, a view of `"mesh": false`, an `Upgrade`, a `CONNECT` and an L4-balanced connection (opaque TCP and TLS passed through) reach their destination; inbound requests to the faulted Service's own pods are not aborted by their inbound sidecar. |
+| FLT-24 | **I** (forwarded aborts). A pod whose app answers `503` with `x-mimic-error: fault-injected` (as an app forwarding its own sidecar's abort): the caller's sidecar passes it as received, never retries it, counts no fault and no `reason`, and a meshed inbound sidecar strips the field before it leaves the pod (§4.1, MSH strip criteria). |
+| FLT-25 | **I** (discovery). In mode `discovery`, `delay` 100 % `fixed: 300ms` over a pod answering in 10 ms: the recorded exchanges' latency histogram holds them under 100 ms while their access lines have a `head_ms` of at least 300; aborts are not recorded (FLT-13). |
+| FLT-26 | **I** (view changes and labels). A view adding faults applies from the next request; a delay in flight when a view removes its fault finishes its delay; with faults on 300 Services and one injection each, `mimic_mesh_faults_total` has one series per Service and `kind`, both `kind` values only, created by their first count; the series of a Service that left the view are gone 5 minutes after (the scrape before still has them); no label or line of #452 carries a path, a header or query value or a body byte of a request (a canary in each is in none). |
+| FLT-27 | **E** (kind, `scripts/e2e.sh` section `flt_27`, own namespace, cleaned by a trap, Python test services). A Service of 2 injected pods that count the requests they receive, and an injected caller: a `MimicConfig` on the Service with `abort` 100 % `status: 503` on `PathPrefix /fail`: from the caller sidecar's first `mesh view applied` line after the config was created, every `/fail` request is answered `503` `fault-injected` and the pods count none of them, other paths are `200`; a second config change to `delay` 100 % `fixed: 500ms` makes every request take at least 500 ms from the next view; once the config is deleted and the view updated, requests are `200` and fast; the caller sidecar's `/metrics` shows `mimic_mesh_faults_total` for both kinds. |
+| FLT-28 | **E** (same section, security). A `MimicConfig` with the same faults created in another namespace and naming a Service `cart` that does not exist there is `Accepted: False` `TargetNotFound`, and the caller's calls to the Service are unchanged (`200`, no `fault` line); a `targetRefs` item with a `namespace` key is refused by the API server (MSH-17). |
+| FLT-29 | **D** (documentation review). `docs/wiki/Mesh.md` has "Fault injection": the fields and bounds, first match wins, the two independent draws and abort over delay, what an abort does and does not do (no pod, no retry, no breaker slot, no mirror, not recorded), the delay inside the breaker slot and against `request`, what is never faulted, and a resilience-test recipe (abort 10 % `503` then delay 100 % 2 s on a caller with a route `request` timeout, what to watch: the caller's errors, `mimic_mesh_faults_total`, the access `fault` field, and how to remove it); `Troubleshooting.md` `fault-injected`; `Monitoring.md` the metric; `Access-logs.md` `fault` and `fault_delay_ms`. |
+| FLT-30 | **D** (security review). Only the Service's namespace (or a consenting destination namespace) can inject faults on it (FLT-01, FLT-28, MSH-17); an abort never reaches a pod and is never trusted (FLT-11, FLT-24); faults cannot eject a pod (FLT-20); what a delay holds is bounded (FLT-16, §11.1); labels and lines carry no request data (FLT-26); the §11.1 limits of #452 are written; `mimic-core` `mesh::fault` has no clock, I/O or random source. |
+| FLT-31 | **I** (h2 framing of an abort). An `h2c` abort of a stream whose request body is still being sent is answered with its `HEADERS` (`END_STREAM`) and the request side reset with `NO_ERROR`, as RTE-63 does for a `504`, the connection's other streams unaffected; an HTTP/1 abort of a request whose body is not read to its end carries `connection: close` and the connection closes after the answer. |
+| FLT-32 | **I** (`SIGTERM`). A delay in flight at `SIGTERM` is not shortened: its request is answered once the delay ends within the grace, and a delay longer than the grace is cut at its end like any request in flight (PRX-13 unchanged). |
 ### 12.29 M5 — Admission contract in the inbound sidecar (#453)
 
 Design: `docs/design/mimic-mesh.md` §8, §9, §12, §13, §14 (M5 row) and §15. The spec text is in

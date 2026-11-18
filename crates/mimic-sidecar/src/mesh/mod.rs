@@ -739,6 +739,25 @@ impl MeshState {
         self.0.router.window_retries(key)
     }
 
+    /// Test hook (#452): the requests counted in the budget window of Service `key`.
+    #[doc(hidden)]
+    pub fn window_requests_for_test(&self, key: &str) -> u64 {
+        self.0.router.window_requests(key)
+    }
+
+    /// Test hook (#452): the `k`-th next value of the sidecar's random source (1: the next),
+    /// without drawing it.
+    #[doc(hidden)]
+    pub fn peek_random_for_test(&self, k: u64) -> u64 {
+        self.0.router.peek_random(k)
+    }
+
+    /// Test hook (#452): how many values the sidecar's random source gave so far.
+    #[doc(hidden)]
+    pub fn draws_for_test(&self) -> u64 {
+        self.0.router.draws()
+    }
+
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
     pub(crate) fn off(&self) -> bool {
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);

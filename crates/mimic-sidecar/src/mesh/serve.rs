@@ -22,6 +22,7 @@ use hyper::http::request::Parts;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use mimic_core::mesh::fault;
 use mimic_core::mesh::head::{Stop, leaves};
 use mimic_core::mesh::mirror::{self, Candidate};
 use mimic_core::mesh::outlier::Outcome as Counted;
@@ -54,6 +55,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The answer to a head the reader refuses (spec §4.1 limit 1).
 const REFUSED: &[u8] = b"HTTP/1.1 400 Bad Request\r\nx-mimic-error: invalid-request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+/// The `x-mimic-error` of an abort (spec §7.9 "Fault injection").
+const FAULT_INJECTED: &str = "fault-injected";
 /// How long the sidecar reads and discards what the client still sends after a refusal, so
 /// that closing the socket does not reset the connection before the client read the answer.
 const REFUSAL_LINGER: Duration = Duration::from_millis(250);
@@ -770,6 +773,11 @@ impl Serving {
         let direct = self.mesh.stale() || self.mesh.off();
         // The routes of the port now (spec §7.9 "Routing"): none for a stale view.
         let routed = if direct { None } else { self.backend.routed() };
+        // The request as the app sent it, for the route match and the fault decision: made once,
+        // and dropped before the request modifier changes its fields.
+        let fields = (!direct && (routed.is_some() || self.backend.retry.has_faults()))
+            .then(|| field_list(&head));
+        let parts = fields.as_deref().map(|fields| request_parts(&head, fields));
         let mut route = "none";
         let mut drawn = self.backend.clone();
         // Where the fallback goes: the ClusterIP of the drawn backend (none when it is headless),
@@ -782,8 +790,12 @@ impl Serving {
         let mut gate = None;
         // The breaker's slot, held from the first try to the response's end (spec §7.9).
         let mut permit: Option<Permit> = None;
-        if let Some(routed) = &routed {
-            match self.select(routed, &head) {
+        // The delay drawn, waited once the slot is taken (spec §7.9 "Fault injection").
+        let mut delay_ms = None;
+        // An abort closes an HTTP/1 connection whose request body is not read whole.
+        let close = || http1 && !source.complete();
+        if let (Some(routed), Some(parts)) = (&routed, &parts) {
+            match self.select(routed, parts) {
                 Selected::Rule {
                     view,
                     rule,
@@ -791,6 +803,20 @@ impl Serving {
                 } => {
                     route = &view.name;
                     tracker.matched(route, rule);
+                    // An abort comes before the breaker's slot (spec §7.9 "Order").
+                    match self.fault_decision(&backend, parts) {
+                        Ok(ms) => delay_ms = ms,
+                        Err(status) => {
+                            return Ok(self.aborted(
+                                tracker,
+                                route,
+                                &backend,
+                                status,
+                                close(),
+                                began,
+                            ));
+                        }
+                    }
                     match backend.admit(router) {
                         Ok(taken) => permit = Some(taken),
                         Err(()) => {
@@ -838,23 +864,52 @@ impl Serving {
                 }
             }
         } else if !direct {
+            let decided = parts
+                .as_ref()
+                .map_or(Ok(None), |parts| self.fault_decision(&drawn, parts));
+            match decided {
+                Ok(ms) => delay_ms = ms,
+                Err(status) => {
+                    return Ok(self.aborted(tracker, route, &drawn, status, close(), began));
+                }
+            }
             match drawn.admit(router) {
                 Ok(taken) => permit = Some(taken),
                 Err(()) => return Ok(self.open(tracker, route, &drawn, began)),
             }
         }
         let backend = &drawn.label;
+        let bounds = Bounds {
+            timeouts,
+            began,
+            timers: &router.timers,
+        };
+        // The delay holds the slot, before the first try is planned: once per request, whatever
+        // its tries (spec §7.9 "Fault injection").
+        if let Some(ms) = delay_ms {
+            if !drawn.has_endpoints() {
+                return Ok(self.no_endpoint(tracker, route, backend, began));
+            }
+            router.metrics.fault(backend, "delay");
+            tracker.backend(backend);
+            tracker.fault(fault::Kind::Delay { ms });
+            if let Err(kind) = self.delay(ms, bounds).await {
+                let upstream = original.unwrap_or(self.ctx.dst);
+                return Ok(self.cut(
+                    tracker,
+                    &source,
+                    (route, backend, upstream),
+                    (kind, protocol),
+                    began,
+                ));
+            }
+        }
         let mut planner = Planner::new(drawn.retry.retries());
         drawn.retry.deposit(router.now());
         let warned = AtomicBool::new(false);
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
         let mut next = self.plan(&drawn, original, direct, tries, &mut planner);
-        let bounds = Bounds {
-            timeouts,
-            began,
-            timers: &router.timers,
-        };
         loop {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
@@ -864,21 +919,7 @@ impl Serving {
                     drawn.opened(router, "all_ejected", 0);
                     return Ok(self.open(tracker, route, &drawn, began));
                 }
-                Plan::Stop => {
-                    self.count(
-                        route,
-                        backend,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no-endpoint",
-                        began,
-                    );
-                    tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "no-endpoint");
-                    return Ok(answer(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no-endpoint",
-                        false,
-                    ));
-                }
+                Plan::Stop => return Ok(self.no_endpoint(tracker, route, backend, began)),
             };
             tries += 1;
             if let Some(reason) = again.take() {
@@ -1097,6 +1138,85 @@ impl Serving {
         answer(StatusCode::SERVICE_UNAVAILABLE, "breaker-open", false)
     }
 
+    /// The fault of the request (spec §7.9 "Fault injection"), with the faults of the drawn
+    /// backend's policy: `Ok` with the delay's milliseconds, if any, or `Err` with the abort's
+    /// status. None at once when it has none, so that no random value is drawn; the abort's value
+    /// is drawn before the delay's.
+    fn fault_decision(
+        &self,
+        drawn: &Backend,
+        parts: &RequestParts<'_>,
+    ) -> Result<Option<u64>, u16> {
+        let faults = drawn.retry.faults();
+        if faults.is_empty() {
+            return Ok(None);
+        }
+        let router = self.mesh.router();
+        match faults
+            .decide(parts, router.random(), router.random())
+            .map(|d| d.kind)
+        {
+            Some(fault::Kind::Abort { status }) => Err(status),
+            Some(fault::Kind::Delay { ms }) => Ok(Some(ms)),
+            None => Ok(None),
+        }
+    }
+
+    /// An abort (spec §7.9 "Fault injection"): the configured `status` of `backend`, counted
+    /// and logged, with no try, no slot of the breaker and nothing asked of the budget.
+    fn aborted(
+        &self,
+        mut tracker: Tracker,
+        route: &str,
+        backend: &Backend,
+        status: u16,
+        close: bool,
+        began: Instant,
+    ) -> Response<MeshBody> {
+        // The view holds statuses 200 to 599 only.
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+        self.count(route, &backend.label, status, FAULT_INJECTED, began);
+        self.mesh.router().metrics.fault(&backend.label, "abort");
+        tracker.backend(&backend.label);
+        tracker.fault(fault::Kind::Abort {
+            status: status.as_u16(),
+        });
+        tracker.synthetic(status.as_u16(), FAULT_INJECTED);
+        answer(status, FAULT_INJECTED, close)
+    }
+
+    /// Waits an injected delay (spec §7.9 "Fault injection"): `Err` with the route timeout that
+    /// expired first. Its timer counts in the test hook while it lives; it ends with the call when
+    /// the app leaves, and `SIGTERM` does not shorten it.
+    async fn delay(&self, ms: u64, bounds: Bounds<'_>) -> Result<(), Kind> {
+        let wait = async {
+            let _armed = Armed::new(bounds.timers);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        };
+        bounds
+            .within(wait, timeout::call_deadline(bounds.timeouts))
+            .await
+    }
+
+    /// The backend has no endpoint: the `503` `no-endpoint`, counted and logged.
+    fn no_endpoint(
+        &self,
+        tracker: Tracker,
+        route: &str,
+        backend: &str,
+        began: Instant,
+    ) -> Response<MeshBody> {
+        self.count(
+            route,
+            backend,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no-endpoint",
+            began,
+        );
+        tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "no-endpoint");
+        answer(StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", false)
+    }
+
     /// The call ends on a route timeout before the response head: the `504`, counted and
     /// logged (spec §7.9 "Timeouts").
     fn cut(
@@ -1125,20 +1245,8 @@ impl Serving {
 
     /// The rule of `routed` that matches the request and its drawn backend, or the answer of
     /// the sidecar (spec §7.9 "Routing").
-    fn select<'a>(&self, routed: &'a Routed, head: &Parts) -> Selected<'a> {
-        let headers: Vec<(&str, &[u8])> = head
-            .headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_bytes()))
-            .collect();
-        let (path, query) = split_target(head.uri.path_and_query().map_or("", |p| p.as_str()));
-        let parts = RequestParts {
-            method: head.method.as_str(),
-            path,
-            query,
-            headers: &headers,
-        };
-        let Some((route, rule)) = routed.table.select(&parts) else {
+    fn select<'a>(&self, routed: &'a Routed, parts: &RequestParts<'_>) -> Selected<'a> {
+        let Some((route, rule)) = routed.table.select(parts) else {
             return Selected::Answer {
                 view: None,
                 rule: 0,
@@ -1618,13 +1726,37 @@ fn refusal_of(
     trusted(response.status().as_u16(), &fields, Some(pod))
 }
 
+/// The fields of a request head, in the order received, for the route match and the fault
+/// decision.
+fn field_list(head: &Parts) -> Vec<(&str, &[u8])> {
+    head.headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect()
+}
+
+/// What the route match and the fault decision see of a request: its method, target and
+/// `fields`.
+fn request_parts<'a>(head: &'a Parts, fields: &'a [(&'a str, &'a [u8])]) -> RequestParts<'a> {
+    let (path, query) = split_target(head.uri.path_and_query().map_or("", |p| p.as_str()));
+    RequestParts {
+        method: head.method.as_str(),
+        path,
+        query,
+        headers: fields,
+    }
+}
+
 /// An answer of the sidecar: `x-mimic-error` and no body. With `close` the connection ends.
 fn answer(status: StatusCode, reason: &'static str, close: bool) -> Response<MeshBody> {
     let mut response = Response::new(MeshBody::empty());
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert("x-mimic-error", HeaderValue::from_static(reason));
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    // A `204` or a `304` has no content and no `content-length` (RFC 9110 §8.6).
+    if status != StatusCode::NO_CONTENT && status != StatusCode::NOT_MODIFIED {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    }
     if close {
         headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
     }

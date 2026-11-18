@@ -11,11 +11,12 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    BackendRef, BreakerSpec, Config, Destination, Endpoint, EndpointSlice, GATEWAY_GROUP,
-    GrantFrom, GrantTo, HeaderModifier, Mirror, NameMatch, OutlierSpec, ParentRef, PathMatch,
-    ReferenceGrant, RetryBudgetSpec, Route, RouteFilter, RouteMatch, RouteRule, Service,
-    ServicePort, SlicePort, Target, TargetKind, TargetPort,
+    AbortSpec, BackendRef, BreakerSpec, Config, DelaySpec, Destination, Endpoint, EndpointSlice,
+    FaultSpec, GATEWAY_GROUP, GrantFrom, GrantTo, HeaderModifier, Mirror, NameMatch, OutlierSpec,
+    ParentRef, PathMatch, ReferenceGrant, RetryBudgetSpec, Route, RouteFilter, RouteMatch,
+    RouteRule, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
 };
+use mimic_core::mesh::route::duration_ms;
 use serde_json::Value;
 
 /// `(namespace, name)`.
@@ -142,6 +143,29 @@ fn bounded(value: &Value) -> u32 {
         .map_or(u32::MAX, |n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
+/// A `faults` item: a percent, a status or a `fixed` that is missing or cannot be read arrives
+/// out of bounds, so that `validate` refuses the object (FLT-03).
+fn fault(value: &Value) -> FaultSpec {
+    let match_ = value.get("match").map(route_match);
+    let number = |v: &Value, field: &str| v.get(field).map_or(u32::MAX, bounded);
+    FaultSpec {
+        r#match: match_,
+        delay: value.get("delay").map(|d| DelaySpec {
+            percent: number(d, "percent"),
+            // Not a Gateway API duration: 0, which `validate` refuses.
+            fixed_ms: d
+                .get("fixed")
+                .and_then(Value::as_str)
+                .and_then(duration_ms)
+                .unwrap_or(0),
+        }),
+        abort: value.get("abort").map(|a| AbortSpec {
+            percent: number(a, "percent"),
+            status: number(a, "status"),
+        }),
+    }
+}
+
 pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
     let key = key(&object.metadata)?;
     let spec = object.data.get("spec").unwrap_or(&Value::Null);
@@ -216,6 +240,10 @@ pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
             max_requests: b.get("maxRequests").map(bounded),
             max_connections: b.get("maxConnections").map(bounded),
         }),
+        faults: spec
+            .get("faults")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().map(fault).collect()),
     };
     Some((key, config))
 }
@@ -390,6 +418,19 @@ fn filter(value: &Value, at: &str, out: &mut Vec<String>) -> RouteFilter {
     }
 }
 
+/// An `HTTPRouteMatch`, of a route rule or of a fault: the path defaults to `PathPrefix /`.
+fn route_match(m: &Value) -> RouteMatch {
+    RouteMatch {
+        path: m.get("path").map(|p| PathMatch {
+            kind: text(p, "type").unwrap_or_else(|| "PathPrefix".into()),
+            value: text(p, "value").unwrap_or_else(|| "/".into()),
+        }),
+        headers: names(m, "headers"),
+        query_params: names(m, "queryParams"),
+        method: text(m, "method"),
+    }
+}
+
 fn rule(value: &Value, at: &str, out: &mut Vec<String>) -> RouteRule {
     unknown(value, at, &RULE_FIELDS, out);
     let matches = list(value, "matches")
@@ -398,15 +439,7 @@ fn rule(value: &Value, at: &str, out: &mut Vec<String>) -> RouteRule {
         .map(|(j, m)| {
             let at = format!("{at}.matches[{j}]");
             unknown(m, &at, &MATCH_FIELDS, out);
-            RouteMatch {
-                path: m.get("path").map(|p| PathMatch {
-                    kind: text(p, "type").unwrap_or_else(|| "PathPrefix".into()),
-                    value: text(p, "value").unwrap_or_else(|| "/".into()),
-                }),
-                headers: names(m, "headers"),
-                query_params: names(m, "queryParams"),
-                method: text(m, "method"),
-            }
+            route_match(m)
         })
         .collect();
     let filters = list(value, "filters")

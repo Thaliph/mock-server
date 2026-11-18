@@ -8,8 +8,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::input::{EndpointSlice, Route, Service, Snapshot, TargetKind, TargetPort};
-use super::policy::{MAX_RETRIES, MAX_SLOW_START_SECS, Policy, Winners, consents, effective};
-use super::route::{Compiled, ModifierView, RouteView, RuleView, compile, refused_header};
+use super::policy::{
+    MAX_FAULTS, MAX_RETRIES, MAX_SLOW_START_SECS, Policy, Winners, consents, effective,
+};
+use super::route::{
+    Compiled, MatchView, ModifierView, RouteView, RuleView, compile, refused_header,
+};
 use crate::Mode;
 
 /// The view format this code writes and reads.
@@ -134,6 +138,17 @@ impl View {
             if !service.policy.circuit_breaker.in_bounds() {
                 return Err("circuitBreaker out of bounds".into());
             }
+            if service.policy.faults.len() > MAX_FAULTS {
+                return Err(format!("faults over {MAX_FAULTS}"));
+            }
+            for fault in &service.policy.faults {
+                if !fault.in_bounds() {
+                    return Err("a fault is out of bounds".into());
+                }
+                if let Some(m) = &fault.r#match {
+                    check_match(m)?;
+                }
+            }
         }
         check_routes(&view)?;
         Ok(view)
@@ -224,32 +239,38 @@ fn check_routes(view: &View) -> Result<(), String> {
     Ok(())
 }
 
+/// The bounds of a match, in a route and in a fault (spec §7.9 "`View::from_json`").
+fn check_match(m: &MatchView) -> Result<(), String> {
+    if m.headers.len() > MAX_ITEMS || m.query_params.len() > MAX_ITEMS {
+        return Err(format!("match over {MAX_ITEMS} headers or query params"));
+    }
+    for h in &m.headers {
+        if !header_name(&h.name) {
+            return Err("a header match name is not a lower-case token".into());
+        }
+    }
+    for nv in m.headers.iter().chain(&m.query_params) {
+        if !header_value(&nv.value) {
+            return Err("a match value is not valid".into());
+        }
+    }
+    if let Some(path) = &m.path
+        && (!matches!(path.kind.as_str(), "Exact" | "PathPrefix") || !path_value(&path.value))
+    {
+        return Err("a path match is not valid".into());
+    }
+    if m.method.as_deref().is_some_and(|m| !method(m)) {
+        return Err("a method is not one of the CRD".into());
+    }
+    Ok(())
+}
+
 fn check_rule(rule: &RuleView, held: &dyn Fn(&str, u16) -> bool) -> Result<(), String> {
     if rule.matches.len() > MAX_MATCHES {
         return Err(format!("rule over {MAX_MATCHES} matches"));
     }
     for m in &rule.matches {
-        if m.headers.len() > MAX_ITEMS || m.query_params.len() > MAX_ITEMS {
-            return Err(format!("match over {MAX_ITEMS} headers or query params"));
-        }
-        for h in &m.headers {
-            if !header_name(&h.name) {
-                return Err("a header match name is not a lower-case token".into());
-            }
-        }
-        for nv in m.headers.iter().chain(&m.query_params) {
-            if !header_value(&nv.value) {
-                return Err("a match value is not valid".into());
-            }
-        }
-        if let Some(path) = &m.path
-            && (!matches!(path.kind.as_str(), "Exact" | "PathPrefix") || !path_value(&path.value))
-        {
-            return Err("a path match is not valid".into());
-        }
-        if m.method.as_deref().is_some_and(|m| !method(m)) {
-            return Err("a method is not one of the CRD".into());
-        }
+        check_match(m)?;
     }
     if rule.backends.len() > MAX_ITEMS {
         return Err(format!("rule over {MAX_ITEMS} backends"));

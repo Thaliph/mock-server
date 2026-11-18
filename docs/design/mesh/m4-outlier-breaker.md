@@ -3,8 +3,8 @@
 > Retro page (#547) of [the mesh milestones](README.md). Issue #451. Spec: §4.1, §7
 > (`MimicConfig`), §7.9 ("Outlier detection", "Circuit breaker", "Configuration", "Metrics"),
 > §11.1, criteria §12.27. Design: [`../mimic-mesh.md`](../mimic-mesh.md) §3.2, §6, §9, §10, §14,
-> §15. Fault injection, the other half of M4 (#452, `FLT-xx`), is in progress and not covered
-> here.
+> §15. Fault injection, the other half of M4 (#452, `FLT-xx`), has its own page:
+> [M4: fault injection](m4-faults.md).
 
 ## Goal
 
@@ -125,8 +125,8 @@ All in spec §11.1 (M4):
 
 ## Open follow-ups
 
-- #452: fault injection (delay and abort), in progress; an injected abort takes no breaker slot,
-  an injected delay is waited before the slot is taken (spec §7.9 "Circuit breaker").
+- #452: fault injection (delay and abort), [its page](m4-faults.md): an injected abort takes no
+  breaker slot, an injected delay is waited inside the slot (spec §7.9 "Circuit breaker").
 - #515 holds the non-blocking notes of the M4 bench review (#543): the `mesh-eject` verdict
   compares an average per ejection with a per-ejection bound, and the `mesh-breaker` percentage
   counts warm-up lines.

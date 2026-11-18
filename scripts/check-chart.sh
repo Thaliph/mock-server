@@ -904,6 +904,44 @@ for rule in "!has(self.outlierDetection) || self.targetRefs.exists(t, t.kind == 
 done
 echo "cbr_04: the MimicConfig CRD bounds outlierDetection and circuitBreaker and fits them to a Service target only"
 
+# FLT-04 (#452): faults of the MimicConfig CRD, their bounds and their CEL rules.
+f='.properties.faults'
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$f | [.type, .maxItems]") == '["array",16]' ]] \
+  || fail "flt_04: faults is not an array of at most 16 items"
+fm="$f.items.properties.match.properties"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$fm.path.properties.type.enum") == '["Exact","PathPrefix"]' ]] \
+  || fail "flt_04: faults[].match.path.type is not Exact or PathPrefix"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$fm.path.properties.value | [.type, .minLength, .maxLength]") == '["string",1,1024]' ]] \
+  || fail "flt_04: faults[].match.path.value is not a string of 1 to 1024 bytes"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$fm.method.enum | length") == 9 ]] \
+  || fail "flt_04: faults[].match.method is not an enum of nine"
+for list in headers queryParams; do
+  [[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$fm.$list | [.type, .maxItems]") == '["array",16]' ]] \
+    || fail "flt_04: faults[].match.$list is not an array of at most 16 items"
+  [[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$fm.$list.items.properties.type.enum") == '["Exact"]' ]] \
+    || fail "flt_04: faults[].match.$list[].type is not Exact"
+done
+for kind in delay abort; do
+  [[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$f.items.properties.$kind.properties.percent | [.type, .minimum, .maximum]") == '["integer",0,100]' ]] \
+    || fail "flt_04: faults[].$kind.percent is not an integer of 0 to 100"
+done
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$f.items.properties.delay.required | sort") == '["fixed","percent"]' ]] \
+  || fail "flt_04: faults[].delay does not require percent and fixed"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$f.items.properties.abort.required | sort") == '["percent","status"]' ]] \
+  || fail "flt_04: faults[].abort does not require percent and status"
+[[ $(printf '%s\n' "$mc_spec" | yq -r "$f.items.properties.delay.properties.fixed.type") == string ]] \
+  || fail "flt_04: faults[].delay.fixed is not a string"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$f.items.properties.abort.properties.status | [.type, .minimum, .maximum]") == '["integer",200,599]' ]] \
+  || fail "flt_04: faults[].abort.status is not an integer of 200 to 599"
+[[ $(printf '%s\n' "$mc_spec" | yq -r "$f.items.properties.delay.properties.fixed[\"x-kubernetes-validations\"][0].rule") == "duration(self) >= duration('1ms') && duration(self) <= duration('60s')" ]] \
+  || fail "flt_04: faults[].delay.fixed is not bounded to 1ms to 60s by CEL"
+[[ $(printf '%s\n' "$mc_spec" | yq -r "$f.items[\"x-kubernetes-validations\"][0].rule") == "has(self.delay) || has(self.abort)" ]] \
+  || fail "flt_04: a fault does not need a delay or an abort by CEL"
+cel=$(printf '%s\n' "$mc_spec" | yq -r '[.["x-kubernetes-validations"][].rule] | join("\n")')
+grep -qxF -- "!has(self.faults) || self.targetRefs.exists(t, t.kind == 'Service')" <<<"$cel" \
+  || fail "flt_04: the MimicConfig CRD lacks the CEL rule that fits faults to a Service target only"
+echo "flt_04: the MimicConfig CRD bounds faults and fits them to a Service target only"
+
 # MSH-29 (#441): the controller's RBAC for the mesh watches, and the variables the mesh values render.
 role=$(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller")' "$tmp/default.yaml")
 rule_verbs() { # rule_verbs <resource>: the verbs of the rules that name the resource, one line each
