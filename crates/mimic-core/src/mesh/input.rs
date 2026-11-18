@@ -108,6 +108,32 @@ pub struct Config {
     pub outlier_detection: Option<OutlierSpec>,
     /// `spec.circuitBreaker` (a Service target only, #451).
     pub circuit_breaker: Option<BreakerSpec>,
+    /// `spec.faults` (a Service target only, #452); `None` when the object has none.
+    pub faults: Option<Vec<FaultSpec>>,
+}
+
+/// One item of `spec.faults`; `None` is a member the object does not set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultSpec {
+    pub r#match: Option<RouteMatch>,
+    pub delay: Option<DelaySpec>,
+    pub abort: Option<AbortSpec>,
+}
+
+/// `faults[].delay`. A `percent` the adapter cannot read arrives as `u32::MAX` and a `fixed` it
+/// cannot read (or that is missing) as 0, out of bounds, so that `validate` refuses them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelaySpec {
+    pub percent: u32,
+    /// `fixed` in milliseconds.
+    pub fixed_ms: u64,
+}
+
+/// `faults[].abort`; a value the adapter cannot read arrives out of bounds, as for the delay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortSpec {
+    pub percent: u32,
+    pub status: u32,
 }
 
 /// `spec.outlierDetection`; `None` is a field the object does not set. A `baseEjectionTime`

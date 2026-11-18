@@ -102,7 +102,7 @@ fn view(rules: &[String], own: SocketAddr, other: &[SocketAddr]) -> View {
 /// The Service `shop/cart` is on `port`; `shop/other` is headless on 80.
 fn view_on(port: u16, rules: &[String], own: SocketAddr, other: &[SocketAddr]) -> View {
     let pod = |p: &SocketAddr| format!(r#"{{"ip":"{}","port":{},"ready":true}}"#, p.ip(), p.port());
-    let policy = r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"loadBalancer":{"slowStartSeconds":0},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
+    let policy = r#""policy":{"circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"faults":[],"loadBalancer":{"slowStartSeconds":0},"outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#;
     let text = format!(
         r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{"shop/cart":{{"endpoints":{{"{port}":[{own}]}},"generations":{{}},"ips":["127.0.0.1"],{policy},"ports":{{"{port}":{{"targetPort":8080}}}},"routes":[{{"name":"shop/timed","rules":[{rules}]}}]}},"shop/other":{{"endpoints":{{"80":[{other}]}},"generations":{{}},"ips":[],{policy},"ports":{{"80":{{"targetPort":8080}}}}}}}}}}"#,
         own = pod(&own),

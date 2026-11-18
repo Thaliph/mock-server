@@ -70,14 +70,23 @@ fn flt_01_without_a_config_the_faults_are_empty_and_the_winners_are_taken_whole_
     assert!(effective(None).faults.is_empty());
     assert!(view_faults(&s, "shop/cart").is_empty());
     let many: Vec<FaultSpec> = (0..16)
-        .map(|i| spec(Some(path("Exact", &format!("/p{i}"))), abort(i, 500 + i), None))
+        .map(|i| {
+            spec(
+                Some(path("Exact", &format!("/p{i}"))),
+                abort(i, 500 + i),
+                None,
+            )
+        })
         .collect();
     s.configs = vec![with(many)];
     let got = view_faults(&s, "shop/cart");
     assert_eq!(got.len(), 16);
     for (i, f) in got.iter().enumerate() {
         let want = format!("/p{i}");
-        assert_eq!(f.r#match.as_ref().unwrap().path.as_ref().unwrap().value, want);
+        assert_eq!(
+            f.r#match.as_ref().unwrap().path.as_ref().unwrap().value,
+            want
+        );
         assert_eq!(f.abort.as_ref().unwrap().status, 500 + i as u16);
     }
 }
@@ -110,17 +119,36 @@ fn refused(config: &Config, needle: &str) {
 fn flt_01_validate_refuses_each_bad_fault_naming_the_field_and_the_index() {
     refused(&with((0..17).map(|_| ok_fault()).collect()), "faults");
     refused(&with(vec![ok_fault(), spec(None, None, None)]), "faults[1]");
-    refused(&with(vec![spec(None, abort(101, 503), None)]), "faults[0].abort.percent");
+    refused(
+        &with(vec![spec(None, abort(101, 503), None)]),
+        "faults[0].abort.percent",
+    );
     refused(
         &with(vec![ok_fault(), spec(None, None, delay(101, 5))]),
         "faults[1].delay.percent",
     );
-    refused(&with(vec![spec(None, abort(1, 199), None)]), "faults[0].abort.status");
-    refused(&with(vec![spec(None, abort(1, 600), None)]), "faults[0].abort.status");
-    refused(&with(vec![spec(None, None, delay(1, 0))]), "faults[0].delay.fixed");
-    refused(&with(vec![spec(None, None, delay(1, 60_001))]), "faults[0].delay.fixed");
     refused(
-        &with(vec![spec(Some(path("RegularExpression", "/a.*")), abort(1, 503), None)]),
+        &with(vec![spec(None, abort(1, 199), None)]),
+        "faults[0].abort.status",
+    );
+    refused(
+        &with(vec![spec(None, abort(1, 600), None)]),
+        "faults[0].abort.status",
+    );
+    refused(
+        &with(vec![spec(None, None, delay(1, 0))]),
+        "faults[0].delay.fixed",
+    );
+    refused(
+        &with(vec![spec(None, None, delay(1, 60_001))]),
+        "faults[0].delay.fixed",
+    );
+    refused(
+        &with(vec![spec(
+            Some(path("RegularExpression", "/a.*")),
+            abort(1, 503),
+            None,
+        )]),
         "faults[0].match.path",
     );
     refused(
@@ -149,21 +177,42 @@ fn flt_01_validate_refuses_each_bad_fault_naming_the_field_and_the_index() {
         ..RouteMatch::default()
     };
     refused(
-        &with(vec![spec(Some(headers(vec![name("RegularExpression", "x")])), abort(1, 503), None)]),
+        &with(vec![spec(
+            Some(headers(vec![name("RegularExpression", "x")])),
+            abort(1, 503),
+            None,
+        )]),
         "faults[0].match.headers",
     );
     refused(
-        &with(vec![spec(Some(queries(vec![name("RegularExpression", "x")])), abort(1, 503), None)]),
+        &with(vec![spec(
+            Some(queries(vec![name("RegularExpression", "x")])),
+            abort(1, 503),
+            None,
+        )]),
         "faults[0].match.queryParams",
     );
-    let many = |kind: &str| (0..17).map(|i| name("Exact", &format!("{kind}{i}"))).collect();
-    refused(&with(vec![spec(Some(headers(many("h"))), abort(1, 503), None)]), "headers");
-    refused(&with(vec![spec(Some(queries(many("q"))), abort(1, 503), None)]), "queryParams");
+    let many = |kind: &str| {
+        (0..17)
+            .map(|i| name("Exact", &format!("{kind}{i}")))
+            .collect()
+    };
+    refused(
+        &with(vec![spec(Some(headers(many("h"))), abort(1, 503), None)]),
+        "headers",
+    );
+    refused(
+        &with(vec![spec(Some(queries(many("q"))), abort(1, 503), None)]),
+        "queryParams",
+    );
     let method = RouteMatch {
         method: Some("FETCH".into()),
         ..RouteMatch::default()
     };
-    refused(&with(vec![spec(Some(method), abort(1, 503), None)]), "faults[0].match.method");
+    refused(
+        &with(vec![spec(Some(method), abort(1, 503), None)]),
+        "faults[0].match.method",
+    );
     let on_deployment = Config {
         faults: Some(vec![ok_fault()]),
         ..cfg("shop", "a", 1, &[(TargetKind::Deployment, "cart")])
@@ -209,7 +258,10 @@ fn flt_01_an_invalid_fault_makes_the_config_invalid_in_its_status() {
     let c = &st[&("shop".to_string(), "a".to_string())];
     assert_eq!(c.accepted.reason, "Invalid");
     assert!(c.accepted.message.contains("faults[0]"));
-    assert!(view_faults(&s, "shop/cart").is_empty(), "an invalid config wins nothing");
+    assert!(
+        view_faults(&s, "shop/cart").is_empty(),
+        "an invalid config wins nothing"
+    );
 }
 
 fn full_fault() -> FaultSpec {
@@ -298,7 +350,11 @@ fn flt_02_from_json_reads_back_what_build_wrote() {
 fn flt_02_from_json_refuses_a_missing_faults_and_an_unknown_field_at_any_level() {
     let json = built(vec![full_fault()]).json;
     assert!(read(&json.replacen(r#""faults":[{"#, r#""faults_":[{"#, 1)).is_err());
-    let without = json.replacen(&json[json.find(r#""faults""#).unwrap()..json.find(r#""loadBalancer""#).unwrap()], "", 1);
+    let without = json.replacen(
+        &json[json.find(r#""faults""#).unwrap()..json.find(r#""loadBalancer""#).unwrap()],
+        "",
+        1,
+    );
     assert!(read(&without).is_err(), "a missing faults");
     for (from, to) in [
         (r#""faults":[{"#, r#""faults":[{"extra":1,"#),
@@ -312,7 +368,12 @@ fn flt_02_from_json_refuses_a_missing_faults_and_an_unknown_field_at_any_level()
         assert!(json.contains(from), "{from}");
         assert!(read(&json.replacen(from, to, 1)).is_err(), "{from}");
     }
-    for member in [r#""percent":1,"#, r#""status":503"#, r#""fixedMs":500,"#, r#""percent":10"#] {
+    for member in [
+        r#""percent":1,"#,
+        r#""status":503"#,
+        r#""fixedMs":500,"#,
+        r#""percent":10"#,
+    ] {
         assert!(json.contains(member), "{member}");
     }
     assert!(read(&json.replacen(r#""percent":1,"#, "", 1)).is_err());
@@ -331,7 +392,10 @@ fn flt_02_from_json_refuses_every_value_validate_refuses() {
         assert!(read(&json.replacen(from, to, 1)).is_ok(), "{to}");
     };
     bad(r#""percent":1,"status""#, r#""percent":101,"status""#);
-    bad(r#""fixedMs":500,"percent":10"#, r#""fixedMs":500,"percent":101"#);
+    bad(
+        r#""fixedMs":500,"percent":10"#,
+        r#""fixedMs":500,"percent":101"#,
+    );
     bad(r#""status":503"#, r#""status":199"#);
     bad(r#""status":503"#, r#""status":600"#);
     bad(r#""status":503"#, r#""status":70000"#);
@@ -354,15 +418,26 @@ fn flt_02_from_json_refuses_every_value_validate_refuses() {
 fn flt_02_from_json_refuses_17_faults_an_empty_fault_and_17_match_items() {
     let item = r#"{"abort":{"percent":1,"status":503}}"#;
     let json = built(vec![]).json;
-    let many = |n: usize| json.replacen(r#""faults":[]"#, &format!(r#""faults":[{}]"#, vec![item; n].join(",")), 1);
+    let many = |n: usize| {
+        json.replacen(
+            r#""faults":[]"#,
+            &format!(r#""faults":[{}]"#, vec![item; n].join(",")),
+            1,
+        )
+    };
     assert!(read(&many(16)).is_ok());
     assert!(read(&many(17)).is_err());
     assert!(read(&json.replacen(r#""faults":[]"#, r#""faults":[{}]"#, 1)).is_err());
     let items = |n: usize, field: &str| {
-        let list: Vec<String> = (0..n).map(|i| format!(r#"{{"name":"h{i}","value":"v"}}"#)).collect();
+        let list: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"name":"h{i}","value":"v"}}"#))
+            .collect();
         json.replacen(
             r#""faults":[]"#,
-            &format!(r#""faults":[{{"abort":{{"percent":1,"status":503}},"match":{{"{field}":[{}]}}}}]"#, list.join(",")),
+            &format!(
+                r#""faults":[{{"abort":{{"percent":1,"status":503}},"match":{{"{field}":[{}]}}}}]"#,
+                list.join(",")
+            ),
             1,
         )
     };
@@ -407,7 +482,14 @@ fn flt_07_a_fault_without_match_holds_for_every_request() {
     let faults = [fault(None, Some((100, 503)), None)];
     for (method, p) in [("GET", "/"), ("POST", "/a/b"), ("GET", "*"), ("GET", "")] {
         let d = decide(&faults, &req(method, p), u64::MAX, u64::MAX);
-        assert_eq!(d, Some(Decision { index: 0, kind: Kind::Abort { status: 503 } }), "{p:?}");
+        assert_eq!(
+            d,
+            Some(Decision {
+                index: 0,
+                kind: Kind::Abort { status: 503 }
+            }),
+            "{p:?}"
+        );
     }
 }
 
@@ -416,25 +498,58 @@ fn flt_07_the_match_is_the_route_match() {
     let headers: &[(&str, &[u8])] = &[("X-A", b"1"), ("x-a", b"2"), ("x-b", b"y")];
     let m = MatchView {
         headers: vec![
-            NameValue { name: "x-a".into(), value: "1,2".into() },
-            NameValue { name: "x-b".into(), value: "y".into() },
+            NameValue {
+                name: "x-a".into(),
+                value: "1,2".into(),
+            },
+            NameValue {
+                name: "x-b".into(),
+                value: "y".into(),
+            },
         ],
         method: Some("POST".into()),
-        path: Some(PathView { kind: "PathPrefix".into(), value: "/shop/".into() }),
-        query_params: vec![NameValue { name: "q".into(), value: "a b".into() }],
+        path: Some(PathView {
+            kind: "PathPrefix".into(),
+            value: "/shop/".into(),
+        }),
+        query_params: vec![NameValue {
+            name: "q".into(),
+            value: "a b".into(),
+        }],
     };
     let faults = [fault(Some(m), Some((100, 500)), None)];
-    let r = |method, p, q, h| RequestParts { method, path: p, query: q, headers: h };
+    let r = |method, p, q, h| RequestParts {
+        method,
+        path: p,
+        query: q,
+        headers: h,
+    };
     let yes = |parts: RequestParts| decide(&faults, &parts, u64::MAX, 0).is_some();
     assert!(yes(r("POST", "/shop", Some("q=a%20b&q=z"), headers)));
-    assert!(yes(r("POST", "/shop/x", Some("q=a+b".replace('+', "%20").as_str()), headers)));
+    assert!(yes(r("POST", "/shop/x", Some("q=a%20b"), headers)));
     assert!(!yes(r("GET", "/shop", Some("q=a%20b"), headers)), "method");
-    assert!(!yes(r("POST", "/shopx", Some("q=a%20b"), headers)), "segment boundary");
-    assert!(!yes(r("POST", "/shop", Some("q=a+b"), headers)), "+ stays +");
-    assert!(!yes(r("POST", "/shop", Some("q=z&q=a%20b"), headers)), "first of a name");
-    assert!(!yes(r("POST", "/shop", Some("q=a%20b"), &headers[..1])), "joined header");
+    assert!(
+        !yes(r("POST", "/shopx", Some("q=a%20b"), headers)),
+        "segment boundary"
+    );
+    assert!(
+        !yes(r("POST", "/shop", Some("q=a+b"), headers)),
+        "+ stays +"
+    );
+    assert!(
+        !yes(r("POST", "/shop", Some("q=z&q=a%20b"), headers)),
+        "first of a name"
+    );
+    assert!(
+        !yes(r("POST", "/shop", Some("q=a%20b"), &headers[..1])),
+        "joined header"
+    );
     assert!(!yes(r("POST", "/shop", None, headers)), "query");
-    let exact = [fault(Some(mv(Some(("Exact", "/a")), None)), Some((100, 500)), None)];
+    let exact = [fault(
+        Some(mv(Some(("Exact", "/a")), None)),
+        Some((100, 500)),
+        None,
+    )];
     assert!(decide(&exact, &req("GET", "/a"), u64::MAX, 0).is_some());
     assert!(decide(&exact, &req("GET", "/a/"), u64::MAX, 0).is_none());
     assert!(decide(&exact, &req("GET", "*"), u64::MAX, 0).is_none());
@@ -442,18 +557,36 @@ fn flt_07_the_match_is_the_route_match() {
 
 #[test]
 fn flt_07_the_first_fault_that_holds_wins_whatever_the_precedence() {
-    let prefix = fault(Some(mv(Some(("PathPrefix", "/")), None)), Some((100, 501)), None);
-    let exact = fault(Some(mv(Some(("Exact", "/checkout")), None)), Some((100, 502)), None);
+    let prefix = fault(
+        Some(mv(Some(("PathPrefix", "/")), None)),
+        Some((100, 501)),
+        None,
+    );
+    let exact = fault(
+        Some(mv(Some(("Exact", "/checkout")), None)),
+        Some((100, 502)),
+        None,
+    );
     let status = |faults: &[Fault], p: &str| {
         decide(faults, &req("GET", p), u64::MAX, u64::MAX).map(|d| (d.index, d.kind))
     };
     let a = [prefix.clone(), exact.clone()];
-    assert_eq!(status(&a, "/checkout"), Some((0, Kind::Abort { status: 501 })));
+    assert_eq!(
+        status(&a, "/checkout"),
+        Some((0, Kind::Abort { status: 501 }))
+    );
     let b = [exact, prefix];
-    assert_eq!(status(&b, "/checkout"), Some((0, Kind::Abort { status: 502 })));
+    assert_eq!(
+        status(&b, "/checkout"),
+        Some((0, Kind::Abort { status: 502 }))
+    );
     assert_eq!(status(&b, "/cart"), Some((1, Kind::Abort { status: 501 })));
     assert_eq!(decide(&[], &req("GET", "/"), u64::MAX, u64::MAX), None);
-    let none = [fault(Some(mv(Some(("Exact", "/x")), None)), Some((100, 500)), None)];
+    let none = [fault(
+        Some(mv(Some(("Exact", "/x")), None)),
+        Some((100, 500)),
+        None,
+    )];
     assert_eq!(decide(&none, &req("GET", "/y"), u64::MAX, u64::MAX), None);
     // The first that holds is the one decided, even when it draws nothing.
     let quiet = [
@@ -485,10 +618,14 @@ fn flt_08_each_decision_reads_its_own_value_and_an_abort_wins() {
     let f = [fault(None, Some((10, 503)), Some((10, 700)))];
     let at = |r, s| decide(&f, &req("GET", "/"), r, s).map(|d| (d.index, d.kind));
     assert_eq!(at(0, u64::MAX), Some((0, Kind::Abort { status: 503 })));
-    assert_eq!(at(0, 0), Some((0, Kind::Abort { status: 503 })), "abort with a delay drawn");
+    assert_eq!(
+        at(0, 0),
+        Some((0, Kind::Abort { status: 503 })),
+        "abort with a delay drawn"
+    );
     assert_eq!(at(u64::MAX, 0), Some((0, Kind::Delay { ms: 700 })));
     assert_eq!(at(u64::MAX, u64::MAX), None);
-    let only_delay = [fault(None, None, Some((100, 5)))];
+    let only_delay = [fault(None, None, Some((10, 5)))];
     assert_eq!(
         decide(&only_delay, &req("GET", "/"), 0, u64::MAX).map(|d| d.kind),
         None,
@@ -498,7 +635,11 @@ fn flt_08_each_decision_reads_its_own_value_and_an_abort_wins() {
         decide(&only_delay, &req("GET", "/"), u64::MAX, 0).map(|d| d.kind),
         Some(Kind::Delay { ms: 5 })
     );
-    assert_eq!(at(1 << 60, 1 << 60), at(1 << 60, 1 << 60), "no hidden state");
+    assert_eq!(
+        at(1 << 60, 1 << 60),
+        at(1 << 60, 1 << 60),
+        "no hidden state"
+    );
 }
 
 /// splitmix64: a fixed-seed generator with no dependency.
@@ -513,7 +654,7 @@ fn splitmix(state: &mut u64) -> u64 {
 #[test]
 fn flt_09_abort_10_and_delay_20_decide_10_and_18_percent_over_100000_pairs() {
     let f = [fault(None, Some((10, 503)), Some((20, 100)))];
-    let mut state = 0x4D49_4D49_43u64;
+    let mut state = 0x4D49_4D49_4D49_4D49u64;
     let (mut aborts, mut delays) = (0u32, 0u32);
     for _ in 0..100_000 {
         let (r, s) = (splitmix(&mut state), splitmix(&mut state));
@@ -534,13 +675,23 @@ fn any_match() -> impl Strategy<Value = Option<MatchView>> {
     ));
     let method = proptest::option::of(prop_oneof![Just("GET"), Just("POST")]);
     let header = proptest::option::of(prop_oneof![Just("x-a"), Just("x-b")]);
-    proptest::option::of((path, method, header).prop_map(|(p, m, h)| MatchView {
-        headers: h
-            .map(|n| vec![NameValue { name: n.into(), value: "1".into() }])
-            .unwrap_or_default(),
-        method: m.map(Into::into),
-        path: p.map(|(k, v)| PathView { kind: k.into(), value: v.into() }),
-        query_params: vec![],
+    proptest::option::of((path, method, header).prop_map(|(p, m, h)| {
+        MatchView {
+            headers: h
+                .map(|n| {
+                    vec![NameValue {
+                        name: n.into(),
+                        value: "1".into(),
+                    }]
+                })
+                .unwrap_or_default(),
+            method: m.map(Into::into),
+            path: p.map(|(k, v)| PathView {
+                kind: k.into(),
+                value: v.into(),
+            }),
+            query_params: vec![],
+        }
     }))
 }
 

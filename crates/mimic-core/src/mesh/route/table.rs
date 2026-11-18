@@ -38,17 +38,17 @@ pub fn split_target(target: &str) -> (&str, Option<&str>) {
     }
 }
 
-enum PathItem {
-    Exact(String),
+enum PathItem<S> {
+    Exact(S),
     /// The prefix without its one trailing `/`.
-    Prefix(String),
+    Prefix(S),
 }
 
 /// One match of one rule, with the items it holds once per name.
 struct Entry {
     route: usize,
     rule: usize,
-    path: Option<PathItem>,
+    path: Option<PathItem<String>>,
     method: Option<String>,
     headers: Vec<(String, String)>,
     query: Vec<(String, String)>,
@@ -146,21 +146,56 @@ fn entry(route: usize, rule: usize, m: &MatchView) -> Entry {
     }
 }
 
+/// Whether `m` holds for `req` as the match of a route does (the first item of a name counts),
+/// without building a table: a fault's `match` (spec §7.9 "Fault injection").
+pub fn match_holds(m: &MatchView, req: &RequestParts) -> bool {
+    if let Some(p) = &m.path {
+        let item = if p.kind == "Exact" {
+            PathItem::Exact(p.value.as_str())
+        } else {
+            PathItem::Prefix(p.value.strip_suffix('/').unwrap_or(p.value.as_str()))
+        };
+        if !path_holds(&item, req.path) {
+            return false;
+        }
+    }
+    if m.method.as_deref().is_some_and(|want| want != req.method) {
+        return false;
+    }
+    // A repeated name is ignored (the first item of a name counts); it is looked for only when
+    // an item does not hold, which keeps the cost of a holding match low.
+    m.headers.iter().enumerate().all(|(i, h)| {
+        header_equals(req.headers, &h.name, h.value.as_bytes())
+            || m.headers[..i]
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case(&h.name))
+    }) && m.query_params.iter().enumerate().all(|(i, q)| {
+        query_equals(req.query, &q.name, &q.value)
+            || m.query_params[..i].iter().any(|e| e.name == q.name)
+    })
+}
+
+fn path_holds(item: &PathItem<&str>, path: &str) -> bool {
+    // `*` and an empty path match no path item.
+    if !path.starts_with('/') {
+        return false;
+    }
+    match item {
+        PathItem::Exact(v) => path == *v,
+        PathItem::Prefix(v) => path
+            .strip_prefix(v)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+    }
+}
+
 impl Entry {
     fn holds(&self, req: &RequestParts) -> bool {
         if let Some(item) = &self.path {
-            // `*` and an empty path match no path item.
-            if !req.path.starts_with('/') {
-                return false;
-            }
-            let ok = match item {
-                PathItem::Exact(v) => req.path == v,
-                PathItem::Prefix(v) => req
-                    .path
-                    .strip_prefix(v.as_str())
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+            let borrowed = match item {
+                PathItem::Exact(v) => PathItem::Exact(v.as_str()),
+                PathItem::Prefix(v) => PathItem::Prefix(v.as_str()),
             };
-            if !ok {
+            if !path_holds(&borrowed, req.path) {
                 return false;
             }
         }

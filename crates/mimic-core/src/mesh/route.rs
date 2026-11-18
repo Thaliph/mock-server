@@ -14,7 +14,7 @@ mod apply;
 mod table;
 
 pub use apply::{FieldList, Pick, draw};
-pub use table::{RequestParts, Table, split_target};
+pub use table::{RequestParts, Table, match_holds, split_target};
 
 use super::view::{
     MAX_ITEMS, MAX_MATCHES, MAX_RULES, MAX_WEIGHT, fraction, header_name, header_value, method,
@@ -536,7 +536,7 @@ fn merge(into: &mut Option<ModifierView>, m: Option<&HeaderModifier>) {
 }
 
 /// A Gateway API duration (`1h30m`, `500ms`): one to four `<1 to 5 digits><h|m|s|ms>` parts.
-fn duration_ms(text: &str) -> Option<u64> {
+pub fn duration_ms(text: &str) -> Option<u64> {
     let mut rest = text;
     let mut total = 0u64;
     let mut parts = 0;

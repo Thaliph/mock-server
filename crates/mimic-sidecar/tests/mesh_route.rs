@@ -75,7 +75,7 @@ fn view(services: &[Svc]) -> View {
                 )
             });
             format!(
-                r#""{key}":{{"endpoints":{{"{port}":[{pods}]{more_endpoints}}},"generations":{{}},"ips":[{ip}],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":{retries},"retryBudget":{{"minPerSecond":{min},"percent":{percent},"windowSeconds":{window}}}}},"ports":{{"{port}":{{"targetPort":8080}}{more_ports}}}{routes}}}"#,
+                r#""{key}":{{"endpoints":{{"{port}":[{pods}]{more_endpoints}}},"generations":{{}},"ips":[{ip}],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"faults":[],"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":{retries},"retryBudget":{{"minPerSecond":{min},"percent":{percent},"windowSeconds":{window}}}}},"ports":{{"{port}":{{"targetPort":8080}}{more_ports}}}{routes}}}"#,
                 key = s.key,
                 port = s.port,
                 pods = pods.join(","),

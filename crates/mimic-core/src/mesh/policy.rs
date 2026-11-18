@@ -5,7 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::input::{Config, MIMIC_GROUP, ReferenceGrant, Snapshot, TargetKind};
+use super::input::{
+    Config, FaultSpec, MIMIC_GROUP, ReferenceGrant, RouteMatch, Snapshot, TargetKind,
+};
+use super::route::{MatchView, NameValue, PathView};
+use super::view::{MAX_ITEMS, header_name, header_value, method, path_value};
 
 /// `loadBalancer.slowStart` when no `MimicConfig` sets it, in seconds.
 pub const DEFAULT_SLOW_START_SECS: u32 = 30;
@@ -49,6 +53,10 @@ pub const DEFAULT_MAX_REQUESTS: u32 = 1024;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
 /// Largest `circuitBreaker.maxRequests` and `maxConnections` (the smallest is 1).
 pub const MAX_BREAKER_LIMIT: u32 = 100_000;
+/// Most `faults` of a policy.
+pub const MAX_FAULTS: usize = 16;
+/// Largest `faults[].delay.fixed`, in milliseconds (the smallest is 1).
+pub const MAX_FAULT_DELAY_MS: u64 = 60_000;
 pub const MAX_TARGETS: usize = 16;
 pub const MAX_DESTINATIONS: usize = 256;
 
@@ -85,11 +93,41 @@ pub struct CircuitBreaker {
     pub max_requests: u32,
 }
 
+/// `faults[].abort` in the view. Field order is alphabetical: the JSON is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaultAbort {
+    pub percent: u32,
+    pub status: u16,
+}
+
+/// `faults[].delay` in the view. Field order is alphabetical: the JSON is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FaultDelay {
+    pub fixed_ms: u64,
+    pub percent: u32,
+}
+
+/// One fault of a policy, as the view carries it (spec §7.9 "Fault injection"). Field order is
+/// alphabetical: the JSON is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fault {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort: Option<FaultAbort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<FaultDelay>,
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub r#match: Option<MatchView>,
+}
+
 /// The effective policy of a Service, as the view carries it. Field order is alphabetical.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Policy {
     pub circuit_breaker: CircuitBreaker,
+    pub faults: Vec<Fault>,
     pub load_balancer: LoadBalancer,
     pub outlier_detection: OutlierDetection,
     pub retries: u32,
@@ -123,6 +161,22 @@ impl CircuitBreaker {
     }
 }
 
+impl Fault {
+    /// Whether every field is inside its bound and one of `abort` and `delay` is set (the
+    /// reader of a view uses it, FLT-02).
+    pub fn in_bounds(&self) -> bool {
+        (self.abort.is_some() || self.delay.is_some())
+            && self
+                .abort
+                .as_ref()
+                .is_none_or(|a| a.percent <= 100 && (200..=599).contains(&a.status))
+            && self
+                .delay
+                .as_ref()
+                .is_none_or(|d| d.percent <= 100 && (1..=MAX_FAULT_DELAY_MS).contains(&d.fixed_ms))
+    }
+}
+
 /// The policy of a Service no `MimicConfig` targets.
 pub fn defaults() -> Policy {
     Policy {
@@ -130,6 +184,7 @@ pub fn defaults() -> Policy {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_requests: DEFAULT_MAX_REQUESTS,
         },
+        faults: Vec::new(),
         outlier_detection: OutlierDetection {
             base_ejection_seconds: DEFAULT_BASE_EJECTION_SECS,
             consecutive_5xx: DEFAULT_CONSECUTIVE_5XX,
@@ -162,6 +217,10 @@ pub fn effective(winner: Option<&Config>) -> Policy {
                 .and_then(|b| b.max_requests)
                 .unwrap_or(DEFAULT_MAX_REQUESTS),
         },
+        faults: winner
+            .and_then(|c| c.faults.as_ref())
+            .map(|list| list.iter().map(fault_view).collect())
+            .unwrap_or_default(),
         outlier_detection: OutlierDetection {
             base_ejection_seconds: outlier
                 .and_then(|o| o.base_ejection_seconds)
@@ -194,6 +253,104 @@ pub fn effective(winner: Option<&Config>) -> Policy {
                 .unwrap_or(DEFAULT_RETRY_WINDOW_SECS),
         },
     }
+}
+
+/// A fault of a valid config as the view carries it: header names lower-cased.
+fn fault_view(spec: &FaultSpec) -> Fault {
+    let names = |list: &[super::input::NameMatch], lower: bool| -> Vec<NameValue> {
+        list.iter()
+            .map(|n| NameValue {
+                name: if lower {
+                    n.name.to_ascii_lowercase()
+                } else {
+                    n.name.clone()
+                },
+                value: n.value.clone(),
+            })
+            .collect()
+    };
+    Fault {
+        abort: spec.abort.as_ref().map(|a| FaultAbort {
+            percent: a.percent,
+            status: u16::try_from(a.status).unwrap_or(u16::MAX),
+        }),
+        delay: spec.delay.as_ref().map(|d| FaultDelay {
+            fixed_ms: d.fixed_ms,
+            percent: d.percent,
+        }),
+        r#match: spec.r#match.as_ref().map(|m| MatchView {
+            headers: names(&m.headers, true),
+            method: m.method.clone(),
+            path: m.path.as_ref().map(|p| PathView {
+                kind: p.kind.clone(),
+                value: p.value.clone(),
+            }),
+            query_params: names(&m.query_params, false),
+        }),
+    }
+}
+
+/// `Err(message)` for the first fault that breaks a bound, naming the field and the index.
+fn validate_faults(faults: &[FaultSpec]) -> Result<(), String> {
+    if faults.len() > MAX_FAULTS {
+        return Err(format!("faults holds more than {MAX_FAULTS} items"));
+    }
+    for (i, f) in faults.iter().enumerate() {
+        if f.abort.is_none() && f.delay.is_none() {
+            return Err(format!("faults[{i}] needs a delay or an abort"));
+        }
+        if let Some(a) = &f.abort {
+            if a.percent > 100 {
+                return Err(format!("faults[{i}].abort.percent is over 100"));
+            }
+            if !(200..=599).contains(&a.status) {
+                return Err(format!("faults[{i}].abort.status is not 200 to 599"));
+            }
+        }
+        if let Some(d) = &f.delay {
+            if d.percent > 100 {
+                return Err(format!("faults[{i}].delay.percent is over 100"));
+            }
+            if !(1..=MAX_FAULT_DELAY_MS).contains(&d.fixed_ms) {
+                return Err(format!("faults[{i}].delay.fixed is not 1ms to 60s"));
+            }
+        }
+        if let Some(m) = &f.r#match {
+            validate_match(i, m)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_match(i: usize, m: &RouteMatch) -> Result<(), String> {
+    let at = format!("faults[{i}].match");
+    if let Some(p) = &m.path
+        && (!matches!(p.kind.as_str(), "Exact" | "PathPrefix") || !path_value(&p.value))
+    {
+        return Err(format!(
+            "{at}.path is not Exact or PathPrefix with a value of 1 to 1024 bytes starting with /"
+        ));
+    }
+    if m.method.as_deref().is_some_and(|name| !method(name)) {
+        return Err(format!("{at}.method is not one of the HTTPRoute CRD"));
+    }
+    for (field, list, named) in [
+        ("headers", &m.headers, true),
+        ("queryParams", &m.query_params, false),
+    ] {
+        if list.len() > MAX_ITEMS {
+            return Err(format!("{at}.{field} holds more than {MAX_ITEMS} items"));
+        }
+        if list.iter().any(|n| {
+            n.kind != "Exact"
+                || !header_value(&n.value)
+                || n.name.is_empty()
+                || (named && !header_name(&n.name.to_ascii_lowercase()))
+        }) {
+            return Err(format!("{at}.{field} holds an item that is not valid"));
+        }
+    }
+    Ok(())
 }
 
 /// `Err(message)` when the object breaks a rule the CRD's CEL also states (MSH-08).
@@ -315,6 +472,12 @@ pub fn validate(config: &Config) -> Result<(), String> {
                 ));
             }
         }
+    }
+    if let Some(faults) = &config.faults {
+        if !has(TargetKind::Service) {
+            return Err("faults fit a Service target only".into());
+        }
+        validate_faults(faults)?;
     }
     Ok(())
 }

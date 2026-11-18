@@ -102,7 +102,7 @@ fn service(key: &str, ips: &[&str], ports: &[u16]) -> String {
         .map(|p| format!("\"{p}\":{{\"targetPort\":8080}}"))
         .collect();
     format!(
-        "\"{key}\":{{\"endpoints\":{{\"80\":[{{\"ip\":\"10.1.0.9\",\"port\":8080,\"ready\":true}}]}},\"generations\":{{}},\"ips\":[{}],\"policy\":{{\"circuitBreaker\":{{\"maxConnections\":1024,\"maxRequests\":1024}},\"loadBalancer\":{{\"slowStartSeconds\":30}},\"outlierDetection\":{{\"baseEjectionSeconds\":30,\"consecutive5xx\":0,\"consecutiveFailures\":5,\"maxEjectionPercent\":50}},\"retries\":3,\"retryBudget\":{{\"minPerSecond\":10,\"percent\":20,\"windowSeconds\":10}}}},\"ports\":{{{}}}}}",
+        "\"{key}\":{{\"endpoints\":{{\"80\":[{{\"ip\":\"10.1.0.9\",\"port\":8080,\"ready\":true}}]}},\"generations\":{{}},\"ips\":[{}],\"policy\":{{\"circuitBreaker\":{{\"maxConnections\":1024,\"maxRequests\":1024}},\"faults\":[],\"loadBalancer\":{{\"slowStartSeconds\":30}},\"outlierDetection\":{{\"baseEjectionSeconds\":30,\"consecutive5xx\":0,\"consecutiveFailures\":5,\"maxEjectionPercent\":50}},\"retries\":3,\"retryBudget\":{{\"minPerSecond\":10,\"percent\":20,\"windowSeconds\":10}}}},\"ports\":{{{}}}}}",
         ips.join(","),
         ports.join(",")
     )

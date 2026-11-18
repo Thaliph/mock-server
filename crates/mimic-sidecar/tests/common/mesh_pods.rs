@@ -227,7 +227,7 @@ pub fn view_on(
         .collect();
     let services = if mesh {
         format!(
-            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
+            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"faults":[],"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
             endpoints.join(",")
         )
     } else {
@@ -301,7 +301,7 @@ pub fn view_services(services: &[Svc]) -> View {
             .map(|(port, _)| format!(r#""{port}":{{"targetPort":8080}}"#))
             .collect();
         entries.push(format!(
-            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":["{}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}}}"#,
+            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":["{}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"faults":[],"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}}}"#,
             s.key,
             endpoints.join(","),
             s.ip,

@@ -122,6 +122,7 @@ fn config() -> impl Strategy<Value = Config> {
                 retry_budget: None,
                 outlier_detection: None,
                 circuit_breaker: None,
+                faults: None,
             },
         )
 }

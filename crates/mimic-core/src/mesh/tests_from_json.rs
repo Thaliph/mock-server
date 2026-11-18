@@ -704,12 +704,26 @@ fn flt_06_the_fuzz_seed_view_holds_16_faults_with_every_kind_of_match_item() {
     assert!(matches.iter().any(|m| !m.headers.is_empty()));
     assert!(matches.iter().any(|m| !m.query_params.is_empty()));
     for kind in ["Exact", "PathPrefix"] {
-        assert!(matches
-            .iter()
-            .any(|m| m.path.as_ref().is_some_and(|p| p.kind == kind)));
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.path.as_ref().is_some_and(|p| p.kind == kind))
+        );
     }
-    assert!(faults.iter().any(|f| f.abort.is_some() && f.delay.is_none()));
-    assert!(faults.iter().any(|f| f.delay.is_some() && f.abort.is_none()));
-    assert!(faults.iter().any(|f| f.delay.is_some() && f.abort.is_some()));
+    assert!(
+        faults
+            .iter()
+            .any(|f| f.abort.is_some() && f.delay.is_none())
+    );
+    assert!(
+        faults
+            .iter()
+            .any(|f| f.delay.is_some() && f.abort.is_none())
+    );
+    assert!(
+        faults
+            .iter()
+            .any(|f| f.delay.is_some() && f.abort.is_some())
+    );
     assert!(faults.iter().any(|f| f.r#match.is_none()));
 }
