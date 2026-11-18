@@ -701,6 +701,12 @@ impl Router {
         lock(&self.services).get(key).map_or(0, |s| s.counts(now).1)
     }
 
+    /// The requests the budget of Service `key` counts in its window.
+    pub(crate) fn window_requests(&self, key: &str) -> u64 {
+        let now = self.started.elapsed();
+        lock(&self.services).get(key).map_or(0, |s| s.counts(now).0)
+    }
+
     /// The backend of a Service port.
     pub(crate) fn backend(&self, service: &str, port: u16) -> Option<Arc<Backend>> {
         self.backends
@@ -804,6 +810,37 @@ mod tests {
         // A clock that goes back never logs early.
         assert_eq!(limiter.refused(at(500)), None);
         assert_eq!(limiter.refused(at(2000)), Some(1));
+    }
+
+    #[test]
+    fn flt_13_service_faults_follow_the_view() {
+        use mimic_core::mesh::fault::Kind;
+        use mimic_core::mesh::policy::{Fault, FaultAbort, defaults};
+        use mimic_core::mesh::route::RequestParts;
+        let abort = |status| Fault {
+            abort: Some(FaultAbort {
+                percent: 100,
+                status,
+            }),
+            delay: None,
+            r#match: None,
+        };
+        let mut policy = defaults();
+        policy.faults = vec![abort(500), abort(503)];
+        let retry = ServiceRetry::new(&policy);
+        let req = RequestParts {
+            method: "GET",
+            path: "/",
+            query: None,
+            headers: &[],
+        };
+        let decided = retry.faults().decide(&req, 0, 0).map(|d| (d.index, d.kind));
+        assert_eq!(decided, Some((0, Kind::Abort { status: 500 })));
+        retry.configure(&defaults());
+        assert!(retry.faults().is_empty());
+        assert_eq!(retry.faults().decide(&req, 0, 0), None);
+        retry.configure(&policy);
+        assert!(!retry.faults().is_empty());
     }
 
     #[test]

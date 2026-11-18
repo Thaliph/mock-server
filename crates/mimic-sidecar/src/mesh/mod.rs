@@ -739,6 +739,12 @@ impl MeshState {
         self.0.router.window_retries(key)
     }
 
+    /// Test hook (#452): the requests counted in the budget window of Service `key`.
+    #[doc(hidden)]
+    pub fn window_requests_for_test(&self, key: &str) -> u64 {
+        self.0.router.window_requests(key)
+    }
+
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
     pub(crate) fn off(&self) -> bool {
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);

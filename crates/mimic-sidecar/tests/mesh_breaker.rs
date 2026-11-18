@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::mesh_pods::{EchoPod, H1Client, Pod, RawPod};
 use common::mock_rig::{Options, rig_with, users_set};
-use common::{Logs, capture_logs, closed_port, fixture_mesh};
+use common::{
+    H2Sender, Logs, capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until,
+};
 use http_body_util::{BodyExt, Empty};
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::Mode;
 use mimic_core::mesh::view::{Limits, View};
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
@@ -125,14 +126,6 @@ fn state_with(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> Mesh
     state
 }
 
-fn metric(scrape: &str, name: &str, labels: &[&str]) -> f64 {
-    scrape
-        .lines()
-        .filter(|l| l.starts_with(name) && labels.iter().all(|f| l.contains(f)))
-        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
-        .sum()
-}
-
 /// The lines of the log with this message.
 async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
     logs.settled().await;
@@ -150,17 +143,6 @@ async fn reasoned(logs: &Logs, reason: &str) -> Vec<serde_json::Value> {
         .into_iter()
         .filter(|l| l["reason"] == reason)
         .collect()
-}
-
-/// Waits (at most 5 s) until `cond` holds.
-async fn until(what: &str, mut cond: impl FnMut() -> bool) {
-    for _ in 0..500 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("never: {what}");
 }
 
 fn lower(head: &str) -> String {
@@ -197,18 +179,6 @@ async fn code(job: JoinHandle<(String, Vec<u8>, Duration)>) -> u16 {
     head[9..12].parse().unwrap()
 }
 
-type H2Sender = hyper::client::conn::http2::SendRequest<Empty<Bytes>>;
-
-async fn h2_client(addr: SocketAddr) -> H2Sender {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(connection);
-    sender
-}
-
 /// One `h2c` stream: the status, the `x-mimic-error`, whether `x-mimic-endpoint` came, and how
 /// long it took.
 fn h2_get(sender: &H2Sender) -> JoinHandle<(u16, Option<String>, bool, Duration)> {
@@ -230,11 +200,6 @@ fn h2_get(sender: &H2Sender) -> JoinHandle<(u16, Option<String>, bool, Duration)
         response.into_body().collect().await.unwrap();
         (status, error, endpoint, began.elapsed())
     })
-}
-
-fn median(mut values: Vec<u64>) -> u64 {
-    values.sort_unstable();
-    values[values.len() / 2]
 }
 
 #[tokio::test]

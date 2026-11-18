@@ -180,6 +180,18 @@ async fn rty_18_http1_content_length_answers_lose_the_fields_on_a_keep_alive_con
 }
 
 #[tokio::test]
+async fn flt_24_an_inbound_sidecar_strips_a_forwarded_fault_injected() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
+    let reply: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: fault-injected\r\nContent-Length: 0\r\n\r\n";
+    let want: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    let state = meshed();
+    let rig = start(app(reply, false).await, Some(&state)).await;
+    exchange(rig.addr, GET, 3, want, false).await;
+    assert_eq!(rig.stripped(), 3);
+}
+
+#[tokio::test]
 async fn rty_18_http1_chunked_and_close_delimited_bodies_are_untouched() {
     // Every test that drives the sidecar captures: see `capture_logs`.
     let _logs = common::capture_logs();

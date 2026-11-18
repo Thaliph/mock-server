@@ -248,6 +248,16 @@ pub struct Svc {
     pub percent: u32,
     pub min_per_second: u32,
     pub window: u32,
+    /// The `faults` of the policy, a JSON array.
+    pub faults: String,
+    /// `maxRequests`, `maxConnections`.
+    pub breaker: (u32, u32),
+    /// `baseEjectionSeconds`, `consecutive5xx`, `consecutiveFailures`, `maxEjectionPercent`.
+    pub outlier: (u32, u32, u32, u32),
+    /// The routes of the Service, JSON objects separated by commas; none when empty.
+    pub routes: String,
+    /// No ClusterIP: `ips` is empty.
+    pub headless: bool,
 }
 
 impl Svc {
@@ -261,7 +271,38 @@ impl Svc {
             percent: 20,
             min_per_second: 10,
             window: 10,
+            faults: "[]".to_string(),
+            breaker: (1024, 1024),
+            outlier: (30, 0, 5, 50),
+            routes: String::new(),
+            headless: false,
         }
+    }
+
+    pub fn faults(mut self, faults: &str) -> Svc {
+        self.faults = faults.to_string();
+        self
+    }
+
+    pub fn breaker(mut self, max_requests: u32, max_connections: u32) -> Svc {
+        self.breaker = (max_requests, max_connections);
+        self
+    }
+
+    pub fn outlier(mut self, base: u32, fives: u32, failures: u32, percent: u32) -> Svc {
+        self.outlier = (base, fives, failures, percent);
+        self
+    }
+
+    /// `routes`: route objects, as the view writes them, separated by commas.
+    pub fn routes(mut self, routes: &str) -> Svc {
+        self.routes = routes.to_string();
+        self
+    }
+
+    pub fn headless(mut self) -> Svc {
+        self.headless = true;
+        self
     }
 
     pub fn budget(mut self, percent: u32, min_per_second: u32, window: u32) -> Svc {
@@ -300,11 +341,23 @@ pub fn view_services(services: &[Svc]) -> View {
             .iter()
             .map(|(port, _)| format!(r#""{port}":{{"targetPort":8080}}"#))
             .collect();
+        let ips = if s.headless {
+            String::new()
+        } else {
+            format!("\"{}\"", s.ip)
+        };
+        let routes = if s.routes.is_empty() {
+            String::new()
+        } else {
+            format!(r#","routes":[{}]"#, s.routes)
+        };
+        let (requests, connections) = s.breaker;
+        let (base, fives, failures, percent) = s.outlier;
         entries.push(format!(
-            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":["{}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"faults":[],"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}}}"#,
+            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":[{ips}],"policy":{{"circuitBreaker":{{"maxConnections":{connections},"maxRequests":{requests}}},"faults":{},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":{base},"consecutive5xx":{fives},"consecutiveFailures":{failures},"maxEjectionPercent":{percent}}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}{routes}}}"#,
             s.key,
             endpoints.join(","),
-            s.ip,
+            s.faults,
             s.retries,
             s.min_per_second,
             s.percent,
