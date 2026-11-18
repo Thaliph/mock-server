@@ -11,18 +11,18 @@ criterion IDs. Never paste the conversation into a brief.
 
 | Agent | Model (effort) | Used for |
 |---|---|---|
-| `architect` | Fable (high) | once per feature: criteria, design, threat model, steps |
+| `architect` | Opus (high) | once per feature: criteria, design, threat model, steps |
 | `spec-writer` | Opus (high) | each step with Rust code: the step spec (contract, reuse, tests) |
 | `rust-dev` | Opus (high) | each Rust step, test-first, from the step spec |
 | `ops` | Sonnet (medium) | each CI / Dockerfile / Helm / kind step |
 | `code-critic` | Opus (high) | each PR, before the reviewer: duplication, layering, coherence |
 | `reviewer` | Opus (high) | each PR, one pass, plus delta re-reviews |
 | `ci-triage` | Haiku (low) | a failing CI run: diff, flake or infra |
-| `security-auditor` | Fable (high) | once per milestone, on `main`, after its last merge |
+| `security-auditor` | Opus (high) | once per milestone, on `main`, after its last merge |
 
-Why (2026-11-18): Fable, the most capable and most expensive tier, only for the two rare,
-highest-leverage roles (a wrong criterion or a missed threat costs a whole feature). The
-concurrent data-plane code and its gate review go to Opus: on Sonnet they needed repeated fix
+Why (2026-11-18): no Fable (no credits for it, maintainer's decision); Opus for every judgment
+role, including the rare, highest-leverage ones (a wrong criterion or a missed threat costs a
+whole feature). The concurrent data-plane code and its gate review go to Opus: on Sonnet they needed repeated fix
 rounds (weak tests, wrong counters). Ops moves from Haiku to Sonnet because workflow
 changes are security-sensitive (pins, permissions). Haiku stays for log reading. Spreading the
 roles over tiers also spreads the usage limits (Sonnet's weekly limit stopped #452 once).
