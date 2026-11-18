@@ -458,6 +458,12 @@ impl Backend {
         );
     }
 
+    /// Whether the port has an endpoint in the view held (the check `plan` makes at its first
+    /// try).
+    pub(crate) fn has_endpoints(&self) -> bool {
+        !lock(&self.state).endpoints.is_empty()
+    }
+
     /// The addresses of the endpoints now.
     fn addrs(&self) -> Vec<SocketAddr> {
         lock(&self.state).endpoints.iter().map(|e| e.addr).collect()

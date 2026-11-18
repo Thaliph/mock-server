@@ -790,6 +790,8 @@ impl Serving {
         let mut gate = None;
         // The breaker's slot, held from the first try to the response's end (spec §7.9).
         let mut permit: Option<Permit> = None;
+        // The delay drawn, waited once the slot is taken (spec §7.9 "Fault injection").
+        let mut delay_ms = None;
         if let (Some(routed), Some(parts)) = (&routed, &parts) {
             match self.select(routed, parts) {
                 Selected::Rule {
@@ -800,9 +802,13 @@ impl Serving {
                     route = &view.name;
                     tracker.matched(route, rule);
                     // An abort comes before the breaker's slot (spec §7.9 "Order").
-                    if let Some(status) = self.abort(&backend, parts) {
-                        let close = http1 && !source.complete();
-                        return Ok(self.aborted(tracker, route, &backend, status, close, began));
+                    match self.fault_decision(&backend, parts).map(|d| d.kind) {
+                        Some(fault::Kind::Abort { status }) => {
+                            let close = http1 && !source.complete();
+                            return Ok(self.aborted(tracker, route, &backend, status, close, began));
+                        }
+                        Some(fault::Kind::Delay { ms }) => delay_ms = Some(ms),
+                        None => {}
                     }
                     match backend.admit(router) {
                         Ok(taken) => permit = Some(taken),
@@ -851,9 +857,16 @@ impl Serving {
                 }
             }
         } else if !direct {
-            if let Some(status) = parts.as_ref().and_then(|parts| self.abort(&drawn, parts)) {
-                let close = http1 && !source.complete();
-                return Ok(self.aborted(tracker, route, &drawn, status, close, began));
+            let decided = parts
+                .as_ref()
+                .and_then(|parts| self.fault_decision(&drawn, parts));
+            match decided.map(|d| d.kind) {
+                Some(fault::Kind::Abort { status }) => {
+                    let close = http1 && !source.complete();
+                    return Ok(self.aborted(tracker, route, &drawn, status, close, began));
+                }
+                Some(fault::Kind::Delay { ms }) => delay_ms = Some(ms),
+                None => {}
             }
             match drawn.admit(router) {
                 Ok(taken) => permit = Some(taken),
@@ -861,17 +874,37 @@ impl Serving {
             }
         }
         let backend = &drawn.label;
+        let bounds = Bounds {
+            timeouts,
+            began,
+            timers: &router.timers,
+        };
+        // The delay holds the slot, before the first try is planned: once per request, whatever
+        // its tries (spec §7.9 "Fault injection").
+        if let Some(ms) = delay_ms {
+            if !drawn.has_endpoints() {
+                return Ok(self.no_endpoint(tracker, route, backend, began));
+            }
+            router.metrics.fault(&drawn.service, "delay");
+            tracker.backend(backend);
+            tracker.fault(fault::Kind::Delay { ms });
+            if let Err(kind) = self.delay(ms, bounds).await {
+                let upstream = original.unwrap_or(self.ctx.dst);
+                return Ok(self.cut(
+                    tracker,
+                    &source,
+                    (route, backend, upstream),
+                    (kind, protocol),
+                    began,
+                ));
+            }
+        }
         let mut planner = Planner::new(drawn.retry.retries());
         drawn.retry.deposit(router.now());
         let warned = AtomicBool::new(false);
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
         let mut next = self.plan(&drawn, original, direct, tries, &mut planner);
-        let bounds = Bounds {
-            timeouts,
-            began,
-            timers: &router.timers,
-        };
         loop {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
@@ -881,21 +914,7 @@ impl Serving {
                     drawn.opened(router, "all_ejected", 0);
                     return Ok(self.open(tracker, route, &drawn, began));
                 }
-                Plan::Stop => {
-                    self.count(
-                        route,
-                        backend,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no-endpoint",
-                        began,
-                    );
-                    tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "no-endpoint");
-                    return Ok(answer(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no-endpoint",
-                        false,
-                    ));
-                }
+                Plan::Stop => return Ok(self.no_endpoint(tracker, route, backend, began)),
             };
             tries += 1;
             if let Some(reason) = again.take() {
@@ -1114,15 +1133,6 @@ impl Serving {
         answer(StatusCode::SERVICE_UNAVAILABLE, "breaker-open", false)
     }
 
-    /// The status of the abort the fault decision of `drawn`'s policy gives the request, if it
-    /// gives one. A delay is not injected yet.
-    fn abort(&self, drawn: &Backend, parts: &RequestParts<'_>) -> Option<u16> {
-        match self.fault_decision(drawn, parts)?.kind {
-            fault::Kind::Abort { status } => Some(status),
-            fault::Kind::Delay { .. } => None,
-        }
-    }
-
     /// The fault of the request (spec §7.9 "Fault injection"), with the faults of the drawn
     /// backend's policy: none at once when it has none, so that no random value is drawn; the
     /// abort's value is drawn before the delay's.
@@ -1156,6 +1166,38 @@ impl Serving {
         });
         tracker.synthetic(status.as_u16(), FAULT_INJECTED);
         answer(status, FAULT_INJECTED, close)
+    }
+
+    /// Waits an injected delay (spec §7.9 "Fault injection"): `Err` with the route timeout that
+    /// expired first. Its timer counts in the test hook while it lives; it ends with the call when
+    /// the app leaves, and `SIGTERM` does not shorten it.
+    async fn delay(&self, ms: u64, bounds: Bounds<'_>) -> Result<(), Kind> {
+        let wait = async {
+            let _armed = Armed::new(bounds.timers);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        };
+        bounds
+            .within(wait, timeout::call_deadline(bounds.timeouts))
+            .await
+    }
+
+    /// The backend has no endpoint: the `503` `no-endpoint`, counted and logged.
+    fn no_endpoint(
+        &self,
+        tracker: Tracker,
+        route: &str,
+        backend: &str,
+        began: Instant,
+    ) -> Response<MeshBody> {
+        self.count(
+            route,
+            backend,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no-endpoint",
+            began,
+        );
+        tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "no-endpoint");
+        answer(StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", false)
     }
 
     /// The call ends on a route timeout before the response head: the `504`, counted and

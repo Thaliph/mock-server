@@ -237,7 +237,10 @@ async fn flt_15_the_abort_and_the_delay_are_drawn_from_their_own_values_in_order
     for i in 0..500 {
         // The decision's two values are the next two draws: the abort's first.
         let s = state.random_state_for_test();
-        let (r_abort, r_delay) = (mix(s.wrapping_add(GOLDEN)), mix(s.wrapping_add(2 * GOLDEN)));
+        let (r_abort, r_delay) = (
+            mix(s.wrapping_add(GOLDEN)),
+            mix(s.wrapping_add(GOLDEN.wrapping_mul(2))),
+        );
         let want = if drawn(r_abort, 10) {
             "abort"
         } else if drawn(r_delay, 20) {
