@@ -129,6 +129,12 @@ fn adm_02_burst_and_queue_size_round_up_with_a_floor_of_one() {
         };
         assert_eq!(c.queue_size(), size, "concurrency {concurrency}");
     }
+    // Out of range, the sizes keep their floor of one.
+    let zero = Contract {
+        concurrency: 0,
+        rps: 0,
+    };
+    assert_eq!((zero.burst(), zero.queue_size()), (1, 1));
     let bounds = |concurrency, rps| Contract { concurrency, rps }.in_bounds();
     assert!(bounds(1, 1));
     assert!(bounds(MAX_CONCURRENCY, MAX_RPS));
@@ -158,6 +164,7 @@ fn adm_02_the_next_token_is_at_ceil_integer_nanoseconds() {
         resolved(&mut out, |o| a.apply(ns(333_333_334), o)),
         [(t, None)]
     );
+    out.clear();
     let _p = admitted(b.offer(ns(333_333_334), &mut out));
     assert!(out.is_empty());
 }
@@ -490,7 +497,10 @@ impl Harness {
 
     fn step(&mut self, op: &Op, t: Duration) -> Result<(), TestCaseError> {
         self.drive(t)?;
-        self.last = self.last.max(t);
+        // `cancel` takes no instant: the state's clock stays where the timer left it.
+        if !matches!(op, Op::Cancel(_)) {
+            self.last = self.last.max(t);
+        }
         match op {
             Op::Offer => {
                 self.offers += 1;
@@ -745,6 +755,7 @@ fn adm_07_counts_of_a_scripted_sequence_are_exact() {
     };
     assert_eq!(a.counts(ms(160)), at_160);
     assert_eq!(a.counts(ms(160)), at_160, "read twice");
+    out.clear();
     let f = queued(a.offer(ms(170), &mut out));
     assert!(a.cancel(f));
     a.release(pb, ms(200), &mut out);
