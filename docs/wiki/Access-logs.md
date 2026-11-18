@@ -80,7 +80,9 @@ decrypted or not. A field that has no value is absent from the line, not `null`.
 | `backend`, `upstream` | Mesh-routed requests (HTTP) and L4-balanced connections only, with `MIMIC_MESH=on` ([Mesh](Mesh)): `backend` is `<namespace>/<name>:<port>` of the Service port, `upstream` the pod `ip:port` of the last try (the ClusterIP after a fallback). `dst` stays the original destination. Absent on relayed connections. |
 | `route`, `rule` | Mesh-routed requests (HTTP) that a rule of an `HTTPRoute` matched ([Mesh](Mesh#routes)): `route` is `<namespace>/<name>` and `rule` the index of the rule in it, 0 first. Absent otherwise. `backend` is then the backend Service port the draw chose, and absent on a `no-route`, `no-backend` or `invalid-backend` answer. |
 | `mirrored` | Mesh-routed requests with a `RequestMirror` ([Mesh](Mesh#mirroring)): `true` when at least one copy of the request was sent or failed (`sent` or `error` in `mimic_mesh_mirrored_total`), read when the line is written. A copy skipped, not drawn, or still waiting for the end of the body does not count. Absent otherwise. |
-| `reason` | Mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, ...; [Mesh](Mesh#circuit-breaker)). Absent otherwise, also for a trusted refusal passed to the app as received. A `breaker-open` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts`, and its `duration_ms` is the time to answer, about a millisecond. |
+| `reason` | Mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, `fault-injected`, ...; [Mesh](Mesh#circuit-breaker), [Mesh](Mesh#fault-injection)). Absent otherwise, also for a trusted refusal passed to the app as received, and for a `fault-injected` answer that came from a pod. A `breaker-open` or `fault-injected` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts`, and its `duration_ms` is the time to answer, about a millisecond. |
+| `fault` | Mesh-routed requests a fault of the backend Service's policy was injected into ([Mesh](Mesh#fault-injection)): `abort` (the line has the configured `status` and `reason: fault-injected`, no `upstream`, no `attempts`) or `delay` (the line is otherwise the request's own: `upstream`, `attempts`, and a `duration_ms` and `head_ms` that include the delay; `result: timeout`, `timeout: request` and no `upstream` nor `attempts` when a route `request` timeout expired during the delay). Absent when no fault matched, or one matched and was not drawn. |
+| `fault_delay_ms` | With `fault` `delay` only: the delay injected, in milliseconds (the fault's `fixed`). |
 | `attempts` | Mesh-routed requests: the number of tries (1 without a retry, at most 4, see [Mesh](Mesh#retries)). L4-balanced connections: the number of connects tried. Absent on relayed connections. |
 | `tls` | `true` when the exchange was decrypted by TLS interception. Absent otherwise. |
 | `interception` | Connection only, outbound TLS only: why the connection was not intercepted (a decision other than `intercepted`, which writes exchange lines instead). |
@@ -144,6 +146,12 @@ Load-marked requests (a load test run sent them; the run is named by its uid):
 
 ```bash
 $LOGS | jq -c 'select(.load_run != null) | {load_run, direction, authority, path, status, duration_ms}'
+```
+
+Faulted calls (mesh fault injection, outbound), with the fault and how the call ended:
+
+```bash
+$LOGS | jq -c 'select(.fault != null) | {authority, backend, path, status, reason, fault, fault_delay_ms, result, duration_ms}'
 ```
 
 Connections that were not decrypted, with why and how they ended:

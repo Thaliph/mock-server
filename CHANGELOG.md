@@ -21,6 +21,18 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Fault injection in the sidecar (#452, M4): `faults` on a `MimicConfig` that targets a Service (at most 16, each
+  with an optional `match`, one Gateway API `HTTPRouteMatch`, and `abort` (`percent`, `status` 200 to 599) and/or
+  `delay` (`percent`, `fixed` 1 ms to 60 s)). Every injected caller's sidecar applies the faults of the drawn
+  backend Service to its mesh-routed requests: the first fault whose `match` holds, in the config's order, with the
+  abort and the delay drawn independently and an abort winning. An abort is answered at once with the configured
+  status and `x-mimic-error: fault-injected`, without any try, breaker slot, retry budget, mirror, outlier outcome
+  or record; a delay is waited inside the breaker slot, before the first try, and counts against the route's
+  `request` timeout, never `backendRequest`. Mocked calls, L4 connections, `Upgrade`, `CONNECT`, mirror copies,
+  stale views, inbound traffic and passthrough connections accepted in mode `mock` (#549) are never faulted. New
+  metric `mimic_mesh_faults_total{service,kind}`, `reason="fault-injected"` in `mimic_mesh_requests_total`, access
+  fields `fault` and `fault_delay_ms`. See Fault injection and its resilience-test recipe in the wiki page Mesh.
+
 - Outlier detection and circuit breaker in the sidecar (#451, M4): `outlierDetection` (`consecutiveFailures` 5,
   `consecutive5xx` 0 = off, `baseEjectionTime` 30 s, `maxEjectionPercent` 50) and `circuitBreaker`
   (`maxRequests` 1024, `maxConnections` 1024) on a `MimicConfig` that targets a Service. A pod whose connects

@@ -120,6 +120,18 @@ make its callers retry. Buffers are bounded: `MIMIC_MESH_RETRY_BUFFER` per reque
 for all requests, the inbound held head 64 KiB, a discarded refusal body 64 KiB. No header value reaches a
 metric label or a log field. See [Mesh](Mesh#retries).
 
+**Fault injection.** The `faults` of a Service's `MimicConfig` make every injected caller's sidecar abort or delay
+its calls to that Service, by design: only whoever may write `mimicconfigs` in the Service's namespace (or in a
+destination namespace that gave the `ReferenceGrant`) can do it, and `targetRefs` cannot leave the namespace. An
+abort is answered by the caller's sidecar and never reaches a pod; it names no pod (no `x-mimic-endpoint`), so no
+sidecar trusts it, and a `fault-injected` answer that comes from a pod is an app answer, never retried, removed by
+a meshed callee's sidecar. Faults give outlier detection no outcome, so they cannot eject a pod. A delay lasts at
+most 60 s and holds the request head, one breaker slot, one timer and the app's connection or stream, no body
+byte; the delays held at once per caller pod are bounded by the Service's `maxRequests` and the app's own
+connections. No metric label or access field of faults carries a path, a header or query value or a body byte. The
+decision (`mimic-core` `mesh::fault`) has no clock, no I/O and no random source of its own: the two draws are
+passed in. See [Mesh](Mesh#fault-injection).
+
 ## Network
 
 - **Webhook (8443):** open to any source by default, because the API server's address depends on the
@@ -158,6 +170,9 @@ The main ones (full list: [the spec](https://github.com/Thaliph/mock-server/blob
 - A user who can create pods can fill the per-namespace share of Valkey (`MIMIC_STORE_MAX_DEPLOYMENTS`);
   once Valkey is full, pushes of every namespace get `503`.
 - A pod killed without `SIGTERM` loses its unshipped report.
+- Whoever may write `mimicconfigs` in a Service's namespace can abort or delay every injected caller's calls to it;
+  a caller cannot opt out of one Service's faults, only turn its whole mesh off. An HTTP/1 caller that leaves a
+  delayed request with a body keeps its slot until the delay ends (at most 60 s).
 - TLS: the first connection of a client that pins or ships its own roots fails; ECH, STARTTLS and
   TLS-in-`CONNECT` are not intercepted. See [TLS interception](TLS-interception).
 - `exec` probes are left as they are; while the sidecar restarts, rewritten app probes can fail.

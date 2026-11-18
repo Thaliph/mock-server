@@ -6,6 +6,12 @@
 > delivers it, and the spec stays the source of truth. The product decisions recorded on
 > 2026-11-12 are final and are not discussed here; where this document makes a technical
 > choice, it says why the alternatives lost.
+>
+> **What was delivered**: one retro page per milestone, with the decisions taken on the issues
+> and diagrams drawn from the code, in [`mesh/`](mesh/README.md): [M0 mode `none`](mesh/m0-mode-none.md),
+> [M1 the view](mesh/m1-view.md), [M2 retries](mesh/m2-retries.md),
+> [M3 routes, timeouts, mirrors](mesh/m3-routes.md), [M4 outlier detection and circuit
+> breaker](mesh/m4-outlier-breaker.md).
 
 ## Contents
 
@@ -814,6 +820,8 @@ kind e2e installs with it once.
   `attempts`).
 
 ## 18. Milestones and dependency graph
+
+The delivered milestones are described as built in [`mesh/`](mesh/README.md).
 
 | Milestone | Content | Issues (drafts) |
 |---|---|---|
