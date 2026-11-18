@@ -885,7 +885,7 @@ impl Serving {
             if !drawn.has_endpoints() {
                 return Ok(self.no_endpoint(tracker, route, backend, began));
             }
-            router.metrics.fault(&drawn.service, "delay");
+            router.metrics.fault(backend, "delay");
             tracker.backend(backend);
             tracker.fault(fault::Kind::Delay { ms });
             if let Err(kind) = self.delay(ms, bounds).await {
@@ -1159,7 +1159,7 @@ impl Serving {
         // The view holds statuses 200 to 599 only.
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
         self.count(route, &backend.label, status, FAULT_INJECTED, began);
-        self.mesh.router().metrics.fault(&backend.service, "abort");
+        self.mesh.router().metrics.fault(&backend.label, "abort");
         tracker.backend(&backend.label);
         tracker.fault(fault::Kind::Abort {
             status: status.as_u16(),

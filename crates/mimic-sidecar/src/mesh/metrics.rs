@@ -54,6 +54,11 @@ pub(crate) const FAULT_KINDS: [&str; 2] = ["abort", "delay"];
 /// Every `status_class` value, to remove the series of an evicted endpoint.
 const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "none"];
 
+/// `<namespace>/<name>` of a backend label `<namespace>/<name>:<port>`.
+fn service_of(backend: &str) -> &str {
+    backend.rsplit_once(':').map_or(backend, |(s, _)| s)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct RequestLabels {
     service: String,
@@ -398,12 +403,14 @@ impl MeshMetrics {
             .inc();
     }
 
-    /// A fault of `kind` (one of [`FAULT_KINDS`]) of the policy of `service` was injected.
-    pub(crate) fn fault(&self, service: &str, kind: &'static str) {
+    /// A fault of `kind` (one of [`FAULT_KINDS`]) of the policy of `backend`'s Service was
+    /// injected. Its series goes with the last port of the Service (`evict_backends`).
+    pub(crate) fn fault(&self, backend: &str, kind: &'static str) {
         debug_assert!(FAULT_KINDS.contains(&kind), "{kind}");
+        self.track(backend, None);
         self.faults
             .get_or_create(&FaultLabels {
-                service: service.to_string(),
+                service: service_of(backend).to_string(),
                 kind,
             })
             .inc();
@@ -568,6 +575,8 @@ impl MeshMetrics {
     /// Removes the per-Service series of the backends that left the view 5 minutes before `now`.
     fn evict_backends(&self, now: Instant) {
         let mut all = self.series.lock().unwrap_or_else(PoisonError::into_inner);
+        // The Services of the backends removed: their fault series go with their last port.
+        let mut gone = BTreeSet::new();
         all.retain(|backend, series| {
             let due = series
                 .left
@@ -575,8 +584,8 @@ impl MeshMetrics {
             if !due {
                 return true;
             }
-            // `<namespace>/<name>:<port>`.
-            let service = backend.rsplit_once(':').map_or(&**backend, |(s, _)| s);
+            let service = service_of(backend);
+            gone.insert(service.to_string());
             let mut services = BTreeSet::from([service.to_string()]);
             for (called, route, status_class, reason) in &series.requests {
                 services.insert(called.clone());
@@ -634,6 +643,17 @@ impl MeshMetrics {
             }
             false
         });
+        for service in gone {
+            if all.keys().any(|backend| service_of(backend) == service) {
+                continue;
+            }
+            for kind in FAULT_KINDS {
+                self.faults.remove(&FaultLabels {
+                    service: service.clone(),
+                    kind,
+                });
+            }
+        }
     }
 
     pub(crate) fn in_flight_gauge(&self, backend: &str, endpoint: &str) -> Gauge {

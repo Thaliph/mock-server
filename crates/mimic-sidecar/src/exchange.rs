@@ -550,7 +550,11 @@ impl Tracker {
                 port: self.ctx.dst.port(),
                 authority: self.named_authority.take(),
                 status,
-                head_ms: head.as_millis() as u64,
+                // The destination's latency: an injected delay is the sidecar's (spec §7.9
+                // "Discovery"); the access line keeps the latency the app saw.
+                head_ms: head
+                    .saturating_sub(Duration::from_millis(self.fault_delay_ms.unwrap_or(0)))
+                    .as_millis() as u64,
                 tunnel: false,
             },
         );

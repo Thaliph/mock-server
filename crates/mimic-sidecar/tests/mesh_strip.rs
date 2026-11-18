@@ -563,7 +563,7 @@ async fn flt_23_an_inbound_sidecar_never_aborts_the_requests_to_its_pod() {
     let app = app(reply, false).await;
     let state = meshed();
     state.hold(
-        view_services(&[Svc::new("shop/cart", "127.0.0.1", 80, &[app])
+        view_services(&[Svc::new("shop/cart", "127.0.0.1", app.port(), &[app])
             .faults(r#"[{"abort":{"percent":100,"status":503}}]"#)]),
         "\"1-a\"",
     );
