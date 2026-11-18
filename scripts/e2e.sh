@@ -112,6 +112,9 @@ cleanup() {
   if [[ -n ${CBR_32_CLEANUP:-} ]]; then
     kubectl delete namespace cbr-32 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${FLT_27_CLEANUP:-} ]]; then
+    kubectl delete namespace flt-27 flt-27-b --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n ${RTE_55_CLEANUP:-} ]]; then
     kubectl delete namespace rte-55 --ignore-not-found --wait=false >/dev/null 2>&1 || true
     [[ -z ${RTE_55_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -1085,6 +1088,12 @@ tls_line() {
 # tls_count <namespace> <pod> <jq boolean>: how many sidecar log lines match.
 tls_count() {
   kubectl -n "$1" logs "$2" -c mimic-sidecar | jq -R -r "fromjson? | select($3) | 1" | wc -l | tr -d ' '
+}
+# e2e_until <id> <timeout seconds> <description> <command...>: polls the command once a second, else fails "<id>: <description>".
+e2e_until() {
+  local id=$1 limit=$2 desc=$3; shift 3
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "$id: $desc"
 }
 # issue <name> <ca name> <dns name>: a server certificate for the name, signed by the CA in $WORK.
 issue() {
@@ -6244,11 +6253,7 @@ for d in good reset ok err slow client; do
 done
 cbr_32_client=$(kubectl -n cbr-32 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
 # cbr_32_until <timeout seconds> <description> <command...>: polls the command once a second.
-cbr_32_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "cbr_32: $desc"
-}
+cbr_32_until() { e2e_until cbr_32 "$@"; }
 cbr_32_view() { [[ $(rty_metric cbr-32 "$cbr_32_client" mimic_mesh_view_endpoints) == 8 ]]; }
 cbr_32_until 60 "the sidecar of client never held a view with the 8 endpoints of broken, five and slow" cbr_32_view
 # Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
@@ -6382,6 +6387,194 @@ cbr_32_until 60 "10 concurrent requests were not all 200 within 60 s of the Mimi
 kubectl delete namespace cbr-32 --wait=false >/dev/null
 CBR_32_CLEANUP=
 echo "cbr_32: maxRequests: 2 answered 2 of 10 concurrent requests 200 and 8 503 breaker-open, and all 10 were 200 once the config was deleted"
+
+# --- Fault injection (#452, spec §12.28 FLT-27, FLT-28) ---------------------------------------------------------------------
+# Objects of this section only: flt-27 (injected: client, which calls; cart, a Service of 2 pods counting the requests they
+# receive) and flt-27-b (not injected, no pod: a MimicConfig naming a Service cart it does not have). The pods run the
+# script of cbr_32. The milliseconds are measured inside the client pod, one kubectl exec per batch.
+log "flt_27: a MimicConfig on cart aborts /fail with 503, then delays every request 500 ms, then stops once deleted"
+[[ -s $WORK/cbr32-pod.py ]] || fail "flt_27: the pod script of cbr_32 is missing"
+FLT_27_CLEANUP=1
+ns_fresh flt-27 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+ns_fresh flt-27-b
+kubectl -n flt-27 create configmap pod --from-file=pod.py="$WORK/cbr32-pod.py" >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cart, namespace: flt-27}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: cart}}
+  template:
+    metadata: {labels: {app: cart}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, /srv/pod.py]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /__count, port: 8080}, periodSeconds: 1}
+          volumeMounts: [{name: srv, mountPath: /srv}]
+      volumes: [{name: srv, configMap: {name: pod}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: cart, namespace: flt-27}
+spec:
+  selector: {app: cart}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: flt-27}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for d in cart client; do
+  kubectl -n flt-27 rollout status deploy/$d --timeout=3m >/dev/null || fail "flt_27: $d did not roll out Ready"
+done
+flt_27_client=$(kubectl -n flt-27 get pods -l app=client -o jsonpath='{.items[0].metadata.name}') \
+  || fail "flt_27: cannot find the client pod"
+flt_27_view() { [[ $(rty_metric flt-27 "$flt_27_client" mimic_mesh_view_endpoints) == 2 ]]; }
+e2e_until flt_27 60 "the sidecar of client never held a view with the 2 endpoints of cart" flt_27_view
+cat > "$WORK/flt27-client.py" <<'PY'
+import http.client
+import sys
+import time
+
+host, path, total = sys.argv[1], sys.argv[2], int(sys.argv[3])
+for _ in range(total):
+    try:
+        c = http.client.HTTPConnection(host, 80, timeout=10)
+        began = time.monotonic()
+        c.request("GET", path)
+        r = c.getresponse()
+        ms = int((time.monotonic() - began) * 1000)
+        r.read()
+        c.close()
+        print(r.status, r.getheader("x-mimic-error") or "-", ms)
+    except Exception:
+        print(0, "-", 0)
+PY
+kubectl -n flt-27 exec -i "$flt_27_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/flt27-client.py" || fail "flt_27: cannot copy the client script"
+# flt_27_run <path> <n>: the lines "<status> <x-mimic-error or -> <ms>" of n sequential GETs from client to cart.
+flt_27_run() { kubectl -n flt-27 exec "$flt_27_client" -c app -- python3 /tmp/client.py cart.flt-27.svc "$1" "$2"; }
+# flt_27_n <output> <status> <error>: how many lines of the output have that status and x-mimic-error.
+flt_27_n() { awk -v s="$2" -v e="$3" '$1 == s && $2 == e { n++ } END { print n + 0 }' <<<"$1"; }
+# flt_27_ms <output> min|max: the least or the most milliseconds of the output.
+flt_27_ms() {
+  awk -v w="$2" 'NR == 1 || (w == "min" && $3 < m) || (w == "max" && $3 > m) { m = $3 } END { print m + 0 }' <<<"$1"
+}
+# flt_27_applied: the mesh view applied lines of the client's sidecar so far.
+flt_27_applied() { tls_count flt-27 "$flt_27_client" '.message == "mesh view applied"'; }
+# flt_27_grew <count>: whether the client's sidecar applied a view since the count was taken.
+flt_27_grew() { (( $(flt_27_applied) > $1 )); }
+# flt_27_condition <namespace> <name>: "<status>/<reason>" of the Accepted condition of a MimicConfig.
+flt_27_condition() {
+  kubectl -n "$1" get mimicconfig "$2" \
+    -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}/{.status.conditions[?(@.type=="Accepted")].reason}'
+}
+# flt_27_is <namespace> <name> <status/reason>: whether the Accepted condition is that, else the one seen on stderr.
+flt_27_is() {
+  local seen
+  seen=$(flt_27_condition "$1" "$2") || seen="unreadable"
+  [[ $seen == "$3" ]] && return 0
+  echo "flt_27: $1/$2 Accepted is $seen, $3 awaited" >&2
+  return 1
+}
+# flt_27_config <namespace> <name> <faults> [targetRefs]: a MimicConfig on the Service cart with these faults.
+flt_27_config() {
+  local refs='{group: "", kind: Service, name: cart}'
+  [[ -z ${4:-} ]] || refs=$4
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: $2, namespace: $1}
+spec:
+  targetRefs: [$refs]
+  faults: $3
+YAML
+}
+flt_27_abort='[{match: {path: {type: PathPrefix, value: /fail}}, abort: {percent: 100, status: 503}}]'
+flt_27_delay='[{delay: {percent: 100, fixed: 500ms}}]'
+
+# FLT-28: the same faults from another namespace, on a Service cart that does not exist there, change nothing.
+flt_27_config flt-27-b foreign "$flt_27_abort" || fail "flt_28: the MimicConfig foreign was rejected"
+e2e_until flt_28 30 "the MimicConfig foreign is not Accepted: False TargetNotFound" \
+  flt_27_is flt-27-b foreign False/TargetNotFound
+if flt_27_config flt-27-b foreign-ns "$flt_27_abort" '{group: "", kind: Service, name: cart, namespace: flt-27}' 2>/dev/null; then
+  fail "flt_28: a targetRefs item with a namespace key was accepted"
+fi
+if flt_27_seen=$(kubectl -n flt-27-b get mimicconfig foreign-ns 2>&1); then
+  fail "flt_28: the MimicConfig foreign-ns exists: $flt_27_seen"
+fi
+found NotFound <<<"$flt_27_seen" || fail "flt_28: get mimicconfig foreign-ns did not say NotFound: $flt_27_seen"
+flt_27_out=$(flt_27_run /fail 20) || fail "flt_28: the client script failed"
+(( $(flt_27_n "$flt_27_out" 200 -) == 20 )) || fail "flt_28: 20 GET /fail were not all 200 with the foreign config: $flt_27_out"
+flt_27_lines=$(tls_count flt-27 "$flt_27_client" '.target == "access" and .fault != null')
+(( flt_27_lines == 0 )) || fail "flt_28: the sidecar of client wrote $flt_27_lines access lines with a fault field"
+echo "flt_28: a config in another namespace was TargetNotFound and left the calls 200, a namespace key was refused"
+
+# FLT-27, the abort: from the first view applied after the config, every /fail is answered by the client's sidecar.
+flt_27_before=$(flt_27_applied) || fail "flt_27: cannot read the logs of the client's sidecar"
+flt_27_config flt-27 cart-faults "$flt_27_abort" || fail "flt_27: the MimicConfig cart-faults (abort) was rejected"
+e2e_until flt_27 30 "the MimicConfig cart-faults is not Accepted: True" flt_27_is flt-27 cart-faults True/Accepted
+e2e_until flt_27 60 "no mesh view applied line on the sidecar of client after the abort config" flt_27_grew "$flt_27_before"
+flt_27_count=$(rty_count flt-27 cart) || fail "flt_27: cannot read the count of cart"
+flt_27_out=$(flt_27_run /fail 20) || fail "flt_27: the client script failed on /fail"
+(( $(flt_27_n "$flt_27_out" 503 fault-injected) == 20 )) || fail "flt_27: 20 GET /fail were not all 503 fault-injected: $flt_27_out"
+flt_27_after=$(rty_count flt-27 cart) || fail "flt_27: cannot read the count of cart"
+(( flt_27_after == flt_27_count )) || fail "flt_27: the pods of cart counted $((flt_27_after - flt_27_count)) of the aborted requests"
+flt_27_out=$(flt_27_run /ok 20) || fail "flt_27: the client script failed on /ok"
+(( $(flt_27_n "$flt_27_out" 200 -) == 20 )) || fail "flt_27: 20 GET /ok were not all 200 with the abort on /fail: $flt_27_out"
+flt_27_count=$(rty_count flt-27 cart) || fail "flt_27: cannot read the count of cart"
+(( flt_27_count == flt_27_after + 20 )) || fail "flt_27: the pods of cart counted $((flt_27_count - flt_27_after)) of the 20 GET /ok"
+echo "flt_27: 20 GET /fail were 503 fault-injected without reaching cart, 20 GET /ok reached it"
+
+# The delay: the same config changed to 500 ms on every request.
+flt_27_before=$(flt_27_applied) || fail "flt_27: cannot read the logs of the client's sidecar"
+flt_27_config flt-27 cart-faults "$flt_27_delay" || fail "flt_27: the MimicConfig cart-faults (delay) was rejected"
+e2e_until flt_27 60 "no mesh view applied line on the sidecar of client after the delay config" flt_27_grew "$flt_27_before"
+flt_27_out=$(flt_27_run /fail 10) || fail "flt_27: the client script failed on /fail"
+flt_27_ok=$(flt_27_run /ok 10) || fail "flt_27: the client script failed on /ok"
+flt_27_out=$(printf '%s\n%s\n' "$flt_27_out" "$flt_27_ok")
+(( $(flt_27_n "$flt_27_out" 200 -) == 20 )) || fail "flt_27: 20 GET with the delay were not all 200: $flt_27_out"
+flt_27_min=$(flt_27_ms "$flt_27_out" min)
+(( flt_27_min >= 500 )) || fail "flt_27: a GET with the 500ms delay took $flt_27_min ms: $flt_27_out"
+
+# The counts, read before the polls below can add to them.
+flt_27_aborts=$(rty_metric_sum flt-27 "$flt_27_client" mimic_mesh_faults_total 'service="flt-27/cart",kind="abort"')
+flt_27_delays=$(rty_metric_sum flt-27 "$flt_27_client" mimic_mesh_faults_total 'service="flt-27/cart",kind="delay"')
+(( ${flt_27_aborts%.*} == 20 )) || fail "flt_27: mimic_mesh_faults_total{kind=\"abort\"} is $flt_27_aborts, 20 expected"
+(( ${flt_27_delays%.*} == 20 )) || fail "flt_27: mimic_mesh_faults_total{kind=\"delay\"} is $flt_27_delays, 20 expected"
+
+# The config deleted: once the view carries that, the requests are 200 and fast.
+flt_27_before=$(flt_27_applied) || fail "flt_27: cannot read the logs of the client's sidecar"
+kubectl -n flt-27 delete mimicconfig cart-faults >/dev/null || fail "flt_27: cannot delete the MimicConfig cart-faults"
+e2e_until flt_27 60 "no mesh view applied line on the sidecar of client after the delete" flt_27_grew "$flt_27_before"
+flt_27_fast() {
+  local out ok max
+  out=$(flt_27_run /fail 20) || return 1
+  ok=$(flt_27_n "$out" 200 -)
+  max=$(flt_27_ms "$out" max)
+  (( ok == 20 && max < 500 )) && return 0
+  echo "flt_27: after the delete, $ok of 20 GET /fail were 200 - and the slowest took $max ms: $(tr '\n' ' ' <<<"$out")" >&2
+  return 1
+}
+e2e_until flt_27 30 "20 GET /fail were not all 200 under 500 ms within 30 s of the config being deleted" flt_27_fast
+
+kubectl delete namespace flt-27 flt-27-b --wait=false >/dev/null
+FLT_27_CLEANUP=
+echo "flt_27: the config aborted 20 /fail ($flt_27_aborts aborts), delayed 20 requests at least $flt_27_min ms ($flt_27_delays delays), and none once deleted"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
