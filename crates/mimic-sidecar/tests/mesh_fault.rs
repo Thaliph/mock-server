@@ -353,6 +353,81 @@ async fn flt_31_http1_an_abort_with_its_body_unread_closes_the_connection() {
 }
 
 #[tokio::test]
+async fn flt_31_a_routed_http1_abort_with_its_body_unread_closes_the_connection() {
+    let _logs = capture_logs();
+    let pod = Pod::http1("pod", 0).await;
+    let routes = route(&[(EVERY_PATH, &[backend("shop/cart", 1)], "")]);
+    let cart = Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr])
+        .faults(CHECKOUT)
+        .routes(&routes);
+    let state = state(&[cart]);
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(
+            format!(
+                "POST /checkout HTTP/1.1\r\nHost: cart.shop.svc:80\r\ncontent-length: 10240\r\n\r\n{}",
+                "x".repeat(1024)
+            )
+            .as_bytes(),
+        )
+        .await;
+    let (head, _) = client.read().await.expect("the abort");
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert!(
+        lower(&head).contains("x-mimic-error: fault-injected"),
+        "{head}"
+    );
+    assert!(lower(&head).contains("connection: close"), "{head}");
+    assert!(client.read().await.is_none(), "the connection is closed");
+    assert_eq!(pod.counts.accepted(), 0);
+}
+
+/// The values the sidecar drew between two states of its random source (each draw adds the
+/// SplitMix64 increment).
+fn draws(from: u64, to: u64) -> u64 {
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    // The inverse of the (odd) increment modulo 2^64, by Newton's iteration.
+    let mut inverse = GOLDEN;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(GOLDEN.wrapping_mul(inverse)));
+    }
+    to.wrapping_sub(from).wrapping_mul(inverse)
+}
+
+/// The values drawn for 10 `GET /` to `shop/cart` with these faults, routed when `routed`
+/// (the decision is then asked even without faults).
+async fn draws_of(routed: bool, faults: &str) -> u64 {
+    let pods = [Pod::http1("a", 0).await, Pod::http1("b", 0).await];
+    let mut cart =
+        Svc::new("shop/cart", "127.0.0.1", 80, &[pods[0].addr, pods[1].addr]).faults(faults);
+    if routed {
+        cart = cart.routes(&route(&[(EVERY_PATH, &[backend("shop/cart", 1)], "")]));
+    }
+    let state = state(&[cart]);
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let before = state.random_state_for_test();
+    for _ in 0..10 {
+        let (head, _) = client.get("/").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    }
+    draws(before, state.random_state_for_test())
+}
+
+#[tokio::test]
+async fn flt_14_a_service_without_faults_draws_no_random_value() {
+    let _logs = capture_logs();
+    for routed in [false, true] {
+        let without = draws_of(routed, "[]").await;
+        // A fault that never holds still takes the decision's two values.
+        let never = draws_of(routed, &format!("[{}]", abort_on("/never", 100, 503))).await;
+        assert!(without < 1000, "{without}");
+        assert_eq!(never - without, 20, "routed {routed}: two values a request");
+    }
+}
+
+#[tokio::test]
 async fn flt_31_h2c_an_abort_of_a_stream_still_sending_is_reset_no_error() {
     let _logs = capture_logs();
     let pod = Pod::h2c("pod", 0, None).await;

@@ -683,6 +683,11 @@ impl Router {
         ((u128::from(self.random()) * n as u128) >> 64) as usize
     }
 
+    /// The SplitMix64 state now: each draw adds its increment (test hook).
+    pub(crate) fn random_state(&self) -> u64 {
+        self.seed.load(Ordering::Relaxed)
+    }
+
     /// A uniform 64-bit value (SplitMix64).
     pub(crate) fn random(&self) -> u64 {
         let mut z = self

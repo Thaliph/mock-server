@@ -745,6 +745,13 @@ impl MeshState {
         self.0.router.window_requests(key)
     }
 
+    /// Test hook (#452): the state of the sidecar's random source; each value drawn adds
+    /// `0x9E37_79B9_7F4A_7C15` to it.
+    #[doc(hidden)]
+    pub fn random_state_for_test(&self) -> u64 {
+        self.0.router.random_state()
+    }
+
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
     pub(crate) fn off(&self) -> bool {
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);

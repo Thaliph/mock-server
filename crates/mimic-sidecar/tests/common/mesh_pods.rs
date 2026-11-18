@@ -27,6 +27,8 @@ pub struct Counts {
     pub in_flight: Arc<AtomicUsize>,
     /// How long each request is held before it is answered, in milliseconds.
     pub delay_ms: Arc<AtomicU64>,
+    /// When each request arrived, in order.
+    pub arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
 }
 
 impl Counts {
@@ -40,6 +42,10 @@ impl Counts {
 
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
+    }
+
+    pub fn arrivals(&self) -> Vec<std::time::Instant> {
+        self.arrivals.lock().unwrap().clone()
     }
 }
 
@@ -61,6 +67,11 @@ async fn answer(
     counts: Counts,
     _req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    counts
+        .arrivals
+        .lock()
+        .unwrap()
+        .push(std::time::Instant::now());
     counts.requests.fetch_add(1, Ordering::SeqCst);
     counts.in_flight.fetch_add(1, Ordering::SeqCst);
     let delay = counts.delay_ms.load(Ordering::SeqCst);
