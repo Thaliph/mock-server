@@ -26,6 +26,8 @@ pub struct Counts {
     pub open: Arc<AtomicUsize>,
     /// Requests being served now.
     pub in_flight: Arc<AtomicUsize>,
+    /// The most requests served at once.
+    pub max_in_flight: Arc<AtomicUsize>,
     /// How long each request is held before it is answered, in milliseconds.
     pub delay_ms: Arc<AtomicU64>,
     /// When each request arrived, in order.
@@ -74,7 +76,8 @@ async fn answer(
         .unwrap()
         .push(std::time::Instant::now());
     counts.requests.fetch_add(1, Ordering::SeqCst);
-    counts.in_flight.fetch_add(1, Ordering::SeqCst);
+    let now = counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    counts.max_in_flight.fetch_max(now, Ordering::SeqCst);
     let delay = counts.delay_ms.load(Ordering::SeqCst);
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;

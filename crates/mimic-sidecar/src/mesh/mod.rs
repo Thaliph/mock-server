@@ -3,6 +3,7 @@
 //! the view, the persisted last view, the classification of outbound connections, and the
 //! balancing of the in-scope cleartext HTTP ones over the pods of the view (spec §7.9).
 
+mod admit;
 mod dial;
 mod follow;
 mod gate;
@@ -36,6 +37,7 @@ use prometheus_client::registry::Unit;
 use crate::discovery::Target;
 use router::Router;
 
+pub(crate) use admit::{Admitter, Slot};
 pub use follow::Follower;
 pub use replay::{Replay, ReplayBudget};
 pub(crate) use router::Backend;
@@ -439,6 +441,8 @@ struct Inner {
     pod: Option<String>,
     /// Set once a view is held: readiness stays.
     seen: AtomicBool,
+    /// The pod's admission contract, from the view held (spec §4.1 "Admission contract").
+    admitter: Admitter,
 }
 
 /// The view held by the sidecar, shared between the client, the listeners and the probes.
@@ -502,6 +506,7 @@ impl MeshState {
                 },
             ),
             seen: AtomicBool::new(false),
+            admitter: Admitter::new(),
         }))
     }
 
@@ -779,10 +784,27 @@ impl MeshState {
     /// the `x-mimic-origin` value to write, and the count.
     pub(crate) fn inbound_refusal(&self) -> String {
         self.0.router.metrics.inbound_refusal();
+        self.origin()
+    }
+
+    /// The `x-mimic-origin` value of an answer the inbound side writes itself (spec §4.1); it
+    /// counts nothing.
+    pub(crate) fn origin(&self) -> String {
         match &self.0.pod {
             Some(pod) => format!("inbound; pod={pod}"),
             None => "inbound".to_string(),
         }
+    }
+
+    /// The admission state of the pod's inbound requests (spec §4.1 "Admission contract").
+    pub(crate) fn admitter(&self) -> &Admitter {
+        &self.0.admitter
+    }
+
+    /// Test hook (#453): the admission counts now.
+    #[doc(hidden)]
+    pub fn admission_counts_for_test(&self) -> mimic_core::mesh::admission::Counts {
+        self.0.admitter.counts()
     }
 
     /// `n` `x-mimic-*` fields were removed from a response of the app.

@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
+use crate::load::Body;
 use crate::mesh::MeshState;
 use crate::transport::Stream;
 
@@ -30,6 +31,18 @@ const DRAIN_BYTES: usize = 64 * 1024;
 const DRAIN_TIME: Duration = Duration::from_secs(1);
 /// The most an `h2c` connection is served.
 const H2_TIME: Duration = Duration::from_secs(5);
+
+/// The head of a refusal the inbound side writes itself (spec §4.1): the status line, then
+/// exactly `x-mimic-error`, `x-mimic-endpoint`, `x-mimic-origin`, `content-length: 0`, and
+/// `connection: close` when `close`.
+pub(crate) fn http1_head(_error: &str, _dst: SocketAddr, _origin: &str, _close: bool) -> String {
+    todo!()
+}
+
+/// The same answer on h2: `:status` 503, the four fields in that order, an empty body.
+pub(crate) fn h2_response(_error: &str, _dst: SocketAddr, _origin: &str) -> Response<Body> {
+    todo!()
+}
 
 /// Answers `client` if it speaks cleartext HTTP/1 (once its head is whole) or `h2c`; anything
 /// else is closed without a byte, as before. `stall` bounds the wait for the caller's bytes.
@@ -138,5 +151,42 @@ async fn serve_h2(
         _ = served.as_mut() => {}
         () = &mut end => {}
         () = &mut abort => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper::body::Body as _;
+
+    use super::{h2_response, http1_head};
+
+    #[test]
+    fn adm_16_the_refusal_fields_are_exact_on_both_protocols() {
+        let dst = "[::1]:8080".parse().unwrap();
+        assert_eq!(
+            http1_head("queue-timeout", dst, "inbound; pod=p", true),
+            "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: queue-timeout\r\nx-mimic-endpoint: [::1]:8080\r\nx-mimic-origin: inbound; pod=p\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            http1_head("queue-timeout", dst, "inbound; pod=p", false),
+            "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: queue-timeout\r\nx-mimic-endpoint: [::1]:8080\r\nx-mimic-origin: inbound; pod=p\r\ncontent-length: 0\r\n\r\n"
+        );
+        let response = h2_response("overloaded", "10.0.0.9:8080".parse().unwrap(), "inbound");
+        assert_eq!(response.status(), 503);
+        let fields: Vec<(&str, &str)> = response
+            .headers()
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("x-mimic-error", "overloaded"),
+                ("x-mimic-endpoint", "10.0.0.9:8080"),
+                ("x-mimic-origin", "inbound"),
+                ("content-length", "0"),
+            ]
+        );
+        assert!(response.body().is_end_stream());
     }
 }

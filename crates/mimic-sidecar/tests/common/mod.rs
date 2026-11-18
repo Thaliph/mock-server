@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod admission;
 pub mod faults;
 pub mod mesh_pods;
 pub mod mock_rig;
@@ -129,6 +130,18 @@ pub async fn fixture_mesh_dst(
     state: &mimic_sidecar::mesh::MeshState,
     discovery: Option<&mimic_sidecar::discovery::Discovery>,
 ) -> Fixture {
+    fixture_mesh_on(Direction::Outbound, original_dst, state, discovery, |s| s).await
+}
+
+/// Like [`fixture_mesh_dst`], on the side `direction`, with `configure` applied to the shared
+/// state before the listener starts.
+pub async fn fixture_mesh_on(
+    direction: Direction,
+    original_dst: OriginalDst,
+    state: &mimic_sidecar::mesh::MeshState,
+    discovery: Option<&mimic_sidecar::discovery::Discovery>,
+    configure: impl FnOnce(Shared) -> Shared,
+) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
@@ -142,8 +155,8 @@ pub async fn fixture_mesh_dst(
         discovery.register(&mut metrics);
         shared = shared.with_discovery(discovery.tap());
     }
-    let shared = Arc::new(shared);
-    spawn_listener(listener, Direction::Outbound, shared.clone());
+    let shared = Arc::new(configure(shared));
+    spawn_listener(listener, direction, shared.clone());
     Fixture {
         addr,
         shared,
