@@ -823,6 +823,11 @@ async fn flt_24_a_forwarded_fault_injected_is_an_app_answer() {
         10.0
     );
     for line in logs.access_exactly(10).await {
-        assert!(absent(&line, "reason") && absent(&line, "fault"), "{line}");
+        assert!(
+            absent(&line, "reason") && absent(&line, "fault"),
+            "reason {}, fault {}",
+            line["reason"],
+            line["fault"]
+        );
     }
 }

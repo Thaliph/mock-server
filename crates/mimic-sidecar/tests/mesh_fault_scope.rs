@@ -100,12 +100,24 @@ async fn flt_22_the_first_fault_that_holds_decides_on_the_request_as_the_app_sen
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     let lines = logs.access_exactly(5).await;
     for (i, line) in lines[..2].iter().enumerate() {
-        assert_eq!(line["fault"], "abort", "request {i}: {line}");
+        assert_eq!(
+            line["fault"], "abort",
+            "request {i}: fault {}",
+            line["fault"]
+        );
     }
     for (i, want) in [(2, 50), (3, 10), (4, 10)] {
         let line = &lines[i];
-        assert_eq!(line["fault"], "delay", "request {i}: {line}");
-        assert_eq!(line["fault_delay_ms"], want, "request {i}: {line}");
+        assert_eq!(
+            line["fault"], "delay",
+            "request {i}: fault {}",
+            line["fault"]
+        );
+        assert_eq!(
+            line["fault_delay_ms"], want,
+            "request {i}: fault_delay_ms {}",
+            line["fault_delay_ms"]
+        );
     }
     let heads = heads(&pod.received());
     assert_eq!(heads.len(), 3, "{heads:?}");

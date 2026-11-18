@@ -205,7 +205,7 @@ async fn flt_15_the_abort_and_the_delay_are_drawn_from_their_own_values_in_order
         let path = format!("/r{i}");
         let line = lines.iter().find(|l| l["path"] == path).unwrap();
         let got = line["fault"].as_str().unwrap_or("none");
-        assert_eq!(got, *want, "request {i}: {line}");
+        assert_eq!(got, *want, "request {i}: fault {got}");
     }
     let count = |k| expected.iter().filter(|w| **w == k).count();
     // 10 % aborts and 18 % delays (`20 × (1 − 0.1)`) of 500.
@@ -740,7 +740,10 @@ async fn flt_25_discovery_records_the_latency_without_the_delay() {
         );
     }
     let json = report.to_json().unwrap();
-    assert!(!json.contains("/abort"), "{json}");
+    assert!(
+        !json.contains("/abort"),
+        "the report holds the aborted path"
+    );
     let lines = logs.access_exactly(7).await;
     let delayed: Vec<&serde_json::Value> =
         lines.iter().filter(|l| l["path"] == "/users/1").collect();
