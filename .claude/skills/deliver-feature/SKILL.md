@@ -12,7 +12,7 @@ criterion IDs. Never paste the conversation into a brief.
 | Agent | Model (effort) | Used for |
 |---|---|---|
 | `architect` | Opus (high) | once per feature: criteria, design, threat model, steps |
-| `spec-writer` | Opus (high) | each step with Rust code: the step spec (contract, reuse, tests) |
+| `spec-writer` | Opus (high) | each step with Rust code: the step spec (contract, reuse, tests, Mermaid decision/workflow/sequence diagrams) |
 | `rust-dev` | Opus (high) | each Rust step, test-first, from the step spec |
 | `ops` | Sonnet (medium) | each CI / Dockerfile / Helm / kind step |
 | `code-critic` | Opus (high) | each PR, before the reviewer: duplication, layering, coherence |
