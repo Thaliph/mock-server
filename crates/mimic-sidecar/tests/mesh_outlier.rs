@@ -644,6 +644,57 @@ async fn cbr_22_copies_to_a_resetting_mirror_pod_eject_it_and_never_reach_it_aga
 }
 
 #[tokio::test]
+async fn flt_16_with_every_pod_ejected_a_drawn_delay_is_neither_waited_nor_counted() {
+    let logs = capture_logs();
+    let cluster = Pod::http1("cluster", 0).await;
+    let (x, y) = (
+        ModePod::start(Mode::Reset).await,
+        ModePod::start(Mode::Reset).await,
+    );
+    let delayed = r#"[{"delay":{"fixedMs":300,"percent":100},"match":{"path":{"type":"Exact","value":"/d"}}}]"#;
+    let cart = cart_on(cluster.addr, &[x.addr, y.addr])
+        .outlier(30, 0, 5, 100)
+        .faults(delayed);
+    let state = mesh_state(&[cart], |_| {});
+    let f = fixture_mesh(cluster.addr, &state, None).await;
+    let label = format!("shop/cart:{}", cluster.addr.port());
+    for _ in 0..30 {
+        let mut client = H1Client::connect(f.addr).await;
+        let _ = status_or_closed(&mut client).await;
+    }
+    let scrape = f.metrics.encode();
+    assert_eq!(ejected(&scrape, &label), 2.0, "{scrape}");
+    let mut client = H1Client::connect(f.addr).await;
+    let began = Instant::now();
+    let (head, _) = client.get("/d").await;
+    let took = began.elapsed();
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-mimic-error: breaker-open"),
+        "{head}"
+    );
+    assert!(took < Duration::from_millis(150), "{took:?}");
+    let scrape = f.metrics.encode();
+    assert!(
+        !scrape
+            .lines()
+            .any(|l| l.starts_with("mimic_mesh_faults_total{")),
+        "{scrape}"
+    );
+    logs.settled().await;
+    let line = logs
+        .access()
+        .into_iter()
+        .find(|l| l["path"] == "/d")
+        .expect("the access line of /d");
+    assert!(
+        line.get("fault").is_none_or(serde_json::Value::is_null),
+        "fault {}",
+        line["fault"]
+    );
+}
+
+#[tokio::test]
 async fn cbr_22_a_mirror_pod_answering_500_is_not_ejected_and_all_ejected_copies_are_errors() {
     let _logs = capture_logs();
     let primary = ModePod::start(Mode::Ok("primary")).await;
