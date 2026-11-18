@@ -29,7 +29,7 @@ pub fn drawn(r: u64, percent: u32) -> bool {
 
 /// The faults of a policy made once, when the view is built: their matches deduplicated and
 /// their header names looked up once per request (FLT-10). The sidecar keeps one per policy of
-/// its view; [`decide`] makes one per call.
+/// its view.
 pub struct Faults {
     matches: Matches,
     effects: Vec<(Option<FaultAbort>, Option<FaultDelay>)>,
@@ -70,8 +70,9 @@ impl Faults {
     }
 }
 
-/// [`Faults::decide`] over `faults` made for this one request.
-pub fn decide(
+/// [`Faults::decide`] over `faults` made for this one request (the tests' shorthand).
+#[cfg(test)]
+pub(crate) fn decide(
     faults: &[Fault],
     req: &RequestParts,
     r_abort: u64,

@@ -792,6 +792,8 @@ impl Serving {
         let mut permit: Option<Permit> = None;
         // The delay drawn, waited once the slot is taken (spec §7.9 "Fault injection").
         let mut delay_ms = None;
+        // An abort closes an HTTP/1 connection whose request body is not read whole.
+        let close = || http1 && !source.complete();
         if let (Some(routed), Some(parts)) = (&routed, &parts) {
             match self.select(routed, parts) {
                 Selected::Rule {
@@ -802,13 +804,18 @@ impl Serving {
                     route = &view.name;
                     tracker.matched(route, rule);
                     // An abort comes before the breaker's slot (spec §7.9 "Order").
-                    match self.fault_decision(&backend, parts).map(|d| d.kind) {
-                        Some(fault::Kind::Abort { status }) => {
-                            let close = http1 && !source.complete();
-                            return Ok(self.aborted(tracker, route, &backend, status, close, began));
+                    match self.fault_decision(&backend, parts) {
+                        Ok(ms) => delay_ms = ms,
+                        Err(status) => {
+                            return Ok(self.aborted(
+                                tracker,
+                                route,
+                                &backend,
+                                status,
+                                close(),
+                                began,
+                            ));
                         }
-                        Some(fault::Kind::Delay { ms }) => delay_ms = Some(ms),
-                        None => {}
                     }
                     match backend.admit(router) {
                         Ok(taken) => permit = Some(taken),
@@ -859,14 +866,12 @@ impl Serving {
         } else if !direct {
             let decided = parts
                 .as_ref()
-                .and_then(|parts| self.fault_decision(&drawn, parts));
-            match decided.map(|d| d.kind) {
-                Some(fault::Kind::Abort { status }) => {
-                    let close = http1 && !source.complete();
-                    return Ok(self.aborted(tracker, route, &drawn, status, close, began));
+                .map_or(Ok(None), |parts| self.fault_decision(&drawn, parts));
+            match decided {
+                Ok(ms) => delay_ms = ms,
+                Err(status) => {
+                    return Ok(self.aborted(tracker, route, &drawn, status, close(), began));
                 }
-                Some(fault::Kind::Delay { ms }) => delay_ms = Some(ms),
-                None => {}
             }
             match drawn.admit(router) {
                 Ok(taken) => permit = Some(taken),
@@ -1134,15 +1139,27 @@ impl Serving {
     }
 
     /// The fault of the request (spec §7.9 "Fault injection"), with the faults of the drawn
-    /// backend's policy: none at once when it has none, so that no random value is drawn; the
-    /// abort's value is drawn before the delay's.
-    fn fault_decision(&self, drawn: &Backend, parts: &RequestParts<'_>) -> Option<fault::Decision> {
+    /// backend's policy: `Ok` with the delay's milliseconds, if any, or `Err` with the abort's
+    /// status. None at once when it has none, so that no random value is drawn; the abort's value
+    /// is drawn before the delay's.
+    fn fault_decision(
+        &self,
+        drawn: &Backend,
+        parts: &RequestParts<'_>,
+    ) -> Result<Option<u64>, u16> {
         let faults = drawn.retry.faults();
         if faults.is_empty() {
-            return None;
+            return Ok(None);
         }
         let router = self.mesh.router();
-        faults.decide(parts, router.random(), router.random())
+        match faults
+            .decide(parts, router.random(), router.random())
+            .map(|d| d.kind)
+        {
+            Some(fault::Kind::Abort { status }) => Err(status),
+            Some(fault::Kind::Delay { ms }) => Ok(Some(ms)),
+            None => Ok(None),
+        }
     }
 
     /// An abort (spec §7.9 "Fault injection"): the configured `status` of `backend`, counted
