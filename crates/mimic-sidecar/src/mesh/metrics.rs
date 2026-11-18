@@ -860,4 +860,36 @@ mod tests {
             text(&metrics)
         );
     }
+
+    #[test]
+    fn flt_26_fault_series_live_as_long_as_a_port_of_their_service() {
+        let metrics = MeshMetrics::new(10);
+        for backend in ["shop/cart:80", "shop/cart:81", "shop/cart-v1:80"] {
+            metrics.backend_seen(backend);
+        }
+        metrics.fault("shop/cart:80", "abort");
+        metrics.fault("shop/cart:81", "delay");
+        metrics.fault("shop/cart-v1:80", "abort");
+        let abort = "mesh_faults_total{service=\"shop/cart\",kind=\"abort\"} 1";
+        let delay = "mesh_faults_total{service=\"shop/cart\",kind=\"delay\"} 1";
+        let other = "mesh_faults_total{service=\"shop/cart-v1\",kind=\"abort\"} 1";
+        let has = |line: &str| text(&metrics).lines().any(|l| l == line);
+        assert!(has(abort) && has(delay) && has(other), "{}", text(&metrics));
+        let now = Instant::now();
+        // One port left, another stays.
+        metrics.backend_left("shop/cart:80", now);
+        metrics.evict(now + EVICT_AFTER);
+        assert!(has(abort) && has(delay), "{}", text(&metrics));
+        // The last port left.
+        metrics.backend_left("shop/cart:81", now);
+        metrics.evict(now + EVICT_AFTER);
+        assert!(!has(abort) && !has(delay), "{}", text(&metrics));
+        assert!(has(other), "{}", text(&metrics));
+        // A count made after the Service left is evicted 5 minutes later.
+        metrics.fault("shop/cart:80", "abort");
+        assert!(has(abort), "{}", text(&metrics));
+        metrics.evict(Instant::now() + EVICT_AFTER);
+        assert!(!has(abort), "{}", text(&metrics));
+        assert!(has(other), "{}", text(&metrics));
+    }
 }

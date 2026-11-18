@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::faults::{abort_on, absent, no_series, status};
 use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, view_services};
 use common::{capture_logs, fixture_mesh, h2_client, median, metric, until};
 use http_body_util::{BodyExt, Empty};
@@ -34,13 +35,6 @@ fn state(services: &[Svc]) -> MeshState {
     });
     state.hold(view_services(services), "\"1-a\"");
     state
-}
-
-/// A fault matching `Exact path`, aborting `percent` % with `status`.
-fn abort_on(path: &str, percent: u32, status: u16) -> String {
-    format!(
-        r#"{{"abort":{{"percent":{percent},"status":{status}}},"match":{{"path":{{"type":"Exact","value":"{path}"}}}}}}"#
-    )
 }
 
 /// A backend of a rule.
@@ -77,10 +71,6 @@ fn lower(head: &str) -> String {
     head.to_ascii_lowercase()
 }
 
-fn status(head: &str) -> u16 {
-    head[9..12].parse().unwrap()
-}
-
 /// The answer of an abort (spec §7.9 "Fault injection"): `status`, exactly one
 /// `x-mimic-error: fault-injected`, `content-length: 0`, no pod named, no body, the connection
 /// kept.
@@ -93,15 +83,6 @@ fn assert_aborted(head: &str, body: &[u8], want: u16) {
     assert!(!head.contains("x-mimic-endpoint"), "{head}");
     assert!(!head.contains("connection:"), "kept: {head}");
     assert!(body.is_empty());
-}
-
-/// Whether the access line has no such field.
-fn absent(line: &serde_json::Value, field: &str) -> bool {
-    line.get(field).is_none_or(serde_json::Value::is_null)
-}
-
-fn no_series(scrape: &str, name: &str) -> bool {
-    !scrape.lines().any(|l| l.starts_with(name))
 }
 
 /// Reads one head (and nothing after it) from `stream`.

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod faults;
 pub mod mesh_pods;
 pub mod mock_rig;
 pub mod tls_rig;

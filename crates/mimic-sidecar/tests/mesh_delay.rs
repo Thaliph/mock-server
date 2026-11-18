@@ -10,10 +10,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use common::faults::{abort_on, absent, delay, no_series, status};
 use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, view_services};
 use common::{Logs, capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until};
 use http_body_util::{BodyExt, Empty};
+use mimic_core::discovery::histogram::bucket_index;
 use mimic_core::mesh::fault::drawn;
+use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -34,11 +37,6 @@ fn state_with(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> Mesh
     let state = MeshState::new(&config);
     state.hold(view_services(services), "\"1-a\"");
     state
-}
-
-/// A fault without `match` delaying `percent` % by `ms`.
-fn delay(percent: u32, ms: u64) -> String {
-    format!(r#"[{{"delay":{{"fixedMs":{ms},"percent":{percent}}}}}]"#)
 }
 
 /// `shop/cart` on the ClusterIP the app dials, its pods `pods`.
@@ -66,18 +64,6 @@ fn route(filters: &str, timeouts: &str) -> String {
 
 const MIRROR: &str =
     r#"{"mirrors":[{"denominator":100,"numerator":100,"port":80,"service":"shop/shadow"}]}"#;
-
-fn status(head: &str) -> u16 {
-    head[9..12].parse().unwrap()
-}
-
-fn absent(line: &serde_json::Value, field: &str) -> bool {
-    line.get(field).is_none_or(serde_json::Value::is_null)
-}
-
-fn no_series(scrape: &str, name: &str) -> bool {
-    !scrape.lines().any(|l| l.starts_with(name))
-}
 
 fn faults(f: &common::Fixture, kind: &str) -> f64 {
     metric(
@@ -753,4 +739,56 @@ async fn flt_32_a_delay_longer_than_the_grace_is_cut_at_its_end() {
     tokio::time::sleep((3300 * MS).saturating_sub(began.elapsed())).await;
     assert_eq!(pod.counts.requests(), 0);
     assert_eq!(pod.counts.in_flight.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn flt_25_discovery_records_the_latency_without_the_delay() {
+    let logs = capture_logs();
+    let pod = Pod::http1("pod", 10).await;
+    let faults = format!(
+        r#"[{},{{"delay":{{"fixedMs":300,"percent":100}}}}]"#,
+        abort_on("/abort", 100, 503)
+    );
+    let state = state(&[cart(&[pod.addr]).faults(&faults)]);
+    let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
+    let f = fixture_mesh(cluster_ip(), &state, Some(&discovery)).await;
+    let mut client = H1Client::connect(f.addr).await;
+    for _ in 0..2 {
+        let (head, _) = client.get("/abort").await;
+        assert_eq!(status(&head), 503, "{head}");
+    }
+    for _ in 0..5 {
+        let (head, body) = client.get("/users/1").await;
+        assert!(head.starts_with("HTTP/1.1 200") && body == "pod", "{head}");
+    }
+    until("the GETs are recorded", || {
+        discovery.report().exchanges() >= 5
+    })
+    .await;
+    let report = discovery.report();
+    assert_eq!(report.exchanges(), 5);
+    for endpoint in report.endpoints() {
+        let buckets: Vec<u8> = endpoint.stats.latency.buckets().keys().copied().collect();
+        assert!(
+            buckets.iter().all(|b| *b < bucket_index(100)),
+            "{buckets:?}"
+        );
+    }
+    let json = report.to_json().unwrap();
+    assert!(!json.contains("/abort"), "{json}");
+    let lines = logs.access_exactly(7).await;
+    let delayed: Vec<&serde_json::Value> =
+        lines.iter().filter(|l| l["path"] == "/users/1").collect();
+    assert_eq!(delayed.len(), 5);
+    for l in delayed {
+        assert_eq!(l["fault_delay_ms"], 300, "{l}");
+        assert!(l["head_ms"].as_u64().unwrap() >= 300, "{l}");
+    }
+    let scrape = f.metrics.encode();
+    assert!(
+        scrape.contains(
+            "mimic_discovery_exchanges_total{direction=\"outbound\",result=\"synthetic\"} 2"
+        ),
+        "{scrape}"
+    );
 }
