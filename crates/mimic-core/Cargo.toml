@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "mesh_route"
 harness = false
+
+[[bench]]
+name = "mesh_admission"
+harness = false

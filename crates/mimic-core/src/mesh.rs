@@ -1,7 +1,9 @@
 //! The mimic mesh, pure part (spec §7, §7.9; design `docs/design/mimic-mesh.md` §4.2, §6):
 //! the plain input structs the controller fills from its watches, the policy of `MimicConfig`s
-//! (precedence, validation, defaults) and the scoped view of a deployment.
+//! (precedence, validation, defaults), the scoped view of a deployment and the admission state
+//! of one pod.
 
+pub mod admission;
 pub mod fault;
 pub mod head;
 pub mod input;
@@ -19,6 +21,8 @@ pub mod view;
 mod testkit;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_admission;
 #[cfg(test)]
 mod tests_apply;
 #[cfg(test)]
