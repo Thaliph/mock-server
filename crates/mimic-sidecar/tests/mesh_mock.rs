@@ -10,8 +10,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::faults::{no_series, status};
 use common::mesh_pods::{H1Client, Pod, Svc, view_on, view_services};
-use common::metric;
 use common::mock_rig::{AUTHORITY, Options, Rig, rig_with, users_set};
+use common::{capture_logs, metric};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -243,6 +243,8 @@ fn faulted(cluster: SocketAddr, pod: SocketAddr) -> View {
 
 #[tokio::test]
 async fn flt_23_in_mode_mock_the_mock_answers_and_no_fault_is_counted() {
+    // Every test that drives the sidecar captures: see `capture_logs` (each rig captures too).
+    let _logs = capture_logs();
     let (pod, cluster) = (Pod::http1("pod", 0).await, Pod::http1("cluster", 0).await);
     let view = || faulted(cluster.addr, pod.addr);
     // Accepted in `mock`.
@@ -280,6 +282,8 @@ async fn flt_23_in_mode_mock_the_mock_answers_and_no_fault_is_counted() {
 
 #[tokio::test]
 async fn flt_23_a_passthrough_destination_on_a_mesh_routed_connection_is_aborted_in_mode_mock() {
+    // Every test that drives the sidecar captures: see `capture_logs` (the rig captures too).
+    let _logs = capture_logs();
     let (pod, cluster) = (Pod::http1("pod", 0).await, Pod::http1("cluster", 0).await);
     let view = faulted(cluster.addr, pod.addr);
     let (rig, _state) = mesh_rig_with(cluster.addr, view, "users.test", Mode::Discovery).await;

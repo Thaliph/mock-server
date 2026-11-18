@@ -380,7 +380,7 @@ async fn draws_of(routed: bool, faults: &str) -> u64 {
 }
 
 #[tokio::test]
-async fn flt_14_a_service_without_faults_draws_no_random_value() {
+async fn flt_08_the_sidecar_draws_two_values_a_decided_request_and_none_without_faults() {
     let _logs = capture_logs();
     for routed in [false, true] {
         let without = draws_of(routed, "[]").await;
