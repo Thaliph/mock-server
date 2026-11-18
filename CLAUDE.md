@@ -3,7 +3,8 @@
 - The spec is the source of truth: `docs/SPEC.md`. Any change of behaviour goes into the spec
   first, then tests, then code.
 - Features are delivered with the `deliver-feature` skill and the agents in `.claude/agents/`
-  (architect, rust-dev, reviewer, ops). One GitHub issue per feature.
+  (architect, spec-writer, rust-dev, ops, code-critic, reviewer,
+  ci-triage, security-auditor). One GitHub issue per feature.
 - TDD: tests named after the acceptance criterion IDs of `docs/SPEC.md` §12 (`fnd_02_…`) are
   written and seen failing before the implementation.
 - `mimic-core` stays pure: no tokio, no I/O, no clock. Process plumbing lives in
