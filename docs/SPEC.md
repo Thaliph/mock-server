@@ -3432,8 +3432,11 @@ no insignificant whitespace):
     the request's own after the delay (tries, budget, outlier outcomes, endpoint `in_flight`: a
     delayed request is in no pod's `in_flight` while it waits). On `SIGTERM` a delay in flight is
     not shortened: the grace bounds it like any slow request.
-  - **Not faulted**: requests the mock answers (passthrough destinations of mode `mock` are
-    mesh-routed and faulted like any), out-of-scope destinations (not in the view), a stale view
+  - **Not faulted**: requests the mock answers (a passthrough request on a mesh-routed
+    connection, accepted in `none` or `discovery` and then switched to `mock`, is faulted like
+    any; a passthrough connection accepted while in `mock` is on the byte relay, §8, because
+    mesh routing is decided when the connection is accepted, and is not faulted; §11.1),
+    out-of-scope destinations (not in the view), a stale view
     and `"mesh": false` (no policy applies), an `Upgrade` or a `CONNECT` request (not routed),
     L4-balanced connections (opaque TCP, TLS passed through: there is no request to answer;
     §11.1), inbound traffic and the copies of mirrors. Every mesh-routed request is faulted the
@@ -5104,6 +5107,15 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   in expectation (10 % of 10 000 requests is 1000 ± about 60 at 2σ), not an exact count per
   window. An abort may carry any status from 200 to 599: a `200` `fault-injected` with an empty
   body is a success to an app that ignores the header; the author chose it.
+- (M4, #452) **A passthrough connection accepted in mode `mock` is never faulted.** Mesh routing
+  is decided when a connection is accepted (§8): a connection to a `spec.mock.passthrough`
+  destination accepted while the mode is `mock` takes the byte relay to the original
+  destination (the ClusterIP), so no route, retry, breaker or fault applies to it, even when the
+  destination is in the view. Only a passthrough connection accepted in `none` or `discovery`
+  and still open after the switch to `mock` stays mesh-routed (MSH-62), and its requests are
+  faulted (FLT-23). A fault test of a passthrough destination runs in `discovery`. Mesh-routing
+  passthrough connections accepted in `mock` changes the routing of every mesh feature, not
+  only faults: follow-up #549.
 
 ## 12. Delivery plan
 
@@ -6283,7 +6295,9 @@ abort takes no breaker slot, no try, no budget, no mirror and is never retried n
 delay is waited **inside** the breaker slot, before the first try, counts against `request` and
 never against `backendRequest`, holds no body byte, and is subtracted from the latency that
 discovery records; mirror copies, L4 connections, `Upgrade`, `CONNECT`, mocked calls, stale
-views and inbound traffic are never faulted (passthrough destinations of mode `mock` are);
+views and inbound traffic are never faulted (a passthrough request on a mesh-routed connection
+switched to mode `mock` is; a passthrough connection accepted in `mock` takes the byte relay and
+is not, §11.1, follow-up #549);
 `mimic_mesh_faults_total{service,kind}` labels the Service whose policy injected the fault.
 Out of scope: inbound faults, bandwidth, reset and gRPC-status faults, a percentage finer than 1 %,
 a delay drawn from a distribution, `MIMIC_*` switches (v2). In the **I** tests the sidecar runs in
@@ -6316,7 +6330,7 @@ below the time the wrong behaviour would give, as RTE-63 to RTE-66 (181ad61).
 | FLT-20 | **I** (outlier detection). With `consecutiveFailures: 1` and `consecutive5xx: 1`: 100 requests aborted with `500` or `503` and 100 delayed requests to healthy pods eject nothing (`mimic_mesh_ejections_total` absent); a delayed request whose try is reset counts that one failure as without a fault (CBR-08). |
 | FLT-21 | **I** (which policy). A route of `shop/cart` sending 100 % to `shop/cart-v1`: `abort` 100 % on `cart` aborts nothing, on `cart-v1` aborts every request with `mimic_mesh_faults_total{service="shop/cart-v1"}`; a rule 50/50 to `cart-v1` (abort 100 %) and `cart-v2` (no faults) aborts 50 % ± 5 % of 2000 requests, all of them drawn to `cart-v1`; a request answered `no-route`, `no-backend` or `invalid-backend` on a port whose Service has `abort` 100 % carries that answer, not a fault. |
 | FLT-22 | **I** (match through the sidecar). Faults `[{match: POST PathPrefix /checkout, abort 100 %}, {match: {headers: [{name: x-chaos, value: "on"}]}, delay 100 % 50ms}, {delay 100 % 10ms}]`: `POST /checkout` is aborted (also with `x-chaos: on`), `GET /checkout` with `X-Chaos: on` is delayed 50 ms, `GET /cart` 10 ms; a query match `?v=2` behaves as in RTE-42; the request modifier of the rule (`set x-chaos: on`) changes no decision (the match sees the request as the app sent it). |
-| FLT-23 | **I** (not faulted). With `abort` 100 % on every Service of the view: in mode `mock` the mocked calls are answered by the mock (MCK criteria unchanged) and `mimic_mesh_faults_total` stays absent, while a `spec.mock.passthrough` destination of the view is aborted; a destination outside the view, a stale view, a view of `"mesh": false`, an `Upgrade`, a `CONNECT` and an L4-balanced connection (opaque TCP and TLS passed through) reach their destination; inbound requests to the faulted Service's own pods are not aborted by their inbound sidecar. |
+| FLT-23 | **I** (not faulted). With `abort` 100 % on every Service of the view: in mode `mock` the mocked calls are answered by the mock (MCK criteria unchanged) and `mimic_mesh_faults_total` stays absent; on a connection to a `spec.mock.passthrough` destination of the view accepted in `discovery`, the requests before and after the switch to `mock` are aborted (not mocked), while a new connection to it accepted in `mock` reaches the ClusterIP on the byte relay and leaves the count unchanged; a destination outside the view, a stale view, a view of `"mesh": false`, an `Upgrade`, a `CONNECT` and an L4-balanced connection (opaque TCP and TLS passed through) reach their destination; inbound requests to the faulted Service's own pods are not aborted by their inbound sidecar. |
 | FLT-24 | **I** (forwarded aborts). A pod whose app answers `503` with `x-mimic-error: fault-injected` (as an app forwarding its own sidecar's abort): the caller's sidecar passes it as received, never retries it, counts no fault and no `reason`, and a meshed inbound sidecar strips the field before it leaves the pod (§4.1, MSH strip criteria). |
 | FLT-25 | **I** (discovery). In mode `discovery`, `delay` 100 % `fixed: 300ms` over a pod answering in 10 ms: the recorded exchanges' latency histogram holds them under 100 ms while their access lines have a `head_ms` of at least 300; aborts are not recorded (FLT-13). |
 | FLT-26 | **I** (view changes and labels). A view adding faults applies from the next request; a delay in flight when a view removes its fault finishes its delay; with faults on 300 Services and one injection each, `mimic_mesh_faults_total` has one series per Service and `kind`, both `kind` values only, created by their first count; the series of a Service that left the view are gone 5 minutes after (the scrape before still has them); no label or line of #452 carries a path, a header or query value or a body byte of a request (a canary in each is in none). |
