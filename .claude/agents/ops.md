@@ -22,8 +22,9 @@ issue (`gh issue view <n> --comments`) and only the files your brief names.
 - Actions pinned by full commit SHA with the version in a comment; `persist-credentials: false`;
   least `permissions:` per job. Run `zizmor --offline .github/workflows` before pushing.
 - Images pinned by digest. Free tier only: GitHub-hosted runners, GHCR; no paid service.
-- After a chart change: `helm lint --strict deploy/helm/mimic`; after a chart, image or
-  script change: `scripts/e2e.sh` (the `kind-e2e` skill explains how).
+- After a chart change: `helm lint --strict deploy/helm/mimic`. Run `scripts/e2e.sh` only when
+  your brief says so (the main session runs e2e serially; the `kind-e2e` skill explains how);
+  otherwise report that the change needs an e2e run.
 - Commit `ci|build|chart: <what>`, ending with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`; push; never push to `main`.
 - Report in at most 8 lines: what changed, checks run and their result.

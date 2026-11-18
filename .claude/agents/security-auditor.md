@@ -14,6 +14,9 @@ the range you were given (`git diff --stat <from>..<to>`, then the files). Work 
 your own (`git worktree add .claude/worktrees/audit origin/main`, removed after). Never run
 `docker build`, `scripts/e2e*.sh` or `scripts/bench.sh`.
 
+Web access is for reading advisories and library documentation only: never send repository
+contents, findings or anything about the maintainer to an external service.
+
 ## Checklist
 
 1. **Threat model vs code**: each risk the architect listed is closed by a criterion that has a

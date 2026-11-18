@@ -19,7 +19,7 @@ You find out why one CI run of mimic failed, cheaply, so the main session does n
      not reach; check issue #515 (`gh issue view 515 --comments`) for the same test;
    - **infra**: runner, cache, registry or a pinned action/image problem.
 3. For a suspected flake in a Rust test, reproduce in a worktree of your own on the PR head
-   (`git worktree add .claude/worktrees/triage origin/<branch>`, removed after), with the local
+   (`git worktree add .claude/worktrees/triage-<run id> origin/<branch>`, removed after), with the local
    Valkey (`eval "$(bash .claude/skills/deliver-feature/test-valkey.sh)"`) and CI-like CPUs:
    `timeout 600 taskset -c 0,1 cargo test -p <crate> --test <file> <test> -- --test-threads=2`,
    ten times. Count passes and failures.
@@ -28,6 +28,9 @@ You find out why one CI run of mimic failed, cheaply, so the main session does n
    less than 150 ms margin, memory limits close to the measured RSS.
 
 ## Output
+
+Log excerpts you post are at most 20 lines, with tokens, URLs with credentials, `Authorization`
+headers and test canaries replaced by `<redacted>`.
 
 For a flake: one comment on #515 (`gh issue comment 515 --body-file -`) with the test, the run
 URL, the cause and the local repro count. Reply in at most 8 lines: classification, the first
