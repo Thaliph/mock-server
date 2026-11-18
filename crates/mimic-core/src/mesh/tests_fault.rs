@@ -192,6 +192,14 @@ fn flt_01_validate_refuses_each_bad_fault_naming_the_field_and_the_index() {
         )]),
         "faults[0].match.queryParams",
     );
+    refused(
+        &with(vec![spec(
+            Some(queries(vec![name("Exact", "")])),
+            abort(1, 503),
+            None,
+        )]),
+        "faults[0].match.queryParams[0].name",
+    );
     let many = |kind: &str| {
         (0..17)
             .map(|i| name("Exact", &format!("{kind}{i}")))
@@ -545,6 +553,11 @@ fn flt_07_the_match_is_the_route_match() {
         "joined header"
     );
     assert!(!yes(r("POST", "/shop", None, headers)), "query");
+    let upper: &[(&str, &[u8])] = &[("X-A", b"1"), ("x-a", b"2"), ("x-b", b"Y")];
+    assert!(
+        !yes(r("POST", "/shop", Some("q=a%20b"), upper)),
+        "values are case-sensitive"
+    );
     let exact = [fault(
         Some(mv(Some(("Exact", "/a")), None)),
         Some((100, 500)),
@@ -788,7 +801,12 @@ proptest! {
         headers in proptest::collection::vec(
             (
                 prop_oneof![Just("x-a"), Just("X-A"), Just("x-b"), Just("X-C"), Just("y")],
-                prop_oneof![Just(&b"1"[..]), Just(&b"2"[..]), Just(&b"a b"[..])],
+                prop_oneof![
+                    Just(&b"1"[..]),
+                    Just(&b"2"[..]),
+                    Just(&b"a b"[..]),
+                    Just(&b"A B"[..]),
+                ],
             ),
             0..=5,
         ),
