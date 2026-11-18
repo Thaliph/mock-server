@@ -21,7 +21,7 @@ branch of the directory you start in.
 ## The step spec
 
 Post it as one issue comment (`gh issue comment <n> --body-file -`), first line
-`<!-- mimic-step-spec: <n> step <k> -->`, at most two screens:
+`<!-- mimic-step-spec: <n> step <k> -->`, at most three screens:
 
 1. **Goal**: one sentence, plus the criterion IDs it covers.
 2. **Placement**: files and modules to create or change, and why there (the layering:
@@ -34,13 +34,26 @@ Post it as one issue comment (`gh issue comment <n> --body-file -`), first line
    one of them is a defect.
 5. **Behaviour table**: input / state → output, covering the edge cases (empty, maximum, invalid,
    concurrent, restart, deletion), each row tied to a criterion ID or marked internal.
-6. **Tests**: the list of test names (`<id>_<what>`), the level (unit / integration / e2e), the
+6. **Diagrams**, in fenced ```` ```mermaid ```` blocks (GitHub renders them in the comment):
+   - **Decision**: a `flowchart TD` of the branching logic of the step (each condition a
+     diamond, each outcome a box that names the status, header, log line or metric it produces).
+   - **Workflow**: a `flowchart LR` or `stateDiagram-v2` of the data or lifecycle flow across
+     the components the step touches (controller, CRD, view, sidecar, Valkey, Kubernetes
+     objects), including the failure and retry paths.
+   - **Sequence**: a `sequenceDiagram` of one request or reconcile through the actors
+     (application, sidecar, upstream, controller, API server), with timeouts and errors as `alt`
+     or `opt` blocks.
+   Label edges with the criterion ID they implement (`FLT-04`). Draw what the step builds,
+   matching the contract and the behaviour table, not the whole feature; skip a diagram only if
+   the step has nothing of that kind, and say so in one line. Keep to plain Mermaid syntax (node
+   IDs without spaces, labels in quotes when they hold `()`, `:` or `/`) so GitHub renders it.
+7. **Tests**: the list of test names (`<id>_<what>`), the level (unit / integration / e2e), the
    setup, the stimulus and the exact assertion, and for each one the mutation it must catch
    (the wrong code that would still pass a weaker test).
-7. **Pitfalls**: what has already broken in this area (read `git log -S`/`--grep` on the files,
+8. **Pitfalls**: what has already broken in this area (read `git log -S`/`--grep` on the files,
    and issue #515 for flakes): timing margins, unroutable ClusterIPs, disabled log callsites,
    cardinality of metric labels, limits on untrusted input.
-8. **Out of scope** for this step.
+9. **Out of scope** for this step.
 
 ## Rules
 
