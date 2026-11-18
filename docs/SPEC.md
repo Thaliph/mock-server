@@ -296,6 +296,87 @@ would see without mimic, except for the limits listed at the end of this section
   that sends nothing within the stall, a head that is not whole, `MIMIC_MESH=off` and a view
   of `"mesh": false`. A load request (§7.8) is answered the same way, before the marker check;
   mock mode is outbound only and unaffected.
+- **Admission contract (M5, #453, inbound only; design §9).** With `MIMIC_MESH=on` and a view
+  that holds an `admission` contract (§7.9; a view of `"mesh": false` never does), the inbound
+  side lets at most `concurrency` requests be in flight to its app and at most `rps` requests per
+  second reach it. The contract is per pod. The decision is `mimic-core` `mesh::admission`: it is
+  pure, and the sidecar's monotonic clock is passed in.
+  - **Decision.** A request is **admitted** when two conditions hold. Fewer than `concurrency`
+    admitted requests are in flight, and a token is left in a bucket of rate `rps` and size
+    `burst = max(1, ⌈rps / 10⌉)`. The bucket is full when the contract starts, and its
+    arithmetic uses integer nanoseconds, no float. Otherwise the request waits in a FIFO
+    **queue** of `max(1, ⌈concurrency / 10⌉)` places. It is admitted once both conditions hold
+    again and no earlier request is waiting. A request that has waited **150 ms** is refused
+    `queue-timeout`. A request that finds the queue full is refused `overloaded` at once. The
+    queue size and the 150 ms are not configurable (owner decision, design §9).
+  - **What is metered.** Two things count as a request:
+    - an HTTP/1 request head, once it is whole and after the load-marker check (§7.8);
+    - an `h2c` stream, once its headers have arrived.
+
+    A request that the marker refuses takes neither a slot nor a place. The following are
+    **not metered**: inbound TLS (relayed unchanged, §5), opaque TCP, the probes of the admin
+    port (`/app-health/…`, §4) and the bytes of an upgraded connection.
+  - **In flight.** A request counts from its admission until its response is complete: the last
+    body byte with any trailers, or the app's close for a close-delimited body. It also stops
+    counting when its exchange ends without a complete response: a side closes or resets the
+    connection or the stream. A `101` to an `Upgrade` and a `2xx` to a `CONNECT` end the count at
+    that head. An interim `1xx` does not. A long-lived response (SSE, a gRPC server stream)
+    therefore holds its slot for its whole life.
+  - **HTTP/1 hold.** The relay reads each request head whole before it forwards the first byte
+    of it, one request at a time, as for the load marker. A held head goes on only once it is
+    admitted, and the bytes forwarded are unchanged. Some heads cannot be judged: a head that
+    reaches 64 KiB without its end, one the codec cannot frame, one not whole after the 30 s
+    stall of "Idle and long-lived connections", one cut by the client's close. When its hold
+    ends, such a head is decided like any request. If it is admitted, it is forwarded unchanged
+    and holds its slot until the connection ends, because the codec no longer sees its response
+    end. If it is refused, nothing of it is forwarded and the answer carries
+    `connection: close`. A head that is not yet whole holds neither a slot nor a place.
+  - **Refusal.** The sidecar writes the refusal itself, after the removal of the app's
+    `x-mimic-*` fields ("Mimic fields of app responses", which never sees it); it is never
+    relayed from the app. The answer is `503 Service Unavailable` with exactly these fields:
+    - `x-mimic-error: overloaded` or `x-mimic-error: queue-timeout`;
+    - `x-mimic-endpoint: <ip>:<port>`, the original destination of the connection as the
+      caller dialled it (`[::1]:8080` form for IPv6);
+    - `x-mimic-origin: inbound; pod=<name>`, with the grammar of "Refused app connections"
+      (owner decision of #518: the answer says where it comes from);
+    - `content-length: 0`;
+    - on HTTP/1, `connection: close` when the connection is not kept (below).
+
+    No other field is written (no `date`), and the app never sees a byte of a refused request.
+    On HTTP/1 the answer is written once the answers to the earlier requests of the connection
+    were written, so pipelined answers keep their order. Whether the connection is kept
+    depends on the request:
+    - **Kept** for an HTTP/1.1 request without `Connection: close` and without
+      `Expect: 100-continue`, whose body is absent or has a `content-length` of at most
+      65 536. The answer is written at once. The body is then read and discarded. When the
+      body is not whole within 1 s of the answer, both connections are closed with a FIN.
+    - **Closed** in every other case: `chunked`, a larger `content-length`, `Expect`,
+      HTTP/1.0, `Connection: close`, or a head that could not be judged. The answer carries
+      `connection: close`. The connection is then closed after the bounded drain of "Refused app
+      connections" (64 KiB, 1 s), and the app's connection is closed with it.
+
+    On `h2c` the stream is answered and its request body is not read. The connection and its
+    other streams go on.
+  - **Observability.** Each refused request writes one access line (`status` 503, `reason` the
+    `x-mimic-error` value, no `upstream`). It counts in `mimic_http_requests_total` like any
+    exchange. Discovery does not record it, and counts it in
+    `mimic_discovery_exchanges_total{result="synthetic"}`. No component line is written per
+    refusal. The admission metrics and the line `admission contract changed` are #454.
+  - **Contract changes.** The contract follows the view, without a restart (§7.9 "Admission"):
+    - A lower `concurrency` cuts nothing: the requests in flight finish, and new requests wait
+      until fewer than the new limit are in flight.
+    - A higher one admits the waiting requests at once, in order.
+    - A new `rps` keeps the tokens held, capped at the new `burst`.
+    - A new queue size leaves the requests already waiting in their place.
+    - A contract removed admits every waiting request at once, and the requests that follow
+      are not held.
+    - A contract that appears counts only the requests admitted after it.
+
+    A stale view keeps its contract. On `SIGTERM`, the requests waiting are decided as usual
+    within their 150 ms.
+  - **Callers.** A meshed caller's sidecar retries the refusal on another pod for every method,
+    as a trusted refusal (§7.9 "Retries"). A caller without a sidecar gets the `503` as it is.
+    With `MIMIC_MESH=off` or a view of `"mesh": false`, nothing is held or refused.
 - **Upgrades**: a request answered with `101` (WebSocket, `h2c` upgrade), or a `CONNECT`
   answered with 2xx, continues as an opaque tunnel after the response. After a request that
   asks for an upgrade or is a `CONNECT`, the relay reads no more client bytes until the final
@@ -305,7 +386,8 @@ would see without mimic, except for the limits listed at the end of this section
   relay's flow control) reports the upgrade request as `unframed`, drops its
   copy and uses every byte: none is lost.
 - **Failures**: the sidecar never synthesises a response (in discovery; mock answers are §8's;
-  the one exception is the inbound `connect-failed` answer of "Refused app connections" above).
+  the exceptions are the inbound `connect-failed` answer of "Refused app connections" and, from
+  M5, the admission refusals of "Admission contract" above).
   When the destination refuses the
   connection, the client connection is closed without any byte; when it closes or resets
   before answering, the client sees the same close or reset (HTTP/1), or the stream is reset
@@ -343,7 +425,10 @@ would see without mimic, except for the limits listed at the end of this section
   side before it observes what they carried (access line, metrics, discovery capture): the
   response (or request) bytes of an exchange are written first, its observation follows, in
   order. A slow recorder or log sink lengthens neither the response nor the request.
-- **Overload: forward, never refuse.** No admission control. Log lines go through a bounded
+- **Overload: forward; refuse only under a contract.** There is no admission control, except
+  that from M5 the inbound side of a meshed pod whose view holds an admission contract refuses
+  what is over it ("Admission contract" above). Without a contract the sidecar forwards
+  everything. Log lines go through a bounded
   in-memory queue; when stdout cannot keep up, lines are dropped and counted
   (`mimic_log_lines_dropped_total`) instead of slowing traffic.
 - **Shutdown** (`SIGTERM`, sent after the app containers stopped): listeners stop accepting,
@@ -375,7 +460,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `backend`, `upstream` | (M1) mesh-routed requests only (§7.9): `<namespace>/<name>:<port>` of the Service port and the pod `ip:port` the request went to | (M1) L4-balanced connections only (§7.9): the same two fields |
   | `attempts` | (M2) mesh-routed requests only: the number of tries (§7.9 "Retries"), 1 without a retry | (M2) L4-balanced connections only: the number of connects tried |
   | `route`, `rule` | (M3, #448) mesh-routed requests that a route rule matched (§7.9 "Routing"): the route's `<namespace>/<name>` and the index of the rule in it (0 first); absent otherwise. `backend` is then the backend Service port drawn, absent when none was (a `no-route`, `no-backend` or `invalid-backend` answer) | — |
-  | `reason` | (M4, #451) mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, …; §7.9); absent otherwise, also for a trusted refusal passed as received. A `breaker-open` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts` | — |
+  | `reason` | (M4, #451) mesh-routed requests the caller's sidecar answered itself: the `x-mimic-error` value it wrote (`breaker-open`, `no-endpoint`, `connect-failed`, `no-route`, …; §7.9); from M5 (#453) inbound requests the admission refused (`overloaded`, `queue-timeout`, §4.1 "Admission contract"); absent otherwise, also for a trusted refusal passed as received. A `breaker-open` line has `backend` (and `route`, `rule` when a rule matched) but no `upstream` and no `attempts` | — |
   | `timeout` | (M3, #449) with `result: timeout` only: the route timeout that expired, `request` or `backendRequest` (§7.9 "Routing") | — |
   | `mirrored` | (M3, #450) `true` when at least one copy of the request was sent to a mirror of the matched rule (§7.9 "Routing", "Mirrors"; result `sent` or `error`), absent otherwise (no mirror, none drawn, every one skipped). It is read when the line is written: a copy still waiting for a body that has not ended then (HTTP/2 full duplex, the request body ending after the response) is not counted, so the field never claims a copy that was not sent | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
@@ -1202,6 +1287,16 @@ the recorder keeps the first message of each side:
   `retries: 3`, `retryBudget: {percent: 20, minPerSecond: 10, window: 10s}`, from M4
   `outlierDetection: {consecutiveFailures: 5, consecutive5xx: 0, baseEjectionTime: 30s,
   maxEjectionPercent: 50}` and `circuitBreaker: {maxRequests: 1024, maxConnections: 1024}`.
+- From M5 (#453), `MimicConfig.spec.admission` sets the admission contract of a Deployment
+  target; CEL rejects it on a config without a Deployment target. It has two fields, both
+  required, and each applies **per pod** of the Deployment:
+  - `concurrency`, an integer from 1 to 100 000: the requests in flight;
+  - `rps`, an integer from 1 to 1 000 000: the requests per second.
+
+  The default is no `admission`, which means no admission control. The winning config of the
+  Deployment carries it into the view (§7.9 "Admission"). Its pods' sidecars enforce it on their
+  inbound side (§4.1 "Admission contract"). An invalid value makes the config `Invalid`, so it
+  takes no part in the precedence.
 - From M3 (#447), Gateway API `HTTPRoute`s (`gateway.networking.k8s.io/v1`, when the CRD exists,
   §2) whose `parentRefs` name a Service (GAMMA) are read by both replicas, validated, compiled into
   the views of the callers they apply to and reported in their `status.parents[]` (§7.9 "Routes").
@@ -2758,6 +2853,19 @@ no insignificant whitespace):
   changed`, `source: pull`, §8 "Mode state"); the mode is never inferred from the absence of a view.
   With `"mesh": false` the table is empty and nothing is classified. With `MIMIC_MESH=off` no
   view is pulled, no table exists and the egress pull alone gives the mode.
+- **Admission** (M5, #453; design §9). The view's top-level `admission` is the `spec.admission`
+  of the winning `MimicConfig` of `d` (§7), for example `"admission":{"concurrency":64,"rps":200}`.
+  It is absent when that config has none, when there is no config, and in a view of
+  `"mesh": false`. Its winning config is already in the top-level `generations`, so a changed
+  contract gives a new ETag.
+  - **What `View::from_json` refuses**: an unknown field in `admission`, a missing
+    `concurrency` or `rps`, a value outside the ranges of §7, and an `admission` in a view of
+    `"mesh": false`. A view without the field reads as no contract.
+  - **How the sidecar applies it**: on its inbound side (§4.1 "Admission contract"), from each
+    accepted view and, at start, from the persisted one below. A stale view keeps its contract.
+  - **Before the first view** there is no contract. When `MIMIC_MESH_STARTUP_WAIT` passes
+    without a view, held or persisted, the sidecar writes one WARN `admission contract unknown`
+    (design §13). Its inbound side holds nothing until a view arrives.
 - **Persisted view.** Each accepted view is written to `<MIMIC_TRUST_DIR>/state/mesh.json`,
   `{"fetchedAt":<unix seconds>,"view":<the view>}`, through a temporary file and a rename. At
   start the file is read (regular file, at most `MIMIC_MESH_MAX_VIEW_BYTES` plus 1 KiB, the view
@@ -3641,7 +3749,7 @@ random numbers it hands to the draw.
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
-  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`, from F11 `load`: an inbound load request forwarded and not recorded, §7.8, from M1 `synthetic`: an answer the mesh generated itself, §4.1) |
+  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`, from F11 `load`: an inbound load request forwarded and not recorded, §7.8, from M1 `synthetic`: an answer the mesh generated itself, §4.1, from M5 also an inbound request the admission refused, §4.1 "Admission contract") |
   | `mimic_discovery_bodies_total` | counter (F4), bodies of recorded exchanges | `direction`, `part` (`request`, `response`), `result` (`parsed`, `empty`, `opaque`, `too_large`, `encoding`, `invalid`, `budget`) |
   | `mimic_discovery_samples_total` | counter (F4), sample admissions | `direction`, `result` (`kept`, `replaced`, `rejected`, `budget`) |
   | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`, from F7 `outbound_header`, §6.1) |
@@ -4106,7 +4214,7 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_MOCK_LATENCY_FACTOR` | `1` | (F10) Latency factor until the first pull answer (§8), a decimal 0–100 with at most 2 fractional digits. Set by the webhook when the effective factor is not 1. |
 | `MIMIC_MOCK_MAX_PENDING` | `1024` | (F10) Mocked requests pending at once (§8 "Bounds"), 1–65536; more are answered `599` (`overload`). Not set by the webhook. Sized with the 128 Mi sidecar limit (MCK-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
 | `MIMIC_MOCK_PASSTHROUGH` | empty | (F10) Destinations handled as in discovery while in mock (§8), comma-separated, the `MIMIC_TLS_EXCLUDE` grammar; an invalid entry or more than 256 exits with code 2. The webhook sets the union of `spec.mock.passthrough` (§7), absent when empty. |
-| `MIMIC_MESH` | `off` | (M1) `on` or `off` (anything else exits 2). `off`: no mesh view is pulled, nothing is classified (§7.9). The webhook always sets it from the controller's own `MIMIC_MESH` (default `on`, §10.2); the sidecar's own default when it is unset stays `off`, as before M1 (a pod injected before M1 pulls nothing). |
+| `MIMIC_MESH` | `off` | (M1) `on` or `off` (anything else exits 2). `off`: no mesh view is pulled, nothing is classified (§7.9), no `x-mimic-*` field is removed and no admission contract applies (§4.1). The webhook always sets it from the controller's own `MIMIC_MESH` (default `on`, §10.2); the sidecar's own default when it is unset stays `off`, as before M1 (a pod injected before M1 pulls nothing). |
 | `MIMIC_MESH_STALE_AFTER` | `60s` | (M1) Age of the view after which it is stale (§7.9), 1s–1h. Set by the webhook. |
 | `MIMIC_MESH_STARTUP_WAIT` | `2s` | (M1) Wait for the first view before `/readyz` answers `200` (§7.9), 0s–1m. Set by the webhook. |
 | `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | (M1) The bounds of §10.2 with the same ranges, applied to the view read from the controller (`View::from_json`). Set by the webhook when they differ from the defaults. |
@@ -4953,6 +5061,45 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   size `maxRequests` for them. An author of a `MimicConfig` of the Service sets it for every
   caller (`maxRequests: 1` throttles all of them), as for every destination policy (RBAC of
   `mimicconfigs` in the Service's namespace). L4-balanced connections are not bounded by it.
+- (M5, #453) **The contract is per pod and does not tell callers apart.** Each sidecar admits
+  from what it sees itself. The workload's capacity is `replicas × contract`, and nothing is
+  shared between pods. One caller, or one attacker that can reach the pod IP, can take every
+  slot and token, and the other callers are then refused too. Admission protects the app from
+  overload; it is no access control (NetworkPolicy is) and it does not keep callers fair to
+  each other. A meshed caller retries a refusal on another pod within its retries and its
+  budget (§7.9). A caller without a sidecar gets the `503`.
+- (M5, #453) **Some traffic is not metered.** Inbound TLS (never decrypted, §5), opaque TCP, the
+  admin-port probes and the bytes after a `101` or a `CONNECT` reach the app without the
+  contract. A workload that serves HTTPS on its pod port has no admission control. The
+  contract's author must size it for what it does meter.
+- (M5, #453) **Held slots follow the slowest side.** A request holds its slot until its response
+  is complete. A long-lived response (SSE, a gRPC stream), a client that sends its body slowly
+  or one that reads its response slowly keeps its slot for as long as that lasts, as it would
+  keep one of the app's own workers without mimic. A client holds nothing while its head is
+  incomplete. The head stays in the connection's buffer: at most 64 KiB, up to the 30 s stall
+  restarted at each byte, within `MIMIC_MAX_CONNECTIONS` (§4.1). So a slow-loris client takes
+  no slot before its head is whole. `concurrency` slow admitted requests can still starve the
+  contract of that pod, as they would starve the app's workers.
+- (M5, #453) **A head that cannot be judged keeps its slot until its connection ends.** Such a
+  head is over 64 KiB, unframed, stalled or cut (§4.1 "Admission contract"). Its response end
+  is no longer seen, so its slot is freed only when the connection closes. A client that sends
+  them takes slots of its own pod only, as long as it keeps those connections.
+- (M5, #453) **The contract can be briefly unknown or exceeded.** A new pod has no contract until
+  its first view, which comes within `MIMIC_MESH_STARTUP_WAIT` when the controller answers
+  (one WARN `admission contract unknown` otherwise). A restarted sidecar container keeps the
+  contract of its persisted view. A contract added while requests are in flight counts only the
+  requests admitted after it, so the app may serve up to `concurrency` more for as long as the
+  earlier requests last. A lowered contract lets the requests in flight finish.
+- (M5, #453) **HTTP/1 timing changes under a contract.** Each request head is held until it is
+  whole and admitted: up to 150 ms in the queue, plus the wait for the answers to the earlier
+  requests of a pipelined connection. An `Expect: 100-continue` request is held the same way,
+  before the app can answer `100 Continue`. Bytes are not changed. A refused request's body,
+  up to 64 KiB within 1 s, is read and discarded. The requests pipelined behind it wait for
+  that read.
+- (M5, #453) **The refusal names the pod.** `x-mimic-endpoint` and `x-mimic-origin` give the pod
+  address the caller dialled and the pod name, as the `connect-failed` answer of #518 does. A
+  caller that reached the pod already knows its address. The pod name is not a secret
+  (Kubernetes objects, DNS of headless Services).
 
 ## 12. Delivery plan
 
@@ -4982,6 +5129,7 @@ names contain the criterion ID (`fnd_02_…`).
 | M1 | `MimicConfig` CRD and the pure mesh view (#440, design `docs/design/mimic-mesh.md` §4.2, §6, §16) | (added 2026-11-12) |
 | M2 | Retries of proxy-level failures on another pod (#445, design `docs/design/mimic-mesh.md` §7); the retry budget is #446 | (added 2026-11-14) |
 | M3 | Gateway API prerequisite and HTTPRoute (GAMMA) ingestion in the controller (#447, design `docs/design/mimic-mesh.md` §4.2, §5); route matching, header modifiers and weighted backends in the sidecar (#448); timeouts #449, mirrors #450 | (added 2026-11-14) |
+| M5 | Admission contract in the inbound sidecar, concurrency and rps (#453, design `docs/design/mimic-mesh.md` §9); signalling and dashboards #454, autoscaling #455 | (added 2026-11-18) |
 
 ### 12.1 F0 — Foundations
 
@@ -6112,6 +6260,90 @@ criterion says so and `baseEjectionSeconds` is set in the view (1 s at least).
 | CBR-34 | **M** (benchmark, design §14 M4 row). `scripts/bench.sh` setups `mesh-eject` (the `mesh-refuse` backend with the third pod resetting instead of refusing) and `mesh-breaker` (`maxRequests: 8` over a 50 ms backend at 200 rps, the BEN-03 cap, with 32 fortio connections, more than `maxRequests`, so that the breaker opens), accepted by BEN-02 and BEN-11, not in the default matrix: in `mesh-eject` at 200 rps the client's error rate is 0 % and the resetting pod receives at most `consecutiveFailures + (connections in flight − 1)` requests per ejection of the caller sidecar (5 + 8 − 1 = 12 with the bench's 8 connections: an ejection cannot recall the tries already sent to the pod); in `mesh-breaker` at least 10 % of the requests are answered `breaker-open` (proof that the breaker opened) and the p99 of the access `duration_ms` of the `breaker-open` lines is at most 1 ms (the counts per millisecond and the largest are recorded; a single line can wait on a busy worker, so the largest is no budget); `mesh-lb` p50 is within 0.2 ms of the M3 runs (no cost without failures); results in `docs/bench/`. |
 | CBR-35 | **D** (documentation review). `docs/wiki/Mesh.md` has "Outlier detection and circuit breaker": the fields and defaults, what counts as a failure and what is neutral, `consecutive5xx` off by default and why, the rounding of `maxEjectionPercent` (one endpoint is never ejected at 50 %), the doubling and the 300 s cap, avoidance and ejection together, the breaker per caller pod, held streams, mirrors and L4 outside it; `Troubleshooting.md` `breaker-open` with its two causes and the WARN `cause`; `Monitoring.md` the two metrics; `Access-logs.md` `reason`. |
 | CBR-36 | **D** (security review). An app or a peer forging failures ejects only its own pod (CBR-18, CBR-19); admission refusals and timeouts cannot be used to eject (CBR-17); the state is per caller pod and bounded by the view (CBR-12, CBR-21, CBR-24); `breaker-open` names no pod and is never trusted (CBR-28); labels and lines carry no request data (CBR-24); the §11.1 limits of #451 are written; `mimic-core` `mesh::outlier` has no clock, I/O or random source. |
+
+### 12.29 M5 — Admission contract in the inbound sidecar (#453)
+
+Design: `docs/design/mimic-mesh.md` §8, §9, §12, §13, §14 (M5 row) and §15. The spec text is in
+§4.1 ("Admission contract", "Overload", "Failures", access line `reason`), §7
+(`MimicConfig.spec.admission`), §7.9 ("Admission" of the view), §9 (`synthetic`), §10.3
+(`MIMIC_MESH`) and §11.1 (M5 #453). Levels are as in §12.2, plus **F** (fuzz), **B** (criterion
+micro-benchmark), **M** (a `scripts/bench.sh` run by hand, recorded on #453, as §12.19 "Mesh
+setups") and **D** (review). ADM-01 to ADM-49 are #453 (ADM-35 to ADM-49 reserved). #454 (the
+signalling) continues at ADM-50.
+
+**Already covered.** The scope item "stripping" of #453 was delivered with M2. The inbound
+removal of `x-mimic-*` fields from app responses, its counter and the closing of unframed
+responses are RTY-06, RTY-07 and RTY-18 (§12.22). The caller's trust of `overloaded` and
+`queue-timeout`, its retry on another pod after 12.5 to 37.5 ms and the neutral outcome for
+outlier detection are RTY-02, RTY-12, RTY-13 and CBR-17. The criteria below add only what a
+contract changes.
+
+**Decisions recorded on #453** (taken with the recommended option while the maintainer is away):
+- **Refusal fields.** The refusal carries `x-mimic-origin: inbound; pod=<name>`, as the
+  `connect-failed` answer of #518 does.
+- **Order of checks.** The load-marker check comes before admission, so a refused ticket takes
+  nothing.
+- **Unjudged heads.** An HTTP/1 head that cannot be judged (over 64 KiB, unframed, stalled,
+  cut) is decided like any request. It holds its slot until its connection ends, so it is no
+  way around the contract.
+- **Keep-alive.** On HTTP/1 the keep-alive choice is made from the head, and the answer is
+  written at once. The body is then drained within 1 s. Design §9 waits for the body first,
+  which the 1 ms budget of §14 does not allow.
+- **Observability.** A refusal is counted like any exchange the client saw: an access line with
+  `reason` and `mimic_http_requests_total`, and `synthetic` for discovery. The admission
+  metrics, the INFO `admission contract changed` and the dashboards are #454.
+- **Before the first view.** The WARN `admission contract unknown` of design §13 is written once,
+  when the startup wait passes without a view.
+
+**Out of scope:** the metrics, the reasons table shared with logs and labels, the dashboards and
+`mimic-load` (#454); autoscaling (#455); a configurable queue or timeout (owner decision); a
+contract per caller, per route or shared between pods; inbound TLS. Mesh traffic management
+beyond the milestones of the design is v2.
+
+**Test set-up of the I tests.** The sidecar runs in process as in §12.22, with `MIMIC_MESH=on`,
+fed views by a fake controller. The app is an in-process server that records, with their
+instants, the requests it receives and the most it had in flight at once. It answers after a
+set delay, or streams a body. "Contract `c/r`" means a view with
+`"admission":{"concurrency":c,"rps":r}`. "A held slot" means a request admitted and still
+waiting for its slow answer. Upper time bounds keep at least 150 ms of margin over the expected
+time, and stay below the time the wrong behaviour would give (as RTE-63).
+
+| ID | Criterion |
+|---|---|
+| ADM-01 | **U** (`mimic-core` `mesh::admission`, the two limits). With contract 2/1000, two requests offered at the same instant are admitted and a third is queued. A release admits the queued one at that instant, and in-flight stays 2. With contract 1000/10 (burst 1), one request is admitted at `t0`. A second is queued although in-flight is 1, below 1000: the token limit alone stops it. It is admitted at `t0 + 100 ms` and not at `t0 + 100 ms − 1 ns`. Either limit stops admission on its own. |
+| ADM-02 | **U** (sizes and arithmetic). For `rps` 1, 9, 10, 11 and 1 000 000, `burst` is 1, 1, 1, 2 and 100 000. For `concurrency` 1, 9, 10, 11 and 100 000, the queue size is 1, 1, 1, 2 and 10 000. A contract starts with a full bucket. With contract 1000/3, the next token after an empty bucket at `t0` comes at `t0 + 333 333 334 ns`, not 1 ns earlier: integer nanoseconds, no float. The extremes (100 000/1 000 000 over a 10-year clock) do not overflow. |
+| ADM-03 | **U** (queue). Offered to a full queue, a request is refused `overloaded` at once and the queue is unchanged. A queued request is still waiting at `offer + 150 ms − 1 ns` and is refused `queue-timeout` at `offer + 150 ms`. The state gives the next instant at which a decision can change: the next token while the head of the queue waits for one, or the next deadline. It gives none for an empty queue. A cancelled entry (the client left) frees its place, is never admitted and is not counted as refused. |
+| ADM-04 | **U** (FIFO). Queued requests are admitted in the order of their offers, whichever limit held them back. An offer first applies the queue at its instant, so a new request is never admitted ahead of a request still waiting, even when a slot and a token are free at that instant. |
+| ADM-05 | **U** (`proptest`). Take any sequence of offers, releases, cancellations, contract changes (within the ranges of §7) and instants, with some instants going back. Then: <ul><li>nothing panics;</li><li>in-flight never exceeds the `concurrency` in force at each admission;</li><li>under one contract, the admissions in any interval `[a, b]` are at most `burst + ⌊rps × (b − a)⌋`;</li><li>the queue never holds more than its size;</li><li>every queued entry ends (admitted, refused or cancelled) at most 150 ms after its offer, when the state is applied at the instants it gives;</li><li>the counts by result add up to the offers;</li><li>an instant that goes back admits nothing early and frees no token.</li></ul> |
+| ADM-06 | **U** (contract changes). <ul><li>Lowering 4 → 2 with 4 in flight cuts nothing, and offers wait until fewer than 2 are in flight.</li><li>Raising 1 → 3 admits two queued entries at once, in order.</li><li>A new `rps` keeps the tokens held, capped at the new `burst`.</li><li>A smaller queue keeps its entries in place: new offers are `overloaded` until fewer entries than the new size are queued.</li><li>Removing the contract admits every queued entry at once. Releases of requests admitted under the old contract are then accepted, with no underflow.</li><li>A contract set while requests are in flight starts with in-flight 0.</li></ul> |
+| ADM-07 | **U** (counts, the input of #454). For a scripted sequence the state gives the exact values of: in-flight; queue depth; the offers admitted at once, queued, admitted from the queue, refused `overloaded` and refused `queue-timeout`; the integral of in-flight over time in nanoseconds. Reading them changes nothing. |
+| ADM-08 | **B** (criterion, results in `docs/bench/`). An offer admitted at once plus its release takes at most 200 ns on an uncontended state, and an offer refused `overloaded` with a full queue of 10 000 takes at most 200 ns. |
+| ADM-09 | **U** (`mesh::policy`). By default there is no admission. `admission` on the winning config of a Deployment is taken whole, also at the bounds (1/1, 100 000/1 000 000). `validate` makes the config `Invalid`, with the message naming the field, in each of these cases: `concurrency` 0 or 100 001; `rps` 0 or 1 000 001; one of the two fields missing; `admission` on a config whose only targets are Services. |
+| ADM-10 | **U** (`mesh::view`). The view of `d` holds top-level `admission`, the winning config's `{"concurrency":…,"rps":…}` with sorted keys. It is absent without a contract and in a view of `"mesh": false`. A change of either value gives a new ETag. `View::from_json` reads back what `build` wrote. It refuses an unknown field in `admission`, a missing field, every value ADM-09 refuses, and `admission` with `"mesh": false`. A view without `admission` reads as no contract. MSH-12 still holds, and so do the view fixtures of RTY-45, RTE-12, CBR-02 and, once #452 is merged, FLT-02, with and without `admission`. |
+| ADM-11 | **U** (next to the controller's adapters, as CBR-03). A `MimicConfig` object converts with `admission` (both fields, or `None` when it is absent). A value outside the ranges, for an object the API server did not check, makes the config `Invalid` and does not panic. |
+| ADM-12 | **E** (chart, `scripts/check-chart.sh`, as CBR-04). The rendered CRD has `admission` (object) with `concurrency` (integer, 1 to 100 000) and `rps` (integer, 1 to 1 000 000), both required. It has the CEL rule `admission fits a Deployment target only`. The golden files are updated. |
+| ADM-13 | **E** (kind, `scripts/e2e.sh` section `msh_17`, its objects only). The API server accepts `admission` 1/1 and 100 000/1 000 000 on a Deployment target. It refuses `concurrency` 0 and 100 001, `rps` 0 and 1 000 001, a missing field, and `admission` in a config whose only target is a Service, each with the schema error or the CEL message naming the field. |
+| ADM-14 | **F** (fuzz target `mesh`). The seed corpus holds a view with `admission`, and MSH-13 holds: `View::from_json` never panics, and an accepted document holds the bounds and reads back equal. |
+| ADM-15 | **I** (refusal fields, HTTP/1). Contract 1/1000 with the slot held, the app answering after 1 s. A `GET` on a second connection is answered 150 to 400 ms after its head with `HTTP/1.1 503 Service Unavailable` and exactly these fields: `x-mimic-error: queue-timeout`; `x-mimic-endpoint`, the original destination `ip:port` (`[::1]:port` over IPv6); `x-mimic-origin: inbound; pod=<name>` (`inbound` without `MIMIC_POD_NAME`); `content-length: 0`. A third request, sent while the second waits, gets the same fields with `overloaded`, within 50 ms. The app never receives a byte of the second or the third. |
+| ADM-16 | **I** (refusal fields, `h2c`). The ADM-15 scenario over `h2c` streams of one connection, the slot held by a first stream. The second stream gets `:status` 503 with the same four fields and no `date`. The third gets `overloaded`. The connection stays open, and a stream opened after the first answer is admitted and answered `200`. The app never sees the refused streams. A refused gRPC request (`content-type: application/grpc`) gets the same answer, with no `grpc-status`; gRPC clients map an HTTP `503` to `UNAVAILABLE`. |
+| ADM-17 | **I** (2× the contract, HTTP/1 and `h2c`). Contract 4/1000, the app answering after 200 ms. 8 concurrent HTTP/1 keep-alive clients, and in a second run 8 concurrent `h2c` streams, send for 3 s. The app never has more than 4 in flight. Every request gets either the app's `200` or a refusal, and both `overloaded` and `queue-timeout` occur. No connection is reset or closed without an answer. Contract 1000/50, the app answering at once: 20 clients send 100 requests/s for 4 s. Over the run's `t` seconds the app receives at most `5 + 50 × t` requests and at least `0.9 × 50 × t`. The rest are refused. |
+| ADM-18 | **I** (slot until the response is complete). Contract 1/1000 in each case: <ul><li>A `chunked` response streamed over 1 s holds the slot. A request during it is refused `queue-timeout`, and one sent after its last chunk is admitted.</li><li>An `h2c` response that ends with trailers frees the slot at the trailers.</li><li>An SSE response kept open holds the slot.</li><li>A client that resets during its response frees the slot: the next request is admitted within 100 ms.</li><li>An app that closes without answering frees the slot within 100 ms.</li></ul> |
+| ADM-19 | **I** (upgrades). Contract 1/1000. An `Upgrade: websocket` answered `101` ends its count at the `101`: while the tunnel stays open, a request on another connection is admitted. An upgrade that the app declines with `200` frees the slot at the end of that response. A `CONNECT` answered `200` ends its count at that head. |
+| ADM-20 | **I** (HTTP/1 connection after a refusal, `overloaded` with the slot held). <ul><li>**Connection kept.** These answers have no `connection` field, the app receives nothing of the refused request, and the next request on the same connection is served `200` once the slot is free: a request without a body; a `content-length: 1024` request whose body comes with the head; the same with its body 500 ms after the head; a `content-length: 65536` request.</li><li>**Closed after the answer.** A `content-length: 1024` request whose body never comes is answered at once, and the connection gets a FIN 1 s to 1.5 s later (not a reset).</li><li>**Answered `connection: close`.** A `content-length: 65537`, a `chunked`, an `Expect: 100-continue` (no `100 Continue` is sent), an HTTP/1.0 and a `Connection: close` request. Each connection then ends with a FIN after the bounded drain, and the client reads the whole answer even when it wrote its body after the head (as RTY-34).</li><li>In every case the app's connection carries no byte of the refused request.</li></ul> |
+| ADM-21 | **I** (pipelining). Contract 1/1000, the app answering after 300 ms. Two requests pipelined in one write: the first gets its `200`, then the second gets `503` `queue-timeout`, in that order on the wire, and the app receives only the first. With contract 2/1000, both reach the app pipelined, the second before the first's answer, and both answers come back in order, byte for byte as without a contract. |
+| ADM-22 | **I** (held heads and slow-loris). Contract 1/1000. <ul><li>A client that sends its head one byte every 100 ms holds no slot: meanwhile another connection's request is admitted at once. Its own request is decided only when its head is whole.</li><li>1000 connections holding incomplete heads take no slot and no queue place: a request on a new connection is admitted at once.</li><li>Each of these heads is decided like any request (forwarded unchanged when admitted, answered `503` with `connection: close` and not forwarded when refused): a head silent for the 30 s stall (the stall shortened by the test, as the relay's `stall` allows); a head that reaches 64 KiB without its end; a head the codec cannot frame (`Bad Header : x`); a head cut by the client's FIN. Each one admitted holds its slot until its connection ends: a request on another connection is refused while it is open, and admitted once it closed.</li></ul> |
+| ADM-23 | **I** (what is not metered, and no contract). Contract 1/1000 with the slot held. An inbound TLS connection, an opaque TCP connection and a probe `GET /app-health/<container>/readyz` on the admin port each reach the app. Without `admission` in the view, the PRX-15 corpus is byte-exact, and a head sent one byte every 100 ms reaches the app byte by byte (nothing held). With `MIMIC_MESH=off`, and with a view of `"mesh": false`, nothing is held and nothing is refused. |
+| ADM-24 | **I** (the contract follows the view). <ul><li>A view that adds 1/1000 applies to the next request without a restart.</li><li>Lowering 4/1000 to 1/1000 with 4 slow requests in flight: all 4 get `200`, and new requests are refused until fewer than 1 is in flight.</li><li>Raising 1/1000 to 3/1000 while one request is queued admits it at once.</li><li>Removing the contract admits a queued request at once, and later heads are no longer held.</li><li>A stale view (past `MIMIC_MESH_STALE_AFTER`, set short) keeps its contract.</li><li>A sidecar restarted with only `mesh.json` (no controller) enforces the persisted contract.</li></ul> |
+| ADM-25 | **I** (stripping and refusals together). With contract 1/1000, an admitted request whose app answers with `x-mimic-error: overloaded` and `x-mimic-endpoint: <this pod>` reaches the client without those fields, HTTP/1 and `h2c` (RTY-18 holds). The sidecar's own refusals keep their four fields. `mimic_mesh_stripped_headers_total` counts the app's fields and never the refusal's. |
+| ADM-26 | **I** (load marker). With `MIMIC_LOAD_ENABLED=1` and contract 1/1000 with the slot held: a request whose ticket is invalid is answered `599` as in §7.8 and takes no queue place, so a plain request sent at once after it is queued, not `overloaded`. A request with a valid ticket is queued and refused like any request, and its answer has no `x-mimic-load` field. An admitted load request's answer still has `x-mimic-load: ok`. |
+| ADM-27 | **I** (access line, RED, discovery). In mode `discovery`, each refused request writes one inbound access line with `status` 503, `reason` (`overloaded` or `queue-timeout`), `method`, `path`, `duration_ms` and no `upstream`. Each counts once in `mimic_http_requests_total{direction="inbound",status_class="5xx"}`. None is recorded by discovery: each counts once in `mimic_discovery_exchanges_total{direction="inbound",result="synthetic"}`. No `warn` or `info` component line is written per refusal. The lines of admitted requests are unchanged and have no `reason`. |
+| ADM-28 | **I** (contract unknown). With `MIMIC_MESH=on`, a controller that never answers and no `mesh.json`, the sidecar writes exactly one WARN `admission contract unknown` once `MIMIC_MESH_STARTUP_WAIT` (set to 300 ms) has passed. Until then, and after, requests are not held. A view with a contract that arrives later applies to the next request. With a persisted view, no such line is written. |
+| ADM-29 | **I** (callers retry on another pod). This uses the set-up of RTY-37: a caller's sidecar in process with a view of three pods whose inbound sidecars run in process too. Every pod has contract 1/1000, and its app answers after 100 ms. 60 requests from 6 concurrent clients, half `POST` with a 1 KiB body and half `GET`, over HTTP/1 keep-alive and `h2c`, each get `200` or, after the last try, the last refusal as received. No app ever has more than 1 request in flight. Every body an app receives equals the one sent. `mimic_mesh_retries_total{reason=~"overloaded\|queue_timeout"}` is at least 1, and no fallback is counted. |
+| ADM-30 | **I** (shutdown). With contract 1/1000, the slot held and one request queued, `SIGTERM` is sent. The queued request is refused `queue-timeout` within 150 to 400 ms, or admitted when the slot frees first. The held request ends as in PRX-13. No request waits past its 150 ms because of the shutdown. |
+| ADM-31 | **E** (kind, `scripts/e2e.sh` section `adm_31`, own namespace, cleaned by a trap, Python test services). A Deployment `cart` has 3 injected pods, a `MimicConfig` admission 1/1000 and an app answering after 300 ms. A non-meshed pod holds one pod's slot with one request sent to its pod IP that the app answers after 120 s. Of 60 sequential `POST`s from an injected caller through the Service, all get `200`. The caller sidecar's `mimic_mesh_retries_total{reason="queue_timeout"}` is at least 1. The busy pod's sidecar has access lines with `reason: queue-timeout`. A direct request from the non-meshed pod to the busy pod gets `503` with `x-mimic-error`, `x-mimic-endpoint` equal to that pod's `ip:port` and `x-mimic-origin: inbound; pod=<its name>`. After the `MimicConfig` is deleted and the view updated, the same direct request reaches the app. |
+| ADM-32 | **M** (benchmark, design §14 M5 row). Setup `mesh-admission` of `scripts/bench.sh`, accepted by BEN-02 and BEN-11 and not in the default matrix. A 50 ms fortio backend runs behind a contract: <ul><li>under the contract, the added p99 is at most 0.5 ms over the M4 run (`mesh-breaker` without breaker);</li><li>the p99 of the time from the decision to the refusal written is at most 1 ms (the access `duration_ms` of the `overloaded` lines);</li><li>the longest `queue-timeout` wait is at most 160 ms;</li><li>at 2× `rps` the admitted rate is within ±5 % of `rps`.</li></ul> The report goes in `docs/bench/` and on #453. |
+| ADM-33 | **D** (documentation review). The spec text of §4.1, §7, §7.9 and §11.1 above. `docs/wiki/Mesh.md` has "Admission contract": the fields, per pod, the queue and its 150 ms, what is and is not metered, slots held by long-lived responses, how to size a contract with a load test, refusals retried by meshed callers and not by others. `Troubleshooting.md` has `overloaded` and `queue-timeout`. `Access-logs.md` has the inbound `reason`. |
+| ADM-34 | **D** (security review). <ul><li>The queue is bounded by `⌈concurrency / 10⌉` entries of a waker each (ADM-02, ADM-05).</li><li>A held head is bounded by 64 KiB, the stall and `MIMIC_MAX_CONNECTIONS`, and holds no slot (ADM-22). A held `h2c` stream is bounded by the 200 streams and the 16 KiB header list of the `h2` server per connection.</li><li>A refusal costs one write and no allocation proportional to the request (ADM-08).</li><li>An app cannot forge a refusal through its own sidecar (ADM-25). A namespace writer sets the contract of its own Deployments only (ADM-13, `targetRefs`).</li><li>A refusal and its access line carry no header value, body or query (ADM-15, ADM-27).</li><li>`mimic-core` `mesh::admission` has no clock, I/O or random source.</li><li>The §11.1 limits of #453 are written. No RBAC, capability or `MIMIC_*` variable is added.</li></ul> |
 
 ## 13. Test strategy
 
