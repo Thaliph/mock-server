@@ -429,8 +429,10 @@ mimicconfig() {
   printf 'apiVersion: mimic.platform.io/v1alpha1\nkind: MimicConfig\nmetadata: {name: %s, namespace: default}\nspec:\n%s\n' "$1" "$2" \
     | kubectl apply -f - >/dev/null
 }
-mc_accepted() { local desc=$1; shift; mimicconfig "$@" 2>/dev/null || fail "msh_17: $desc was rejected"; }
-mc_denied() { local desc=$1; shift; if mimicconfig "$@" 2>/dev/null; then fail "msh_17: $desc was accepted"; fi; }
+# mc_id: the criterion the next refusals and acceptances check.
+mc_id=msh_17
+mc_accepted() { local desc=$1; shift; mimicconfig "$@" 2>/dev/null || fail "$mc_id: $desc was rejected"; }
+mc_denied() { local desc=$1; shift; if mimicconfig "$@" 2>/dev/null; then fail "$mc_id: $desc was accepted"; fi; }
 mc_dep='  targetRefs: [{group: apps, kind: Deployment, name: cart}]'
 mc_svc='  targetRefs: [{group: "", kind: Service, name: cart}]'
 mc_refs() { # mc_refs <n>: a block of n Service targetRefs
@@ -499,8 +501,8 @@ mc_accepted "retries on a config with both target kinds" rty-a8 '  targetRefs:
   retries: 2'
 mc_denied_with() { # mc_denied_with <field> <desc> <name> <spec>: refused, and the error names <field>
   local field=$1 desc=$2 out; shift 2
-  if out=$(mimicconfig "$@" 2>&1); then fail "msh_17: $desc was accepted"; fi
-  [[ $out == *"$field"* ]] || fail "msh_17: the refusal of $desc does not name $field (got: $out)"
+  if out=$(mimicconfig "$@" 2>&1); then fail "$mc_id: $desc was accepted"; fi
+  [[ $out == *"$field"* ]] || fail "$mc_id: the refusal of $desc does not name $field (got: $out)"
 }
 mc_denied_with retries "retries -1" rty-d1 "$mc_svc
   retries: -1"
@@ -522,6 +524,46 @@ mc_denied_with retries "retries with only a Deployment target" rty-d9 "$mc_dep
   retries: 3"
 mc_denied_with retryBudget "retryBudget with only a Deployment target" rty-d10 "$mc_dep
   retryBudget: {percent: 10}"
+# FLT-05 (#452): faults, bounds and target kinds.
+log "flt_05: the MimicConfig CRD accepts faults within their bounds and refuses each one out of them"
+mc_id=flt_05
+mc_faults() { # mc_faults <n>: a block of n aborts
+  local i; printf '  faults:\n'; for ((i = 0; i < $1; i++)); do printf '    - {abort: {percent: 10, status: 503}}\n'; done
+}
+mc_accepted "16 faults" flt-a1 "$mc_svc
+$(mc_faults 16)"
+[[ $(kubectl -n default get mimicconfig flt-a1 -o jsonpath='{.spec.faults[*].abort.status}' | wc -w) == 16 ]] \
+  || fail "flt_05: the 16 faults were not kept"
+mc_accepted "a fault with only an abort of status 200" flt-a2 "$mc_svc
+  faults: [{abort: {percent: 100, status: 200}}]"
+mc_accepted "a fault with only an abort of status 599" flt-a3 "$mc_svc
+  faults: [{abort: {percent: 0, status: 599}}]"
+mc_accepted "a fault with only a delay of 1ms" flt-a4 "$mc_svc
+  faults: [{delay: {percent: 100, fixed: 1ms}}]"
+mc_accepted "a fault with only a delay of 60s" flt-a5 "$mc_svc
+  faults: [{delay: {percent: 0, fixed: 60s}}]"
+mc_denied_with spec.faults "17 faults" flt-d1 "$mc_svc
+$(mc_faults 17)"
+mc_denied_with "faults[] needs a delay or an abort" "a fault with neither a delay nor an abort" flt-d2 "$mc_svc
+  faults: [{match: {path: {type: Exact, value: /checkout}}}]"
+mc_denied_with "spec.faults[0].abort.percent" "an abort percent of 101" flt-d3 "$mc_svc
+  faults: [{abort: {percent: 101, status: 503}}]"
+mc_denied_with "spec.faults[0].delay.percent" "a delay percent of 101" flt-d4 "$mc_svc
+  faults: [{delay: {percent: 101, fixed: 1s}}]"
+mc_denied_with "spec.faults[0].abort.status" "status 600" flt-d5 "$mc_svc
+  faults: [{abort: {percent: 10, status: 600}}]"
+mc_denied_with "faults[].delay.fixed is 1ms to 60s" "fixed 0s" flt-d6 "$mc_svc
+  faults: [{delay: {percent: 10, fixed: 0s}}]"
+mc_denied_with "faults[].delay.fixed is 1ms to 60s" "fixed 61s" flt-d7 "$mc_svc
+  faults: [{delay: {percent: 10, fixed: 61s}}]"
+mc_denied_with "spec.faults[0].delay.fixed" "fixed 500 (no unit)" flt-d8 "$mc_svc
+  faults: [{delay: {percent: 10, fixed: \"500\"}}]"
+mc_denied_with "spec.faults[0].match.path.type" "a RegularExpression path" flt-d9 "$mc_svc
+  faults: [{match: {path: {type: RegularExpression, value: /c.*}}, abort: {percent: 10, status: 503}}]"
+mc_denied_with "faults fit a Service target only" "faults with only a Deployment target" flt-d10 "$mc_dep
+  faults: [{abort: {percent: 10, status: 503}}]"
+mc_id=msh_17
+kubectl -n default delete mimicconfig flt-a1 flt-a2 flt-a3 flt-a4 flt-a5 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig rty-a1 rty-a2 rty-a3 rty-a4 rty-a5 rty-a6 rty-a7 rty-a8 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig msh1 msh2 msh3 msh4 --ignore-not-found >/dev/null
 
