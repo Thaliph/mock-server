@@ -3893,11 +3893,7 @@ msh_curl() {
 }
 msh_etag() { tr -d '\r' < "$1.h" | sed -n 's/^[Ee][Tt]ag: //p'; }
 # msh_until <timeout seconds> <description> <command...>: polls the command once a second.
-msh_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "msh_28: $desc"
-}
+msh_until() { e2e_until msh_28 "$@"; }
 view_ok() { [[ $(msh_curl web "$WORK/msh.json") == 200 ]]; }
 msh_until 90 "the controller never served the view of web" view_ok
 grep -q '"msh-28-a/web"' "$WORK/msh.json" || fail "msh_28: the view of web lacks its own Service"
@@ -4022,11 +4018,7 @@ msh_41_pod=$(kubectl -n msh-41 get pods -l app=web -o jsonpath='{.items[0].metad
 # msh_41_metric <series>: the value of a series of the sidecar of web ("name" or "name{label=\"v\"}"), empty when absent.
 msh_41_metric() { sidecar_metrics msh-41 "$msh_41_pod" | awk -v n="$1" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
 # msh_41_until <timeout seconds> <description> <command...>
-msh_41_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "msh_41: $desc"
-}
+msh_41_until() { e2e_until msh_41 "$@"; }
 msh_41_two_services() { [[ $(msh_41_metric mimic_mesh_view_services) == 2 ]]; }
 msh_41_until 60 "the sidecar of web never held a view of the 2 Services of its namespace" msh_41_two_services
 [[ $(msh_41_metric 'mimic_mesh_view_pulls_total{result="ok"}') -ge 1 ]] || fail "msh_41: no view was pulled (result ok)"
@@ -5368,11 +5360,7 @@ YAML
 for dep in web v1 v2 pods client; do kubectl -n rte-21 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_21: $dep did not roll out Ready"; done
 kubectl -n rte-21-b rollout status deploy/ext --timeout=3m >/dev/null || fail "rte_21: ext did not roll out Ready"
 # rte_21_until <timeout seconds> <description> <command...>: polls the command once a second.
-rte_21_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "rte_21: $desc"
-}
+rte_21_until() { e2e_until rte_21 "$@"; }
 admin_forward
 # rte_21_gauge: the value of mimic_mesh_gateway_api_present on the controller replica behind the admin port-forward.
 rte_21_gauge() { curl -fs localhost:18081/metrics | awk 'index($0, "mimic_mesh_gateway_api_present ") == 1 { print $2 }'; }
@@ -5610,11 +5598,7 @@ spec:
 YAML
 for dep in cart-v1 cart-v2 client; do kubectl -n rte-55 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_55: $dep did not roll out Ready"; done
 # rte_55_until <timeout seconds> <description> <command...>: polls the command once a second.
-rte_55_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "rte_55: $desc"
-}
+rte_55_until() { e2e_until rte_55 "$@"; }
 admin_forward
 rte_55_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
 rte_55_client=$(kubectl -n rte-55 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
@@ -5826,11 +5810,7 @@ spec:
 YAML
 for dep in slow client; do kubectl -n rte-71 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_71: $dep did not roll out Ready"; done
 # rte_71_until <timeout seconds> <description> <command...>: polls the command once a second.
-rte_71_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "rte_71: $desc"
-}
+rte_71_until() { e2e_until rte_71 "$@"; }
 admin_forward
 rte_71_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
 rte_71_client=$(kubectl -n rte-71 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
@@ -5997,11 +5977,7 @@ spec:
 YAML
 for dep in cart cart-shadow client; do kubectl -n rte-93 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_93: $dep did not roll out Ready"; done
 # rte_93_until <timeout seconds> <description> <command...>: polls the command once a second.
-rte_93_until() {
-  local limit=$1 desc=$2; shift 2
-  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
-  fail "rte_93: $desc"
-}
+rte_93_until() { e2e_until rte_93 "$@"; }
 admin_forward
 rte_93_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
 rte_93_client=$(kubectl -n rte-93 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
