@@ -1203,3 +1203,126 @@ async fn ldt_11_without_load_enabled_a_partial_head_is_forwarded_at_once() {
     c.write_all(partial).await.unwrap();
     assert_eq!(received(&raw, partial.len()).await, partial);
 }
+
+// --- ADM-26: the marker before the admission --------------------------------------------
+
+/// A plain `GET path` on a new connection to `rig`.
+async fn plain(addr: SocketAddr, path: &str) -> (TcpStream, std::time::Instant) {
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    let written = std::time::Instant::now();
+    c.write_all(format!("GET {path} HTTP/1.1\r\nHost: app.test:8080\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    (c, written)
+}
+
+fn assert_admission_refused(answer: &Answer, error: &str, name: &str) {
+    assert_eq!(answer.status, 503, "{name}");
+    assert_eq!(answer.header("x-mimic-error"), vec![error], "{name}");
+    assert_eq!(
+        answer.header("x-mimic-origin"),
+        vec!["inbound; pod=p"],
+        "{name}"
+    );
+    assert_eq!(answer.header("x-mimic-endpoint").len(), 1, "{name}");
+    assert_eq!(answer.header("content-length"), vec!["0"], "{name}");
+    assert!(answer.header("x-mimic-load").is_empty(), "{name}");
+}
+
+#[tokio::test]
+async fn adm_26_http1_the_marker_is_checked_before_admission() {
+    let root = root("deployment root");
+    let app = common::admission::App::http1(1000).await;
+    let state = common::admission::meshed(Some("p"), |_| {});
+    state.hold(common::admission::contract(1, 1000), "\"1-a\"");
+    let rig = rig_meshed(
+        &app_at(app.addr),
+        Mode::Mock,
+        Some(&root),
+        true,
+        None,
+        Some(&state),
+    )
+    .await;
+    let (mut held, _) = plain(rig.addr, "/slow").await;
+    common::until("the app holds /slow", || app.in_flight() == 1).await;
+
+    // (1) A refused ticket takes no place: the plain request after it is queued.
+    let mut x = TcpStream::connect(rig.addr).await.unwrap();
+    x.write_all(&get(Some("not-a-ticket"))).await.unwrap();
+    let (mut y, written) = plain(rig.addr, "/r2").await;
+    assert_refused(
+        &read_answer(&mut x, &mut Vec::new()).await,
+        "ticket",
+        "invalid",
+    );
+    let answer = read_answer(&mut y, &mut Vec::new()).await;
+    assert_admission_refused(&answer, "queue-timeout", "plain");
+    assert!(written.elapsed() >= Duration::from_millis(150));
+    assert_eq!(answer.header("connection"), vec!["close"]);
+
+    // (2) A valid ticket is queued and refused like any request.
+    let mut z = TcpStream::connect(rig.addr).await.unwrap();
+    z.write_all(&get(Some(&valid(&root)))).await.unwrap();
+    let answer = read_answer(&mut z, &mut Vec::new()).await;
+    assert_admission_refused(&answer, "queue-timeout", "valid ticket");
+    assert!(!app.got("/pay"), "{}", app.raw_text());
+
+    // (3) With the slot free, a valid ticket is admitted and marked.
+    let first = read_answer(&mut held, &mut Vec::new()).await;
+    assert_eq!(first.status, 200);
+    app.counts
+        .delay_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let answer = call(rig.addr, &get(Some(&valid(&root)))).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("x-mimic-load"), vec!["ok"]);
+    assert!(
+        app.got("/pay") && !app.got("mimic-load-run"),
+        "{}",
+        app.raw_text()
+    );
+}
+
+#[tokio::test]
+async fn adm_26_h2c_the_marker_is_checked_before_admission() {
+    let root = root("deployment root");
+    let app = common::admission::App::h2c(1000).await;
+    let state = common::admission::meshed(Some("p"), |_| {});
+    state.hold(common::admission::contract(1, 1000), "\"1-a\"");
+    let rig = rig_meshed(
+        &app_at(app.addr),
+        Mode::Mock,
+        Some(&root),
+        true,
+        None,
+        Some(&state),
+    )
+    .await;
+    let mut first = h2c(rig.addr).await;
+    let held = tokio::spawn(async move { h2_call(&mut first, None).await.status });
+    common::until("the app holds the first", || app.in_flight() == 1).await;
+
+    // (1) The refused ticket and a plain request at the same time, on two connections.
+    let (mut x, mut y) = (h2c(rig.addr).await, h2c(rig.addr).await);
+    let written = std::time::Instant::now();
+    let (refused, queued) =
+        tokio::join!(h2_call(&mut x, Some("not-a-ticket")), h2_call(&mut y, None));
+    assert_refused(&refused, "ticket", "invalid");
+    assert_admission_refused(&queued, "queue-timeout", "plain");
+    assert!(written.elapsed() >= Duration::from_millis(150));
+
+    // (2) A valid ticket is queued and refused like any request.
+    let answer = h2_call(&mut y, Some(&valid(&root))).await;
+    assert_admission_refused(&answer, "queue-timeout", "valid ticket");
+    assert_eq!(app.counts.requests(), 1);
+
+    // (3) With the slot free, a valid ticket is admitted and marked.
+    assert_eq!(held.await.unwrap(), 200);
+    app.counts
+        .delay_ms
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let answer = h2_call(&mut y, Some(&valid(&root))).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("x-mimic-load"), vec!["ok"]);
+}

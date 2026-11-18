@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::admission::meshed;
-use common::{capture_logs, closed_port};
+use common::{capture_logs, closed_port, read_all};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -62,15 +62,6 @@ impl Rig {
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
     }
-}
-
-/// Reads to the end of the connection; a reset is an error, a FIN gives the bytes.
-async fn read_all(c: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut out))
-        .await
-        .expect("the end of the connection in time")?;
-    Ok(out)
 }
 
 fn want_head(dst: SocketAddr, origin: &str) -> String {

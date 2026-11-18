@@ -189,6 +189,28 @@ fn marked(held: &[u8]) -> Marked {
     }
 }
 
+/// What the bytes held of a request head say.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum HeldHead {
+    /// Not whole, under 64 KiB, every line valid so far.
+    Open,
+    /// Whole: its end (leading blank lines included), and whether it carries `mimic-load-run`.
+    Whole { end: usize, marked: bool },
+    /// A line the codec rejects, or 64 KiB without its end.
+    Unjudged,
+}
+
+#[allow(dead_code)]
+fn held_head(_held: &[u8]) -> HeldHead {
+    todo!()
+}
+
+#[allow(dead_code)]
+fn completed(_answering: &mut bool, _events: &[Event]) -> usize {
+    todo!()
+}
+
 /// The value of every line of `head` named `name`, outer whitespace removed.
 fn values<'a>(head: &'a [u8], name: &str) -> Vec<&'a [u8]> {
     head.split(|&b| b == b'\n')
@@ -1090,6 +1112,90 @@ mod tests {
         end_of(&mut client).await.expect("a FIN to the client");
         end_of(&mut dest).await.expect("a FIN to the destination");
         assert_eq!(relayed.await.unwrap(), Outcome::Ok);
+    }
+
+    #[test]
+    fn adm_22_held_head_tells_open_whole_and_unjudged() {
+        for open in [
+            &b"GET / HTTP/1.1\r\nHo"[..],
+            b"GET / HTTP/1.1\r\nHost: a\r\n",
+            b"GET / HTT",
+            b"\r\n\r\n\n",
+            b"",
+        ] {
+            assert_eq!(held_head(open), HeldHead::Open, "{open:?}");
+        }
+        let crlf = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        assert_eq!(
+            held_head(crlf),
+            HeldHead::Whole {
+                end: crlf.len(),
+                marked: false
+            }
+        );
+        let lf = b"\r\n\nGET / HTTP/1.1\nHost: a\nMimic-Load-Run: x\n\nbody";
+        assert_eq!(
+            held_head(lf),
+            HeldHead::Whole {
+                end: lf.len() - 4,
+                marked: true
+            }
+        );
+        for unjudged in [
+            &b"GET / HTTP/1.1\r\nBad Header : x\r\n"[..],
+            b"GET / HTTP/1.1\r\nno colon here\r\n\r\n",
+        ] {
+            assert_eq!(held_head(unjudged), HeldHead::Unjudged, "{unjudged:?}");
+        }
+        let mut big = b"GET / HTTP/1.1\r\n".to_vec();
+        while big.len() < HEAD_LIMIT {
+            big.extend_from_slice(b"x-pad: aaaaaaaaaaaaaaaa\r\n");
+        }
+        assert_eq!(held_head(&big), HeldHead::Unjudged);
+        assert_eq!(held_head(&big[..HEAD_LIMIT - 1]), HeldHead::Open);
+    }
+
+    #[test]
+    fn adm_18_completed_counts_only_solicited_final_responses() {
+        use mimic_core::proxy::http1::{RequestHead, ResponseHead, Version};
+        let request = RequestHead {
+            method: "GET".into(),
+            path: "/".into(),
+            uri_authority: None,
+            host: None,
+            version: Version::Http11,
+            upgrade: false,
+            connect: false,
+        };
+        let head = |status, request: Option<RequestHead>| ResponseHead {
+            version: Version::Http11,
+            status,
+            request,
+        };
+        let end = Event::ResponseEnd { body_bytes: 0 };
+        let solicited = Event::Response(head(200, Some(request.clone())));
+        let mut answering = false;
+        assert_eq!(
+            completed(&mut answering, &[solicited.clone(), end.clone()]),
+            1
+        );
+        assert!(!answering);
+        assert_eq!(
+            completed(&mut answering, std::slice::from_ref(&solicited)),
+            0
+        );
+        assert!(answering);
+        assert_eq!(completed(&mut answering, std::slice::from_ref(&end)), 1);
+        let unsolicited = Event::Response(head(408, None));
+        assert_eq!(completed(&mut answering, &[unsolicited, end.clone()]), 0);
+        let interim = Event::Interim(head(103, Some(request.clone())));
+        let switched = Event::Response(head(101, Some(request.clone())));
+        assert_eq!(
+            completed(&mut answering, &[interim.clone(), switched, Event::Tunnel]),
+            1
+        );
+        assert_eq!(completed(&mut answering, &[interim]), 0);
+        assert!(!answering);
     }
 
     /// PRX-33: the observation of a response (access line, metrics, discovery) comes after its

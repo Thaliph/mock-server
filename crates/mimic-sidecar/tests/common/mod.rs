@@ -10,6 +10,7 @@ pub mod admission;
 pub mod faults;
 pub mod mesh_pods;
 pub mod mock_rig;
+pub mod prx_corpus;
 pub mod tls_rig;
 
 use mimic_runtime::metrics::Metrics;
@@ -142,7 +143,8 @@ pub async fn fixture_mesh_on(
     discovery: Option<&mimic_sidecar::discovery::Discovery>,
     configure: impl FnOnce(Shared) -> Shared,
 ) -> Fixture {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // The sidecar's own bind (backlog 1024): bursts of connections are not reset.
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
@@ -338,4 +340,14 @@ pub async fn h2_client(addr: SocketAddr) -> H2Sender {
             .unwrap();
     tokio::spawn(connection);
     sender
+}
+
+/// Reads to the end of the connection (at most 10 s): a reset is an error, a FIN gives the
+/// bytes.
+pub async fn read_all(c: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out))
+        .await
+        .expect("the end of the connection in time")?;
+    Ok(out)
 }
