@@ -565,7 +565,35 @@ mc_denied_with "spec.faults[0].match.path.type" "a RegularExpression path" flt-d
   faults: [{match: {path: {type: RegularExpression, value: /c.*}}, abort: {percent: 10, status: 503}}]"
 mc_denied_with "faults fit a Service target only" "faults with only a Deployment target" flt-d10 "$mc_dep
   faults: [{abort: {percent: 10, status: 503}}]"
+# ADM-13 (#453): admission, bounds, required fields and target kind.
+log "adm_13: the MimicConfig CRD accepts admission within its bounds on a Deployment and refuses each one out of them"
+mc_id=adm_13
+mc_accepted "admission 1/1" adm-a1 "$mc_dep
+  admission: {concurrency: 1, rps: 1}"
+mc_accepted "admission 100000/1000000" adm-a2 "$mc_dep
+  admission: {concurrency: 100000, rps: 1000000}"
+[[ $(kubectl -n default get mimicconfig adm-a2 -o jsonpath='{.spec.admission.concurrency} {.spec.admission.rps}') == "100000 1000000" ]] \
+  || fail "adm_13: the admission 100000/1000000 was not kept"
+mc_accepted "admission on a config with both target kinds" adm-a3 '  targetRefs:
+    - {group: apps, kind: Deployment, name: cart}
+    - {group: "", kind: Service, name: cart}
+  admission: {concurrency: 64, rps: 200}'
+mc_denied_with spec.admission.concurrency "concurrency 0" adm-d1 "$mc_dep
+  admission: {concurrency: 0, rps: 10}"
+mc_denied_with spec.admission.concurrency "concurrency 100001" adm-d2 "$mc_dep
+  admission: {concurrency: 100001, rps: 10}"
+mc_denied_with spec.admission.concurrency "an admission without concurrency" adm-d3 "$mc_dep
+  admission: {rps: 10}"
+mc_denied_with spec.admission.rps "rps 0" adm-d4 "$mc_dep
+  admission: {concurrency: 10, rps: 0}"
+mc_denied_with spec.admission.rps "rps 1000001" adm-d5 "$mc_dep
+  admission: {concurrency: 10, rps: 1000001}"
+mc_denied_with spec.admission.rps "an admission without rps" adm-d6 "$mc_dep
+  admission: {concurrency: 10}"
+mc_denied_with "admission fits a Deployment target only" "admission with only a Service target" adm-d7 "$mc_svc
+  admission: {concurrency: 10, rps: 10}"
 mc_id=msh_17
+kubectl -n default delete mimicconfig adm-a1 adm-a2 adm-a3 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig flt-a1 flt-a2 flt-a3 flt-a4 flt-a5 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig rty-a1 rty-a2 rty-a3 rty-a4 rty-a5 rty-a6 rty-a7 rty-a8 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig msh1 msh2 msh3 msh4 --ignore-not-found >/dev/null

@@ -89,9 +89,25 @@ fn config() -> impl Strategy<Value = Config> {
         prop::option::of(prop::collection::vec((ns(), name()), 0..4)),
         prop::option::of(any::<bool>()),
         prop::option::of(0u32..4000),
+        prop::option::of((
+            prop::option::of(prop_oneof![
+                Just(0u32),
+                Just(1),
+                Just(100_000),
+                Just(100_001),
+                1u32..=100_000
+            ]),
+            prop::option::of(prop_oneof![
+                Just(0u32),
+                Just(1),
+                Just(1_000_000),
+                Just(1_000_001),
+                1u32..=1_000_000
+            ]),
+        )),
     )
         .prop_map(
-            |(n, nm, created, targets, destinations, mesh_enabled, slow_start)| Config {
+            |(n, nm, created, targets, destinations, mesh_enabled, slow_start, admission)| Config {
                 namespace: n.into(),
                 name: nm.into(),
                 created,
@@ -123,6 +139,7 @@ fn config() -> impl Strategy<Value = Config> {
                 outlier_detection: None,
                 circuit_breaker: None,
                 faults: None,
+                admission: admission.map(|(concurrency, rps)| AdmissionSpec { concurrency, rps }),
             },
         )
 }

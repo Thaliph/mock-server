@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::admission::{Contract, MAX_CONCURRENCY, MAX_RPS};
 use super::input::{
     Config, FaultSpec, MIMIC_GROUP, ReferenceGrant, RouteMatch, Snapshot, TargetKind,
 };
@@ -441,6 +442,13 @@ pub fn validate(config: &Config) -> Result<(), String> {
         validate_faults(faults)?;
     }
     Ok(())
+}
+
+/// The contract of a Deployment from its winning config, taken whole; `None` without one
+/// (ADM-09).
+pub fn contract(winner: Option<&Config>) -> Option<Contract> {
+    let _ = winner;
+    todo!()
 }
 
 type TargetKey<'a> = (TargetKind, &'a str, &'a str);

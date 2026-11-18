@@ -110,6 +110,16 @@ pub struct Config {
     pub circuit_breaker: Option<BreakerSpec>,
     /// `spec.faults` (a Service target only, #452); `None` when the object has none.
     pub faults: Option<Vec<FaultSpec>>,
+    /// `spec.admission` (a Deployment target only, #453); `None` when the object has none.
+    pub admission: Option<AdmissionSpec>,
+}
+
+/// `spec.admission`; `None` is a field the object does not set. A value the adapter cannot
+/// read arrives as `u32::MAX`, out of bounds, so that `validate` refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionSpec {
+    pub concurrency: Option<u32>,
+    pub rps: Option<u32>,
 }
 
 /// One item of `spec.faults`; `None` is a member the object does not set.

@@ -942,6 +942,19 @@ grep -qxF -- "!has(self.faults) || self.targetRefs.exists(t, t.kind == 'Service'
   || fail "flt_04: the MimicConfig CRD lacks the CEL rule that fits faults to a Service target only"
 echo "flt_04: the MimicConfig CRD bounds faults and fits them to a Service target only"
 
+# ADM-12 (#453): admission of the MimicConfig CRD, its bounds and its CEL rule.
+a='.properties.admission'
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$a | [.type, (.required | sort)]") == '["object",["concurrency","rps"]]' ]] \
+  || fail "adm_12: admission is not an object that requires concurrency and rps"
+for f in "concurrency 100000" "rps 1000000"; do
+  read -r name max <<<"$f"
+  [[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 "$a.properties.$name | [.type, .minimum, .maximum]") == "[\"integer\",1,$max]" ]] \
+    || fail "adm_12: admission.$name is not an integer of 1 to $max"
+done
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.["x-kubernetes-validations"][] | select(.message == "admission fits a Deployment target only") | .rule') == "!has(self.admission) || self.targetRefs.exists(t, t.kind == 'Deployment')" ]] \
+  || fail "adm_12: the MimicConfig CRD lacks the CEL rule that fits admission to a Deployment target only"
+echo "adm_12: the MimicConfig CRD bounds admission and fits it to a Deployment target only"
+
 # MSH-29 (#441): the controller's RBAC for the mesh watches, and the variables the mesh values render.
 role=$(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller")' "$tmp/default.yaml")
 rule_verbs() { # rule_verbs <resource>: the verbs of the rules that name the resource, one line each

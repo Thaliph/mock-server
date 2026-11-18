@@ -30,6 +30,8 @@ mod tests_budget;
 #[cfg(test)]
 mod tests_consent;
 #[cfg(test)]
+mod tests_contract;
+#[cfg(test)]
 mod tests_eject;
 #[cfg(test)]
 mod tests_fault;

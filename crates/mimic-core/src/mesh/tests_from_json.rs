@@ -1,5 +1,6 @@
 //! MSH-12: `View::from_json` reads what `build` writes and refuses the rest.
 
+use super::admission::Contract;
 use super::input::*;
 use super::testkit::*;
 use super::view::{Built, Limits, View, build};
@@ -169,8 +170,8 @@ fn msh_06_an_object_created_again_has_another_generations_key() {
     );
 }
 
-#[test]
-fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
+/// The RTY-45 fixture: a policy with retries and a retry budget at their bounds.
+fn retried() -> Built {
     let mut s = snapshot();
     s.services = vec![http_svc("shop", "cart", "10.96.12.7")];
     let mut c = cfg("shop", "c", 1, &[(TargetKind::Service, "cart")]);
@@ -181,7 +182,12 @@ fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
         window_seconds: Some(60),
     });
     s.configs = vec![c];
-    let b = build(&s, "shop", "cart", Mode::Mock, &Limits::default());
+    build(&s, "shop", "cart", Mode::Mock, &Limits::default())
+}
+
+#[test]
+fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
+    let b = retried();
     let back = read(&b.json).expect("a built view reads back");
     assert_eq!(back, b.view);
     assert_eq!(back.to_json(), b.json);
@@ -726,4 +732,53 @@ fn flt_06_the_fuzz_seed_view_holds_16_faults_with_every_kind_of_match_item() {
             .any(|f| f.delay.is_some() && f.abort.is_some())
     );
     assert!(faults.iter().any(|f| f.r#match.is_none()));
+}
+
+#[test]
+fn adm_10_the_view_fixtures_of_msh_12_rty_45_rte_12_cbr_02_and_flt_02_read_back_with_and_without_admission()
+ {
+    let head = r#"{"admission":{"concurrency":64,"rps":200},"#;
+    for (name, b) in [
+        ("msh_12 and cbr_02", rich()),
+        ("rty_45", retried()),
+        ("rte_12", routed()),
+        (
+            "flt_02",
+            super::tests_fault::built(vec![super::tests_fault::full_fault()]),
+        ),
+    ] {
+        let back = read(&b.json).expect(name);
+        assert_eq!(back.to_json(), b.json, "{name}");
+        assert_eq!(back.admission, None, "{name}");
+        let spliced = b.json.replacen('{', head, 1);
+        assert_ne!(spliced, b.json, "{name}");
+        let back = read(&spliced).expect(name);
+        assert_eq!(
+            back.admission,
+            Some(Contract {
+                concurrency: 64,
+                rps: 200
+            }),
+            "{name}"
+        );
+        assert_eq!(back.to_json(), spliced, "{name}");
+    }
+}
+
+#[test]
+fn adm_14_the_fuzz_seed_view_holds_an_admission_and_reads_back_equal() {
+    let seed = include_str!("../../../../fuzz/seeds/mesh/view");
+    assert!(
+        seed.starts_with(r#"{"admission":{"concurrency":64,"rps":200},"cluster""#),
+        "{seed}"
+    );
+    let view = read(seed.trim_end()).expect("the seed view is accepted");
+    assert_eq!(
+        view.admission,
+        Some(Contract {
+            concurrency: 64,
+            rps: 200
+        })
+    );
+    assert_eq!(view.to_json(), seed.trim_end());
 }

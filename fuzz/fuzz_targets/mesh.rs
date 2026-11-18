@@ -2,8 +2,9 @@
 //!
 //! The input is read as a view document, as it is, and as the seed view with writes over its
 //! bytes (every three bytes: two of position, one of value). `View::from_json` never panics
-//! and its errors stay short; a document it accepts holds the bounds, writes canonical JSON
-//! that reads back to the same view and the same bytes (a fixed point), with a stable ETag.
+//! and its errors stay short; a document it accepts holds the bounds (its admission contract
+//! included, ADM-14), writes canonical JSON that reads back to the same view and the same bytes
+//! (a fixed point), with a stable ETag.
 
 #![no_main]
 
@@ -18,6 +19,10 @@ fn check(text: &str, limits: &Limits) {
         Ok(view) => {
             assert!(view.services.len() <= limits.max_services);
             assert!(view.endpoint_count() <= limits.max_endpoints);
+            assert!(
+                view.admission.is_none_or(|c| view.mesh && c.in_bounds()),
+                "an accepted contract is in bounds, in a view of mesh true"
+            );
             let json = view.to_json();
             let back = View::from_json(&json, &Limits {
                 max_view_bytes: json.len().max(limits.max_view_bytes),

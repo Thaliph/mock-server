@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::admission::Contract;
 use super::input::{EndpointSlice, Route, Service, Snapshot, TargetKind, TargetPort};
 use super::policy::{
     MAX_FAULTS, MAX_RETRIES, MAX_SLOW_START_SECS, Policy, Winners, consents, effective,
@@ -76,6 +77,10 @@ pub struct ServiceView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct View {
+    /// The contract of the deployment's winning config (spec §7.9 "Admission"); never in a
+    /// view of `mesh: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<Contract>,
     pub cluster: String,
     pub format: u32,
     pub generations: BTreeMap<String, i64>,
@@ -524,6 +529,7 @@ pub fn build(
     let winners = Winners::new(&snapshot.configs);
     let own = winners.get(TargetKind::Deployment, namespace, deployment);
     let mut view = View {
+        admission: None,
         cluster: snapshot.cluster.clone(),
         format: FORMAT,
         generations: BTreeMap::new(),

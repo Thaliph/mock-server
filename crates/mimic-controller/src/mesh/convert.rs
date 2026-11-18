@@ -244,6 +244,7 @@ pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
             .get("faults")
             .and_then(Value::as_array)
             .map(|list| list.iter().map(fault).collect()),
+        admission: None,
     };
     Some((key, config))
 }
