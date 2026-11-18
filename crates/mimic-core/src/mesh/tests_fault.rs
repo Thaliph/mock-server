@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use super::fault::{Decision, Kind, decide, drawn};
+use super::fault::{Decision, Faults, Kind, decide, drawn};
 use super::input::*;
 use super::policy::{Fault, FaultAbort, FaultDelay, effective, statuses, validate};
 use super::route::{MatchView, NameValue, PathView, RequestParts};
@@ -734,5 +734,88 @@ proptest! {
         if first.is_none() {
             prop_assert_eq!(got, None);
         }
+    }
+}
+
+fn any_items(names: &'static [&'static str]) -> impl Strategy<Value = Vec<NameValue>> {
+    proptest::collection::vec(
+        (
+            proptest::sample::select(names),
+            prop_oneof![Just("1"), Just("2"), Just("1,2"), Just("a b")],
+        ),
+        0..=4,
+    )
+    .prop_map(|items| {
+        items
+            .into_iter()
+            .map(|(name, value)| NameValue {
+                name: name.into(),
+                value: value.into(),
+            })
+            .collect()
+    })
+}
+
+/// Matches with repeated names, several faults naming one header, and query items.
+fn any_rich_fault() -> impl Strategy<Value = Fault> {
+    let m = (
+        any_items(&["x-a", "x-b", "x-c"]),
+        any_items(&["q", "r"]),
+        proptest::option::of(prop_oneof![Just("GET"), Just("POST")]),
+        proptest::option::of(prop_oneof![Just("/"), Just("/a")]),
+    )
+        .prop_map(|(headers, query_params, method, path)| MatchView {
+            headers,
+            method: method.map(Into::into),
+            path: path.map(|v| PathView {
+                kind: "PathPrefix".into(),
+                value: v.into(),
+            }),
+            query_params,
+        });
+    (
+        proptest::option::of(m),
+        proptest::option::of((0u32..=100, 200u16..=599)),
+        proptest::option::of((0u32..=100, 1u64..=60_000)),
+    )
+        .prop_map(|(m, a, d)| fault(m, a, d))
+}
+
+proptest! {
+    #[test]
+    fn flt_07_the_prepared_faults_decide_what_match_holds_says(
+        faults in proptest::collection::vec(any_rich_fault(), 0..=16),
+        headers in proptest::collection::vec(
+            (
+                prop_oneof![Just("x-a"), Just("X-A"), Just("x-b"), Just("X-C"), Just("y")],
+                prop_oneof![Just(&b"1"[..]), Just(&b"2"[..]), Just(&b"a b"[..])],
+            ),
+            0..=5,
+        ),
+        query in prop_oneof![
+            Just(None),
+            Just(Some("q=1")),
+            Just(Some("q=a%20b&r=1")),
+            Just(Some("r=2&q=1&q=2")),
+        ],
+        method in prop_oneof![Just("GET"), Just("POST")],
+        p in prop_oneof![Just("/"), Just("/a/b"), Just("/b")],
+        r in any::<u64>(),
+        s in any::<u64>(),
+    ) {
+        let parts = RequestParts { method, path: p, query, headers: &headers };
+        let first = faults.iter().position(|f| {
+            f.r#match.as_ref().is_none_or(|m| super::route::match_holds(m, &parts))
+        });
+        let want = first.and_then(|index| {
+            let f = &faults[index];
+            let kind = match (&f.abort, &f.delay) {
+                (Some(a), _) if drawn(r, a.percent) => Kind::Abort { status: a.status },
+                (_, Some(d)) if drawn(s, d.percent) => Kind::Delay { ms: d.fixed_ms },
+                _ => return None,
+            };
+            Some(Decision { index, kind })
+        });
+        prop_assert_eq!(Faults::new(&faults).decide(&parts, r, s), want);
     }
 }

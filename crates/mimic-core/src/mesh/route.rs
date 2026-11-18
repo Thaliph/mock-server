@@ -14,7 +14,7 @@ mod apply;
 mod table;
 
 pub use apply::{FieldList, Pick, draw};
-pub use table::{RequestParts, Table, match_holds, split_target};
+pub use table::{Matches, RequestParts, Table, match_holds, split_target};
 
 use super::view::{
     MAX_ITEMS, MAX_MATCHES, MAX_RULES, MAX_WEIGHT, fraction, header_name, header_value, method,

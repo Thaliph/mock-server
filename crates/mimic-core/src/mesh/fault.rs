@@ -2,8 +2,8 @@
 //! policy applies and what it does. Pure: the request parts and the two random values come in
 //! as arguments.
 
-use super::policy::Fault;
-use super::route::{RequestParts, match_holds};
+use super::policy::{Fault, FaultAbort, FaultDelay};
+use super::route::{Matches, RequestParts};
 
 /// What the sidecar does to the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,24 +27,55 @@ pub fn drawn(r: u64, percent: u32) -> bool {
     (u128::from(r) * 100) >> 64 < u128::from(percent)
 }
 
-/// The decision for a request: the first fault whose `match` holds (none: every request) is
-/// the one; its abort is drawn with `r_abort` and its delay, independently, with `r_delay`. An
-/// abort drawn wins over a delay drawn. `None` when no fault holds or nothing is drawn.
+/// The faults of a policy made once, when the view is built: their matches deduplicated and
+/// their header names looked up once per request (FLT-10). The sidecar keeps one per policy of
+/// its view; [`decide`] makes one per call.
+pub struct Faults {
+    matches: Matches,
+    effects: Vec<(Option<FaultAbort>, Option<FaultDelay>)>,
+}
+
+impl Faults {
+    pub fn new(faults: &[Fault]) -> Self {
+        Faults {
+            matches: Matches::new(faults.iter().map(|f| f.r#match.as_ref())),
+            effects: faults
+                .iter()
+                .map(|f| (f.abort.clone(), f.delay.clone()))
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    /// The decision for a request: the first fault whose `match` holds (none: every request)
+    /// is the one; its abort is drawn with `r_abort` and its delay, independently, with
+    /// `r_delay`. An abort drawn wins over a delay drawn. `None` when no fault holds or nothing
+    /// is drawn.
+    pub fn decide(&self, req: &RequestParts, r_abort: u64, r_delay: u64) -> Option<Decision> {
+        if self.is_empty() {
+            return None;
+        }
+        let index = self.matches.first(req)?;
+        let (abort, delay) = &self.effects[index];
+        let kind = if let Some(a) = abort.as_ref().filter(|a| drawn(r_abort, a.percent)) {
+            Kind::Abort { status: a.status }
+        } else {
+            let d = delay.as_ref().filter(|d| drawn(r_delay, d.percent))?;
+            Kind::Delay { ms: d.fixed_ms }
+        };
+        Some(Decision { index, kind })
+    }
+}
+
+/// [`Faults::decide`] over `faults` made for this one request.
 pub fn decide(
     faults: &[Fault],
     req: &RequestParts,
     r_abort: u64,
     r_delay: u64,
 ) -> Option<Decision> {
-    let (index, fault) = faults
-        .iter()
-        .enumerate()
-        .find(|(_, f)| f.r#match.as_ref().is_none_or(|m| match_holds(m, req)))?;
-    let kind = if let Some(a) = fault.abort.as_ref().filter(|a| drawn(r_abort, a.percent)) {
-        Kind::Abort { status: a.status }
-    } else {
-        let d = fault.delay.as_ref().filter(|d| drawn(r_delay, d.percent))?;
-        Kind::Delay { ms: d.fixed_ms }
-    };
-    Some(Decision { index, kind })
+    Faults::new(faults).decide(req, r_abort, r_delay)
 }
