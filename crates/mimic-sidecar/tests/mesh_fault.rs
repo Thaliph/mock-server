@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::faults::{abort_on, absent, no_series, status};
-use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, view_services};
+use common::faults::{abort_on, absent, lower, no_series, status};
+use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, mesh_state, view_services};
 use common::{capture_logs, fixture_mesh, h2_client, median, metric, until};
 use http_body_util::{BodyExt, Empty};
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
@@ -26,16 +26,6 @@ const CHECKOUT: &str = r#"[{"abort":{"percent":100,"status":503},"match":{"metho
 
 const POST_CHECKOUT: &[u8] =
     b"POST /checkout/1 HTTP/1.1\r\nHost: cart.shop.svc:80\r\ncontent-length: 0\r\n\r\n";
-
-fn state(services: &[Svc]) -> MeshState {
-    let state = MeshState::new(&MeshConfig {
-        enabled: true,
-        seed: Some(21),
-        ..MeshConfig::default()
-    });
-    state.hold(view_services(services), "\"1-a\"");
-    state
-}
 
 /// A backend of a rule.
 fn backend(service: &str, weight: u32) -> String {
@@ -66,10 +56,6 @@ fn exact(path: &str) -> String {
 }
 
 const EVERY_PATH: &str = r#"{"path":{"type":"PathPrefix","value":"/"}}"#;
-
-fn lower(head: &str) -> String {
-    head.to_ascii_lowercase()
-}
 
 /// The answer of an abort (spec §7.9 "Fault injection"): `status`, exactly one
 /// `x-mimic-error: fault-injected`, `content-length: 0`, no pod named, no body, the connection
@@ -107,7 +93,7 @@ async fn flt_11_an_http1_abort_answers_the_status_and_keeps_the_connection() {
     let cluster = Pod::http1("cluster", 0).await;
     let cart =
         Svc::new("shop/cart", "127.0.0.1", cluster.addr.port(), &[pod.addr]).faults(CHECKOUT);
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster.addr, &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..20 {
@@ -167,7 +153,10 @@ async fn h2_call(
 async fn flt_11_h2c_an_abort_answers_its_stream_and_the_other_streams_go_on() {
     let _logs = capture_logs();
     let pod = Pod::h2c("pod", 300, None).await;
-    let state = state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let sender = h2_client(f.addr).await;
     let get = {
@@ -192,7 +181,10 @@ async fn flt_11_h2c_an_abort_answers_its_stream_and_the_other_streams_go_on() {
 async fn flt_11_intercepted_tls_an_abort_is_answered_on_the_kept_connection() {
     let logs = capture_logs();
     let rig = common::tls_rig::rig_with(|pod| {
-        state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod]).faults(CHECKOUT)])
+        mesh_state(
+            &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod]).faults(CHECKOUT)],
+            |_| {},
+        )
     })
     .await;
     let mut tls = common::tls_rig::client(&rig).await;
@@ -231,7 +223,7 @@ async fn flt_11_configured_statuses_204_304_and_head() {
     );
     let cart = Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr])
         .faults(&format!("[{}]", faults.join(",")));
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for want in [200, 418, 599, 204, 304] {
@@ -280,7 +272,7 @@ async fn flt_11_a_1_mib_post_is_aborted_without_reading_its_body() {
     let cluster = Pod::http1("cluster", 0).await;
     let cart =
         Svc::new("shop/cart", "127.0.0.1", cluster.addr.port(), &[pod.addr]).faults(CHECKOUT);
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster.addr, &state, None).await;
     let stream = TcpStream::connect(f.addr).await.unwrap();
     let (mut read, mut write) = stream.into_split();
@@ -309,7 +301,10 @@ async fn flt_11_a_1_mib_post_is_aborted_without_reading_its_body() {
 async fn flt_31_http1_an_abort_with_its_body_unread_closes_the_connection() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     // 1 KiB of a declared 10 KiB, and the app stops sending.
@@ -341,7 +336,7 @@ async fn flt_31_a_routed_http1_abort_with_its_body_unread_closes_the_connection(
     let cart = Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr])
         .faults(CHECKOUT)
         .routes(&routes);
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     client
@@ -364,18 +359,6 @@ async fn flt_31_a_routed_http1_abort_with_its_body_unread_closes_the_connection(
     assert_eq!(pod.counts.accepted(), 0);
 }
 
-/// The values the sidecar drew between two states of its random source (each draw adds the
-/// SplitMix64 increment).
-fn draws(from: u64, to: u64) -> u64 {
-    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-    // The inverse of the (odd) increment modulo 2^64, by Newton's iteration.
-    let mut inverse = GOLDEN;
-    for _ in 0..6 {
-        inverse = inverse.wrapping_mul(2u64.wrapping_sub(GOLDEN.wrapping_mul(inverse)));
-    }
-    to.wrapping_sub(from).wrapping_mul(inverse)
-}
-
 /// The values drawn for 10 `GET /` to `shop/cart` with these faults, routed when `routed`
 /// (the decision is then asked even without faults).
 async fn draws_of(routed: bool, faults: &str) -> u64 {
@@ -385,15 +368,15 @@ async fn draws_of(routed: bool, faults: &str) -> u64 {
     if routed {
         cart = cart.routes(&route(&[(EVERY_PATH, &[backend("shop/cart", 1)], "")]));
     }
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
-    let before = state.random_state_for_test();
+    let before = state.draws_for_test();
     for _ in 0..10 {
         let (head, _) = client.get("/").await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     }
-    draws(before, state.random_state_for_test())
+    state.draws_for_test() - before
 }
 
 #[tokio::test]
@@ -412,7 +395,10 @@ async fn flt_14_a_service_without_faults_draws_no_random_value() {
 async fn flt_31_h2c_an_abort_of_a_stream_still_sending_is_reset_no_error() {
     let _logs = capture_logs();
     let pod = Pod::h2c("pod", 0, None).await;
-    let state = state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let tcp = TcpStream::connect(f.addr).await.unwrap();
     let (send, conn) = h2::client::handshake(tcp).await.unwrap();
@@ -482,7 +468,10 @@ async fn flt_12_ten_percent_aborts_about_a_thousand_of_ten_thousand() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let ten = r#"[{"abort":{"percent":10,"status":503}}]"#;
-    let state = state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(ten)]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(ten)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let aborted = aborted_of(f.addr, 10_000).await;
     assert!((800..=1200).contains(&aborted), "aborted {aborted}");
@@ -503,7 +492,10 @@ async fn flt_12_ten_percent_aborts_about_a_thousand_of_ten_thousand() {
     // `percent` 0 aborts none and makes no series.
     let pod = Pod::http1("pod", 0).await;
     let zero = r#"[{"abort":{"percent":0,"status":503}}]"#;
-    let state = self::state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(zero)]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(zero)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     assert_eq!(aborted_of(f.addr, 200).await, 0);
     assert_eq!(pod.counts.requests(), 200);
@@ -533,7 +525,7 @@ async fn flt_13_an_abort_takes_no_try_slot_budget_mirror_or_modifier() {
         .faults(&faults)
         .routes(&routes);
     let mirror = Svc::new("shop/shadow", "127.0.0.2", 80, &[shadow.addr]).headless();
-    let state = state(&[cart, mirror]);
+    let state = mesh_state(&[cart, mirror], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let held = tokio::spawn({
         let addr = f.addr;
@@ -587,7 +579,10 @@ async fn flt_13_an_abort_takes_no_try_slot_budget_mirror_or_modifier() {
 async fn flt_13_an_abort_is_a_synthetic_exchange_and_never_recorded() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr]).faults(CHECKOUT)],
+        |_| {},
+    );
     let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
     let f = fixture_mesh(cluster_ip(), &state, Some(&discovery)).await;
     let mut client = H1Client::connect(f.addr).await;
@@ -626,7 +621,7 @@ async fn flt_14_the_access_line_of_an_abort_and_of_a_request_not_drawn() {
     let cart = Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr])
         .faults(&faults)
         .routes(&routes);
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for path in ["/a", "/n", "/x"] {
@@ -658,8 +653,11 @@ async fn flt_14_the_access_line_of_an_abort_and_of_a_request_not_drawn() {
         assert_eq!(l["upstream"], pod.addr.to_string(), "{l}");
     }
     // Unrouted: no route and no rule.
-    let unrouted = self::state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr])
-        .faults(&format!("[{}]", abort_on("/a", 100, 503)))]);
+    let unrouted = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[pod.addr])
+            .faults(&format!("[{}]", abort_on("/a", 100, 503)))],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &unrouted, None).await;
     let (head, _) = H1Client::connect(f.addr).await.get("/a").await;
     assert_eq!(status(&head), 503, "{head}");
@@ -768,7 +766,7 @@ async fn flt_21_the_sidecars_own_route_answers_carry_no_fault() {
     let cart = Svc::new("shop/cart", "127.0.0.1", 80, &[own.addr])
         .faults(r#"[{"abort":{"percent":100,"status":503}}]"#)
         .routes(&routes);
-    let state = state(&[cart]);
+    let state = mesh_state(&[cart], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for (path, want, reason) in [
@@ -795,7 +793,10 @@ async fn flt_24_a_forwarded_fault_injected_is_an_app_answer() {
             .to_vec()
     };
     let (a, b) = (RawPod::start(reply).await, RawPod::start(reply).await);
-    let state = state(&[Svc::new("shop/cart", "127.0.0.1", 80, &[a.addr, b.addr])]);
+    let state = mesh_state(
+        &[Svc::new("shop/cart", "127.0.0.1", 80, &[a.addr, b.addr])],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..10 {

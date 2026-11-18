@@ -572,10 +572,34 @@ impl Drop for Slot {
     }
 }
 
+/// SplitMix64's increment, added to the state at each draw.
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The inverse of [`GOLDEN`] (odd) modulo 2^64, by Newton's iteration: a state difference
+/// times it is the number of draws.
+const GOLDEN_INVERSE: u64 = {
+    let mut inverse = GOLDEN;
+    let mut i = 0;
+    while i < 6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(GOLDEN.wrapping_mul(inverse)));
+        i += 1;
+    }
+    inverse
+};
+
+/// SplitMix64's output function of a state.
+fn splitmix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 pub(crate) struct Router {
     started: Instant,
     /// SplitMix64 state: one atomic add per draw, no lock.
     seed: AtomicU64,
+    /// The state at start, to count the draws (test hook).
+    first_seed: u64,
     backends: RwLock<BTreeMap<String, Arc<Backend>>>,
     pub(crate) pools: Arc<Pools>,
     /// The pools of the copies sent to mirrors, apart from those of every other request.
@@ -606,9 +630,11 @@ impl Router {
         refusal_delay: Duration,
         mirrors: MirrorConfig,
     ) -> Router {
+        let seed = seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX));
         Router {
             started: Instant::now(),
-            seed: AtomicU64::new(seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX))),
+            seed: AtomicU64::new(seed),
+            first_seed: seed,
             backends: RwLock::new(BTreeMap::new()),
             pools: Pools::new(idle_timeout),
             mirror_pools: Pools::new(idle_timeout),
@@ -689,20 +715,30 @@ impl Router {
         ((u128::from(self.random()) * n as u128) >> 64) as usize
     }
 
-    /// The SplitMix64 state now: each draw adds its increment (test hook).
-    pub(crate) fn random_state(&self) -> u64 {
-        self.seed.load(Ordering::Relaxed)
+    /// The `k`-th next value `random` gives (1: the next), without drawing it (test hook).
+    pub(crate) fn peek_random(&self, k: u64) -> u64 {
+        splitmix(
+            self.seed
+                .load(Ordering::Relaxed)
+                .wrapping_add(GOLDEN.wrapping_mul(k)),
+        )
+    }
+
+    /// How many values were drawn since the router was made (test hook).
+    pub(crate) fn draws(&self) -> u64 {
+        self.seed
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.first_seed)
+            .wrapping_mul(GOLDEN_INVERSE)
     }
 
     /// A uniform 64-bit value (SplitMix64).
     pub(crate) fn random(&self) -> u64 {
-        let mut z = self
-            .seed
-            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
-            .wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        splitmix(
+            self.seed
+                .fetch_add(GOLDEN, Ordering::Relaxed)
+                .wrapping_add(GOLDEN),
+        )
     }
 
     /// The sidecar's monotonic clock, the one the retry budget is given.

@@ -9,12 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::mesh_pods::{EchoPod, H1Client, Pod};
+use common::mesh_pods::{EchoPod, H1Client, Pod, Svc, mesh_state, view_services};
 use common::{Logs, capture_logs, closed_port, fixture_mesh};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use mimic_core::mesh::view::{Limits, View};
-use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -106,99 +104,15 @@ impl ModePod {
     }
 }
 
-/// A Service of the view: its ports with their pods, its ClusterIP (none: headless), its
-/// outlier policy and its routes.
-struct Svc {
-    key: &'static str,
-    ip: Option<String>,
-    ports: Vec<(u16, Vec<SocketAddr>)>,
-    outlier: (u32, u32, u32, u32),
-    routes: String,
-}
-
-fn svc(key: &'static str, ip: Option<&str>, port: u16, pods: &[SocketAddr]) -> Svc {
-    Svc {
-        key,
-        ip: ip.map(str::to_string),
-        ports: vec![(port, pods.to_vec())],
-        outlier: (30, 0, 5, 50),
-        routes: String::new(),
-    }
-}
-
-impl Svc {
-    /// `baseEjectionSeconds`, `consecutive5xx`, `consecutiveFailures`, `maxEjectionPercent`.
-    fn outlier(mut self, base: u32, fives: u32, failures: u32, percent: u32) -> Svc {
-        self.outlier = (base, fives, failures, percent);
-        self
-    }
-
-    fn json(&self) -> String {
-        let (base, fives, failures, percent) = self.outlier;
-        let endpoints: Vec<String> = self
-            .ports
-            .iter()
-            .map(|(port, pods)| {
-                let list: Vec<String> = pods
-                    .iter()
-                    .map(|p| format!(r#"{{"ip":"{}","port":{},"ready":true}}"#, p.ip(), p.port()))
-                    .collect();
-                format!(r#""{port}":[{}]"#, list.join(","))
-            })
-            .collect();
-        let ports: Vec<String> = self
-            .ports
-            .iter()
-            .map(|(port, _)| format!(r#""{port}":{{"targetPort":8080}}"#))
-            .collect();
-        let ips = self
-            .ip
-            .as_ref()
-            .map(|i| format!("\"{i}\""))
-            .unwrap_or_default();
-        format!(
-            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":[{ips}],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"faults":[],"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":{base},"consecutive5xx":{fives},"consecutiveFailures":{failures},"maxEjectionPercent":{percent}}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{{}}}{}}}"#,
-            self.key,
-            endpoints.join(","),
-            ports.join(","),
-            self.routes,
-        )
-    }
-}
-
-fn view(services: &[Svc]) -> View {
-    let text = format!(
-        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{{}}}}}"#,
-        services.iter().map(Svc::json).collect::<Vec<_>>().join(",")
-    );
-    View::from_json(&text, &Limits::default()).unwrap()
-}
-
 /// The Service `shop/cart` the app dials on `cluster`.
 fn cart_on(cluster: SocketAddr, pods: &[SocketAddr]) -> Svc {
-    svc(
-        "shop/cart",
-        Some(&cluster.ip().to_string()),
-        cluster.port(),
-        pods,
-    )
+    let ip = Box::leak(cluster.ip().to_string().into_boxed_str());
+    Svc::new("shop/cart", ip, cluster.port(), pods)
 }
 
 /// The Service the app dials, `shop/cart` on `127.0.0.1:80` (no one listens there).
 fn cart(pods: &[SocketAddr]) -> Svc {
-    svc("shop/cart", Some("127.0.0.1"), 80, pods)
-}
-
-fn state_with(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
-    let mut config = MeshConfig {
-        enabled: true,
-        seed: Some(21),
-        ..MeshConfig::default()
-    };
-    configure(&mut config);
-    let state = MeshState::new(&config);
-    state.hold(view(services), "\"1-a\"");
-    state
+    Svc::new("shop/cart", "127.0.0.1", 80, pods)
 }
 
 fn dst() -> SocketAddr {
@@ -258,7 +172,7 @@ async fn cbr_15_a_resetting_pod_is_ejected_after_five_and_restored_after_its_tim
         ModePod::start(Mode::Ok("b")).await,
     );
     let bad = ModePod::start(Mode::Reset).await;
-    let state = state_with(
+    let state = mesh_state(
         &[cart(&[a.addr, b.addr, bad.addr]).outlier(1, 0, 5, 50)],
         |_| {},
     );
@@ -306,7 +220,7 @@ async fn cbr_15_a_post_the_pod_resets_counts_as_a_failure_too() {
     let _logs = capture_logs();
     let ok = ModePod::start(Mode::Ok("ok")).await;
     let bad = ModePod::start(Mode::Reset).await;
-    let state = state_with(&[cart(&[ok.addr, bad.addr])], |_| {});
+    let state = mesh_state(&[cart(&[ok.addr, bad.addr])], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     for _ in 0..80 {
         // A POST is not retried: the app sees the close, on a connection of its own.
@@ -331,7 +245,7 @@ async fn status_or_closed(client: &mut H1Client) -> Option<u16> {
 async fn cbr_16_a_refusing_pod_is_avoided_then_ejected_after_its_fifth_connect() {
     let _logs = capture_logs();
     let ok = ModePod::start(Mode::Ok("ok")).await;
-    let state = state_with(&[cart(&[ok.addr, closed_port().await])], |c| {
+    let state = mesh_state(&[cart(&[ok.addr, closed_port().await])], |c| {
         c.avoid_failed_for = Duration::from_millis(100)
     });
     let f = fixture_mesh(dst(), &state, None).await;
@@ -371,7 +285,7 @@ async fn cbr_17_busy_pods_and_the_original_destination_are_never_ejected() {
             origin: None,
         })
         .await;
-        let state = state_with(
+        let state = mesh_state(
             &[cart(&[ok.addr, busy.addr]).outlier(30, 3, 2, 100)],
             |_| {},
         );
@@ -391,7 +305,7 @@ async fn cbr_17_busy_pods_and_the_original_destination_are_never_ejected() {
     }
     // A stale view sends every request to the original destination: no pod, no outcome.
     let cluster = ModePod::start(Mode::Status(500)).await;
-    let state = state_with(&[cart_on(cluster.addr, &[]).outlier(30, 1, 1, 100)], |c| {
+    let state = mesh_state(&[cart_on(cluster.addr, &[]).outlier(30, 1, 1, 100)], |c| {
         c.stale_after = Duration::from_millis(1)
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -409,7 +323,7 @@ async fn cbr_18_consecutive_5xx_is_off_by_default_and_ejects_when_set() {
     let _logs = capture_logs();
     let ok = ModePod::start(Mode::Ok("ok")).await;
     let five = ModePod::start(Mode::Status(500)).await;
-    let state = state_with(&[cart(&[ok.addr, five.addr])], |_| {});
+    let state = mesh_state(&[cart(&[ok.addr, five.addr])], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let mut fives = 0;
@@ -424,7 +338,7 @@ async fn cbr_18_consecutive_5xx_is_off_by_default_and_ejects_when_set() {
 
     let ok = ModePod::start(Mode::Ok("ok")).await;
     let five = ModePod::start(Mode::Status(500)).await;
-    let state = state_with(&[cart(&[ok.addr, five.addr]).outlier(30, 3, 5, 50)], |_| {});
+    let state = mesh_state(&[cart(&[ok.addr, five.addr]).outlier(30, 3, 5, 50)], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..60 {
@@ -447,7 +361,7 @@ async fn cbr_18_a_refusal_naming_another_pod_is_the_5xx_of_the_pod_that_sent_it(
         origin: None,
     })
     .await;
-    let state = state_with(
+    let state = mesh_state(
         &[cart(&[a.addr, b.addr, c.addr]).outlier(30, 3, 5, 50)],
         |_| {},
     );
@@ -473,7 +387,7 @@ async fn cbr_19_a_trusted_app_refusal_ejects_its_pod_and_a_forged_one_nothing() 
         origin: Some("inbound"),
     })
     .await;
-    let state = state_with(&[cart(&[ok.addr, refusing.addr])], |_| {});
+    let state = mesh_state(&[cart(&[ok.addr, refusing.addr])], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for n in 0..60 {
@@ -492,7 +406,7 @@ async fn cbr_19_a_trusted_app_refusal_ejects_its_pod_and_a_forged_one_nothing() 
         origin: Some("inbound"),
     })
     .await;
-    let state = state_with(
+    let state = mesh_state(
         &[cart(&[a.addr, b.addr, forger.addr]).outlier(30, 0, 2, 100)],
         |_| {},
     );
@@ -515,7 +429,7 @@ async fn cbr_20_at_most_the_allowed_share_is_ejected_and_a_single_pod_never() {
         ModePod::start(Mode::Reset).await,
         ModePod::start(Mode::Reset).await,
     );
-    let state = state_with(&[cart(&[x.addr, y.addr])], |_| {});
+    let state = mesh_state(&[cart(&[x.addr, y.addr])], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..40 {
@@ -529,7 +443,7 @@ async fn cbr_20_at_most_the_allowed_share_is_ejected_and_a_single_pod_never() {
     // A single resetting pod is never ejected: M2 path, then the ClusterIP.
     let cluster = Pod::http1("cluster", 0).await;
     let only = ModePod::start(Mode::Reset).await;
-    let state = state_with(&[cart_on(cluster.addr, &[only.addr])], |_| {});
+    let state = mesh_state(&[cart_on(cluster.addr, &[only.addr])], |_| {});
     let f = fixture_mesh(cluster.addr, &state, None).await;
     for _ in 0..8 {
         let mut client = H1Client::connect(f.addr).await;
@@ -547,7 +461,7 @@ async fn cbr_20_with_every_pod_ejected_nothing_is_tried_and_an_l4_connection_is_
         ModePod::start(Mode::Reset).await,
         ModePod::start(Mode::Reset).await,
     );
-    let state = state_with(
+    let state = mesh_state(
         &[cart_on(cluster.addr, &[x.addr, y.addr]).outlier(30, 0, 5, 100)],
         |_| {},
     );
@@ -595,7 +509,7 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
         ModePod::start(Mode::Reset).await,
     ];
     let pods = [ok[0].addr, ok[1].addr, bad[0].addr, bad[1].addr];
-    let state = state_with(&[cart(&pods)], |_| {});
+    let state = mesh_state(&[cart(&pods)], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..400 {
@@ -606,20 +520,26 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
     }
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 2.0);
     // The view takes the port down to the two ejected pods: one is restored at once.
-    state.hold(view(&[cart(&[bad[0].addr, bad[1].addr])]), "\"2-a\"");
+    state.hold(
+        view_services(&[cart(&[bad[0].addr, bad[1].addr])]),
+        "\"2-a\"",
+    );
     let restored = lines(&logs, "endpoint restored").await;
     assert_eq!(restored.len(), 1, "{}", logs.text());
     assert_eq!(restored[0]["cause"], "max_percent");
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 1.0);
     // A view that sets the percent to 0 restores every ejected pod.
     state.hold(
-        view(&[cart(&[bad[0].addr, bad[1].addr]).outlier(30, 0, 5, 0)]),
+        view_services(&[cart(&[bad[0].addr, bad[1].addr]).outlier(30, 0, 5, 0)]),
         "\"3-a\"",
     );
     assert_eq!(lines(&logs, "endpoint restored").await.len(), 2);
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 0.0);
     // An ejected pod that leaves the view drops from the gauge, without a line.
-    state.hold(view(&[cart(&[bad[0].addr, bad[1].addr])]), "\"3b-a\"");
+    state.hold(
+        view_services(&[cart(&[bad[0].addr, bad[1].addr])]),
+        "\"3b-a\"",
+    );
     for _ in 0..40 {
         let _ = status_or_closed(&mut client).await;
         client = H1Client::connect(f.addr).await;
@@ -627,7 +547,7 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
     assert!(lines(&logs, "endpoint ejected").await.len() >= 3);
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 1.0);
     let before = lines(&logs, "endpoint restored").await.len();
-    state.hold(view(&[cart(&[ok[0].addr])]), "\"4-a\"");
+    state.hold(view_services(&[cart(&[ok[0].addr])]), "\"4-a\"");
     state.tick();
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 0.0);
     assert_eq!(
@@ -646,7 +566,7 @@ async fn cbr_23_no_retry_goes_to_an_ejected_pod_and_the_last_ejection_falls_back
         closed_port().await,
         closed_port().await,
     ];
-    let state = state_with(
+    let state = mesh_state(
         &[cart_on(cluster.addr, &pods).outlier(30, 0, 1, 100)],
         |_| {},
     );
@@ -676,13 +596,13 @@ async fn cbr_22_copies_to_a_resetting_mirror_pod_eject_it_and_never_reach_it_aga
     let healthy = ModePod::start(Mode::Ok("mirror")).await;
     let bad = ModePod::start(Mode::Reset).await;
     let mut shop = cart(&[]);
-    shop.routes = r#","routes":[{"name":"shop/mirror","rules":[{"backends":[{"port":80,"service":"shop/cart-v1","weight":1}],"filters":{"mirrors":[{"denominator":1,"numerator":1,"port":80,"service":"shop/mirror"}]},"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}]"#.into();
+    shop.routes = r#"{"name":"shop/mirror","rules":[{"backends":[{"port":80,"service":"shop/cart-v1","weight":1}],"filters":{"mirrors":[{"denominator":1,"numerator":1,"port":80,"service":"shop/mirror"}]},"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}"#.into();
     let services = [
         shop,
-        svc("shop/cart-v1", None, 80, &[primary.addr]),
-        svc("shop/mirror", None, 80, &[healthy.addr, bad.addr]),
+        Svc::new("shop/cart-v1", "", 80, &[primary.addr]).headless(),
+        Svc::new("shop/mirror", "", 80, &[healthy.addr, bad.addr]).headless(),
     ];
-    let state = state_with(&services, |_| {});
+    let state = mesh_state(&services, |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let copies = |f: &common::Fixture| {
@@ -731,16 +651,18 @@ async fn cbr_22_a_mirror_pod_answering_500_is_not_ejected_and_all_ejected_copies
     let bad = ModePod::start(Mode::Reset).await;
     let rules = |mirror: &str| {
         format!(
-            r#","routes":[{{"name":"shop/mirror","rules":[{{"backends":[{{"port":80,"service":"shop/cart-v1","weight":1}}],"filters":{{"mirrors":[{{"denominator":1,"numerator":1,"port":80,"service":"{mirror}"}}]}},"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}]}}]}}]"#
+            r#"{{"name":"shop/mirror","rules":[{{"backends":[{{"port":80,"service":"shop/cart-v1","weight":1}}],"filters":{{"mirrors":[{{"denominator":1,"numerator":1,"port":80,"service":"{mirror}"}}]}},"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}]}}]}}"#
         )
     };
     let mut shop = cart(&[]);
     shop.routes = rules("shop/five");
-    let state = state_with(
+    let state = mesh_state(
         &[
             shop,
-            svc("shop/cart-v1", None, 80, &[primary.addr]),
-            svc("shop/five", None, 80, &[five.addr]).outlier(30, 1, 5, 100),
+            Svc::new("shop/cart-v1", "", 80, &[primary.addr]).headless(),
+            Svc::new("shop/five", "", 80, &[five.addr])
+                .headless()
+                .outlier(30, 1, 5, 100),
         ],
         |_| {},
     );
@@ -762,11 +684,13 @@ async fn cbr_22_a_mirror_pod_answering_500_is_not_ejected_and_all_ejected_copies
 
     let mut shop = cart(&[]);
     shop.routes = rules("shop/bad");
-    let state = state_with(
+    let state = mesh_state(
         &[
             shop,
-            svc("shop/cart-v1", None, 80, &[primary.addr]),
-            svc("shop/bad", None, 80, &[bad.addr]).outlier(30, 0, 5, 100),
+            Svc::new("shop/cart-v1", "", 80, &[primary.addr]).headless(),
+            Svc::new("shop/bad", "", 80, &[bad.addr])
+                .headless()
+                .outlier(30, 0, 5, 100),
         ],
         |_| {},
     );
@@ -790,7 +714,7 @@ async fn cbr_22_a_mirror_pod_answering_500_is_not_ejected_and_all_ejected_copies
 async fn cbr_22_an_l4_balanced_service_ejects_a_refusing_pod_and_sends_it_nothing() {
     let _logs = capture_logs();
     let echo = EchoPod::start().await;
-    let state = state_with(&[cart(&[echo.addr, closed_port().await])], |c| {
+    let state = mesh_state(&[cart(&[echo.addr, closed_port().await])], |c| {
         c.avoid_failed_for = Duration::ZERO
     });
     let f = fixture_mesh(dst(), &state, None).await;
@@ -825,7 +749,7 @@ async fn cbr_22_an_l4_balanced_service_ejects_a_refusing_pod_and_sends_it_nothin
 async fn cbr_20_an_l4_connection_with_every_pod_ejected_is_closed_without_a_byte() {
     let _logs = capture_logs();
     let cluster = EchoPod::start().await;
-    let state = state_with(
+    let state = mesh_state(
         &[
             cart_on(cluster.addr, &[closed_port().await, closed_port().await])
                 .outlier(30, 0, 1, 100),
@@ -856,9 +780,9 @@ async fn cbr_24_series_are_bounded_by_the_view_and_carry_no_request_data() {
     let logs = capture_logs();
     let ok = ModePod::start(Mode::Ok("ok")).await;
     let bad = ModePod::start(Mode::Reset).await;
-    let mut many = svc("shop/many", Some("127.0.0.2"), 1000, &[ok.addr]);
+    let mut many = Svc::new("shop/many", "127.0.0.2", 1000, &[ok.addr]);
     many.ports = (1000..1300u16).map(|p| (p, vec![ok.addr])).collect();
-    let state = state_with(&[cart(&[ok.addr, bad.addr]), many], |_| {});
+    let state = mesh_state(&[cart(&[ok.addr, bad.addr]), many], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let series = |f: &common::Fixture, name: &str| {
         f.metrics
@@ -899,7 +823,7 @@ async fn cbr_24_series_are_bounded_by_the_view_and_carry_no_request_data() {
         assert!(!scrape.contains(needle), "a label holds request data");
     }
     // The 300 ports leave: their series stay for 5 minutes, then go.
-    state.hold(view(&[cart(&[ok.addr, bad.addr])]), "\"2-a\"");
+    state.hold(view_services(&[cart(&[ok.addr, bad.addr])]), "\"2-a\"");
     assert_eq!(series(&f, "mimic_mesh_ejected_endpoints{"), 301);
     state.evict(Instant::now() + Duration::from_secs(5 * 60 + 1));
     assert_eq!(series(&f, "mimic_mesh_ejected_endpoints{"), 1);
@@ -1008,7 +932,7 @@ async fn cbr_15_over_h2c_a_resetting_pod_is_ejected_after_five_and_restored_afte
     let (a, b) = (Pod::h2c("a", 0, None).await, Pod::h2c("b", 0, None).await);
     let resets = Arc::new(AtomicUsize::new(0));
     let bad = h2_refuser(h2::Reason::INTERNAL_ERROR, resets.clone()).await;
-    let state = state_with(&[cart(&[a.addr, b.addr, bad]).outlier(1, 0, 5, 50)], |_| {});
+    let state = mesh_state(&[cart(&[a.addr, b.addr, bad]).outlier(1, 0, 5, 50)], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut sender = h2_client(f.addr).await;
     for n in 0..100 {
@@ -1049,7 +973,7 @@ async fn cbr_17_refused_streams_and_goaways_are_never_ejected() {
             h2_refuser(h2::Reason::REFUSED_STREAM, seen.clone()).await
         };
         let ok = Pod::h2c("ok", 0, None).await;
-        let state = state_with(&[cart(&[ok.addr, refuser]).outlier(30, 1, 2, 100)], |_| {});
+        let state = mesh_state(&[cart(&[ok.addr, refuser]).outlier(30, 1, 2, 100)], |_| {});
         let f = fixture_mesh(dst(), &state, None).await;
         let mut sender = h2_client(f.addr).await;
         for n in 0..200 {
@@ -1073,10 +997,10 @@ async fn cbr_17_refused_streams_and_goaways_are_never_ejected() {
 async fn cbr_17_a_route_timeout_is_never_ejected() {
     let logs = capture_logs();
     let slow = Pod::http1("slow", 3000).await;
-    let timed = r#","routes":[{"name":"shop/timed","rules":[{"backends":[{"port":80,"service":"shop/cart","weight":1}],"matches":[{"path":{"type":"PathPrefix","value":"/"}}],"timeouts":{"backendRequestMs":50}}]}]"#;
+    let timed = r#"{"name":"shop/timed","rules":[{"backends":[{"port":80,"service":"shop/cart","weight":1}],"matches":[{"path":{"type":"PathPrefix","value":"/"}}],"timeouts":{"backendRequestMs":50}}]}"#;
     let mut shop = cart(&[slow.addr]).outlier(30, 1, 1, 100);
     shop.routes = timed.into();
-    let state = state_with(&[shop], |_| {});
+    let state = mesh_state(&[shop], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for n in 0..30 {
@@ -1158,7 +1082,7 @@ async fn cbr_17_a_request_the_app_abandons_is_never_ejected() {
     // The pod answers only with the whole body: an abandoned upload ends in a request that was
     // written, partly, and got no head, the case `AppLeft` keeps from counting as a `reset`.
     let pod = BodyPod::start().await;
-    let state = state_with(&[cart(&[pod.addr]).outlier(30, 1, 1, 100)], |_| {});
+    let state = mesh_state(&[cart(&[pod.addr]).outlier(30, 1, 1, 100)], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     for n in 1..=30 {
         let mut leaving = TcpStream::connect(f.addr).await.unwrap();
@@ -1209,7 +1133,7 @@ async fn cbr_17_a_request_the_app_abandons_is_never_ejected() {
 async fn cbr_18_the_answers_of_the_caller_sidecar_count_on_no_pod() {
     let logs = capture_logs();
     // Every pod refuses to connect: the caller's `connect-failed` answers are no `5xx` of a pod.
-    let state = state_with(
+    let state = mesh_state(
         &[cart(&[closed_port().await]).outlier(30, 3, 100, 100)],
         |_| {},
     );
@@ -1231,7 +1155,7 @@ async fn cbr_20_after_the_first_ejection_ends_requests_are_tried_again() {
         ModePod::start(Mode::Reset).await,
         ModePod::start(Mode::Reset).await,
     );
-    let state = state_with(
+    let state = mesh_state(
         &[cart_on(cluster.addr, &[x.addr, y.addr]).outlier(1, 0, 5, 100)],
         |_| {},
     );

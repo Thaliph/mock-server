@@ -2,6 +2,8 @@
 //! (spec §7.9 "Fault injection", §12.28).
 #![allow(dead_code)]
 
+use super::{Fixture, metric};
+
 /// A fault matching `Exact path`, aborting `percent` % with `status`.
 pub fn abort_on(path: &str, percent: u32, status: u16) -> String {
     format!(
@@ -22,6 +24,20 @@ pub fn status(head: &str) -> u16 {
 /// Whether the access line has no such field.
 pub fn absent(line: &serde_json::Value, field: &str) -> bool {
     line.get(field).is_none_or(serde_json::Value::is_null)
+}
+
+/// A response head lower-cased.
+pub fn lower(head: &str) -> String {
+    head.to_ascii_lowercase()
+}
+
+/// The count of the faults of `kind` of `shop/cart` in the scrape of `f`.
+pub fn faults(f: &Fixture, kind: &str) -> f64 {
+    metric(
+        &f.metrics.encode(),
+        "mimic_mesh_faults_total{",
+        &["service=\"shop/cart\"", &format!("kind=\"{kind}\"")],
+    )
 }
 
 /// Whether the scrape has no series of `name`.

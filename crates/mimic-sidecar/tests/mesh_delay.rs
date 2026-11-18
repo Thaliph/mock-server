@@ -10,34 +10,17 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::faults::{abort_on, absent, delay, no_series, status};
-use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, view_services};
+use common::faults::{abort_on, absent, delay, faults, no_series, status};
+use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, mesh_state};
 use common::{Logs, capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until};
 use http_body_util::{BodyExt, Empty};
 use mimic_core::discovery::histogram::bucket_index;
 use mimic_core::mesh::fault::drawn;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
-use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const MS: Duration = Duration::from_millis(1);
-
-fn state(services: &[Svc]) -> MeshState {
-    state_with(services, |_| {})
-}
-
-fn state_with(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
-    let mut config = MeshConfig {
-        enabled: true,
-        seed: Some(21),
-        ..MeshConfig::default()
-    };
-    configure(&mut config);
-    let state = MeshState::new(&config);
-    state.hold(view_services(services), "\"1-a\"");
-    state
-}
 
 /// `shop/cart` on the ClusterIP the app dials, its pods `pods`.
 fn cart(pods: &[SocketAddr]) -> Svc {
@@ -65,14 +48,6 @@ fn route(filters: &str, timeouts: &str) -> String {
 const MIRROR: &str =
     r#"{"mirrors":[{"denominator":100,"numerator":100,"port":80,"service":"shop/shadow"}]}"#;
 
-fn faults(f: &common::Fixture, kind: &str) -> f64 {
-    metric(
-        &f.metrics.encode(),
-        "mimic_mesh_faults_total{",
-        &["service=\"shop/cart\"", &format!("kind=\"{kind}\"")],
-    )
-}
-
 /// `GET path` on `client`: the head, the body and the client's latency.
 async fn timed_get(client: &mut H1Client, path: &str) -> (String, String, Duration) {
     let began = Instant::now();
@@ -99,7 +74,7 @@ fn assert_held(sent: &[Instant], arrivals: &[Instant], latencies: Vec<u64>) {
 async fn flt_15_http1_a_200ms_delay_holds_every_request_before_the_pod() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[cart(&[pod.addr]).faults(&delay(100, 200))]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(&delay(100, 200))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let (mut sent, mut latencies) = (Vec::new(), Vec::new());
@@ -117,7 +92,7 @@ async fn flt_15_http1_a_200ms_delay_holds_every_request_before_the_pod() {
 async fn flt_15_h2c_a_200ms_delay_holds_every_stream() {
     let _logs = capture_logs();
     let pod = Pod::h2c("pod", 0, None).await;
-    let state = state(&[cart(&[pod.addr]).faults(&delay(100, 200))]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(&delay(100, 200))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut sender = h2_client(f.addr).await;
     let (mut sent, mut latencies) = (Vec::new(), Vec::new());
@@ -163,7 +138,7 @@ async fn concurrent(addr: SocketAddr, clients: usize, each: usize) -> Vec<(Strin
 async fn flt_15_ten_percent_delays_about_two_hundred_of_two_thousand() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[cart(&[pod.addr]).faults(&delay(10, 200))]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(&delay(10, 200))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let answers = concurrent(f.addr, 20, 100).await;
     assert!(answers.iter().all(|(h, _)| h.starts_with("HTTP/1.1 200")));
@@ -183,7 +158,7 @@ async fn flt_15_an_abort_drawn_wins_over_a_delay() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let both = r#"[{"abort":{"percent":50,"status":503},"delay":{"fixedMs":200,"percent":100}}]"#;
-    let state = state(&[cart(&[pod.addr]).faults(both)]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(both)], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let answers = concurrent(f.addr, 20, 20).await;
     let (aborted, answered): (Vec<_>, Vec<_>) = answers
@@ -202,31 +177,18 @@ async fn flt_15_an_abort_drawn_wins_over_a_delay() {
     assert_eq!(pod.counts.requests(), answered.len());
 }
 
-/// SplitMix64's increment and output function, as the sidecar draws (`Router::random`).
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-
-fn mix(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 #[tokio::test]
 async fn flt_15_the_abort_and_the_delay_are_drawn_from_their_own_values_in_order() {
     let logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let both = r#"[{"abort":{"percent":10,"status":503},"delay":{"fixedMs":5,"percent":20}}]"#;
-    let state = state(&[cart(&[pod.addr]).faults(both)]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(both)], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let mut expected = Vec::new();
     for i in 0..500 {
         // The decision's two values are the next two draws: the abort's first.
-        let s = state.random_state_for_test();
-        let (r_abort, r_delay) = (
-            mix(s.wrapping_add(GOLDEN)),
-            mix(s.wrapping_add(GOLDEN.wrapping_mul(2))),
-        );
+        let (r_abort, r_delay) = (state.peek_random_for_test(1), state.peek_random_for_test(2));
         let want = if drawn(r_abort, 10) {
             "abort"
         } else if drawn(r_delay, 20) {
@@ -259,7 +221,7 @@ async fn flt_16_a_delayed_post_holds_no_body_byte_no_pod_and_two_timers() {
     let svc = cart(&[pod.addr])
         .faults(&delay(100, 1000))
         .routes(&route("", r#"{"requestMs":5000}"#));
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let body: Vec<u8> = (0..32768u32).map(|i| (i % 251) as u8).collect();
     let mut request =
@@ -301,7 +263,7 @@ async fn flt_16_delayed_requests_hold_the_slots_and_a_leaving_client_frees_one()
     let logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let svc = cart(&[pod.addr]).faults(&delay(100, 1000)).breaker(2, 1024);
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let kept = tokio::spawn({
         let addr = f.addr;
@@ -348,7 +310,7 @@ async fn flt_16_an_h2c_stream_reset_during_the_delay_frees_its_slot() {
     let _logs = capture_logs();
     let pod = Pod::h2c("pod", 0, None).await;
     let svc = cart(&[pod.addr]).faults(&delay(100, 1000)).breaker(1, 1024);
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let sender = h2_client(f.addr).await;
     let call = |sender: &common::H2Sender| {
@@ -380,7 +342,7 @@ async fn flt_16_an_h2c_stream_reset_during_the_delay_frees_its_slot() {
 #[tokio::test]
 async fn flt_16_a_port_without_endpoints_answers_no_endpoint_without_the_delay() {
     let logs = capture_logs();
-    let state = state(&[cart(&[]).faults(&delay(100, 1000))]);
+    let state = mesh_state(&[cart(&[]).faults(&delay(100, 1000))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let (head, _, took) = timed_get(&mut H1Client::connect(f.addr).await, "/").await;
     assert_eq!(status(&head), 503, "{head}");
@@ -402,7 +364,7 @@ async fn flt_17_a_request_timeout_during_the_delay_answers_504_without_a_try() {
     let svc = cart(&[pod.addr])
         .faults(&delay(100, 500))
         .routes(&route("", r#"{"requestMs":100}"#));
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let began = Instant::now();
     let (head, _) = H1Client::connect(f.addr).await.get("/").await;
@@ -435,7 +397,7 @@ async fn flt_17_backend_request_does_not_count_the_delay() {
     let svc = cart(&[pod.addr])
         .faults(&delay(100, 500))
         .routes(&route("", r#"{"backendRequestMs":100}"#));
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let (head, body, took) = timed_get(&mut H1Client::connect(f.addr).await, "/").await;
     assert!(head.starts_with("HTTP/1.1 200") && body == "pod", "{head}");
@@ -449,7 +411,7 @@ async fn flt_17_request_counts_the_delay_and_the_try_together() {
     let svc = cart(&[pod.addr])
         .faults(&delay(100, 500))
         .routes(&route("", r#"{"requestMs":700}"#));
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let (head, _, took) = timed_get(&mut H1Client::connect(f.addr).await, "/").await;
     assert_eq!(status(&head), 504, "{head}");
@@ -465,7 +427,7 @@ async fn flt_18_one_delay_per_request_whatever_its_tries() {
         .faults(&delay(100, 200))
         .outlier(30, 0, 100, 50)
         .budget(100, 100, 10);
-    let state = state_with(&[svc], |c| c.avoid_failed_for = MS);
+    let state = mesh_state(&[svc], |c| c.avoid_failed_for = MS);
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..30 {
@@ -496,7 +458,7 @@ async fn flt_18_a_request_that_falls_back_to_the_cluster_ip_is_delayed_once() {
         .faults(&delay(100, 200))
         .outlier(30, 0, 100, 50)
         .budget(100, 100, 10);
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster.addr, &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..5 {
@@ -530,7 +492,7 @@ async fn flt_19_copies_follow_the_primary_after_the_delay() {
         .faults(&delay(100, 200))
         .routes(&route(MIRROR, ""));
     let mirror = Svc::new("shop/shadow", "127.0.0.2", 80, &[shadow.addr]).headless();
-    let state = state(&[svc, mirror]);
+    let state = mesh_state(&[svc, mirror], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for i in 0..10 {
@@ -558,7 +520,7 @@ async fn flt_19_a_mirror_deadline_shorter_than_the_delay_makes_every_copy_an_err
         .faults(&delay(100, 1000))
         .routes(&route(MIRROR, ""));
     let mirror = Svc::new("shop/shadow", "127.0.0.2", 80, &[shadow.addr]).headless();
-    let state = state_with(&[svc, mirror], |c| c.mirror_timeout = 500 * MS);
+    let state = mesh_state(&[svc, mirror], |c| c.mirror_timeout = 500 * MS);
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let calls: Vec<_> = (0..3)
         .map(|_| {
@@ -594,7 +556,7 @@ async fn flt_19_copies_are_never_faulted() {
         .faults(
             r#"[{"abort":{"percent":100,"status":503},"delay":{"fixedMs":5000,"percent":100}}]"#,
         );
-    let state = state(&[svc, mirror]);
+    let state = mesh_state(&[svc, mirror], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..10 {
@@ -610,7 +572,10 @@ async fn flt_20_aborts_and_delays_eject_no_pod() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let faults = r#"[{"abort":{"percent":100,"status":500},"match":{"path":{"type":"Exact","value":"/500"}}},{"abort":{"percent":100,"status":503},"match":{"path":{"type":"Exact","value":"/503"}}},{"delay":{"fixedMs":20,"percent":100}}]"#;
-    let state = state(&[cart(&[pod.addr]).faults(faults).outlier(30, 1, 1, 50)]);
+    let state = mesh_state(
+        &[cart(&[pod.addr]).faults(faults).outlier(30, 1, 1, 50)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for (path, want) in [("/500", 500), ("/503", 503), ("/", 200)] {
@@ -643,7 +608,7 @@ async fn flt_20_a_delayed_try_that_is_reset_counts_one_failure() {
     let svc = cart(&[resetting.addr, ok.addr])
         .faults(&delay(100, 20))
         .outlier(30, 0, 1, 50);
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..50 {
@@ -682,7 +647,7 @@ async fn flt_14_the_access_line_of_a_delayed_request() {
     let svc = cart(&[pod.addr])
         .faults(&delay(100, 50))
         .routes(&route("", ""));
-    let state = state(&[svc]);
+    let state = mesh_state(&[svc], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let (head, _) = H1Client::connect(f.addr).await.get("/").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
@@ -702,7 +667,7 @@ async fn flt_14_the_access_line_of_a_delayed_request() {
 async fn flt_32_a_delay_in_flight_at_sigterm_ends_within_the_grace() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[cart(&[pod.addr]).faults(&delay(100, 500))]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(&delay(100, 500))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let call = tokio::spawn({
         let addr = f.addr;
@@ -722,7 +687,7 @@ async fn flt_32_a_delay_in_flight_at_sigterm_ends_within_the_grace() {
 async fn flt_32_a_delay_longer_than_the_grace_is_cut_at_its_end() {
     let logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[cart(&[pod.addr]).faults(&delay(100, 3000))]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(&delay(100, 3000))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let began = Instant::now();
     let mut client = H1Client::connect(f.addr).await;
@@ -749,7 +714,7 @@ async fn flt_25_discovery_records_the_latency_without_the_delay() {
         r#"[{},{{"delay":{{"fixedMs":300,"percent":100}}}}]"#,
         abort_on("/abort", 100, 503)
     );
-    let state = state(&[cart(&[pod.addr]).faults(&faults)]);
+    let state = mesh_state(&[cart(&[pod.addr]).faults(&faults)], |_| {});
     let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
     let f = fixture_mesh(cluster_ip(), &state, Some(&discovery)).await;
     let mut client = H1Client::connect(f.addr).await;

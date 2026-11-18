@@ -9,10 +9,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::faults::{abort_on, absent, delay, no_series, status};
-use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, view_services, view_text};
-use common::{Fixture, capture_logs, fixture_mesh, fixture_mesh_dst, metric, until};
-use mimic_sidecar::mesh::{MeshConfig, MeshState};
+use common::faults::{abort_on, absent, delay, faults, no_series, status};
+use common::mesh_pods::{
+    H1Client, Pod, RawPod, Svc, cluster_ip, mesh_state, view_services, view_text,
+};
+use common::{Fixture, capture_logs, fixture_mesh, fixture_mesh_dst, until};
 
 /// `abort` 100 % on every request.
 const ALL: &str = r#"[{"abort":{"percent":100,"status":503}}]"#;
@@ -27,22 +28,6 @@ const CHAOS_ROUTE: &str = r#"{"name":"shop/r","rules":[{"backends":[{"port":80,"
 const UPGRADE: &[u8] =
     b"GET /ws HTTP/1.1\r\nHost: cart.shop.svc\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 
-fn state(services: &[Svc]) -> MeshState {
-    state_with(services, |_| {})
-}
-
-fn state_with(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
-    let mut config = MeshConfig {
-        enabled: true,
-        seed: Some(21),
-        ..MeshConfig::default()
-    };
-    configure(&mut config);
-    let state = MeshState::new(&config);
-    state.hold(view_services(services), "\"1-a\"");
-    state
-}
-
 /// `shop/cart` on the ClusterIP `port` of `127.0.0.1`, its pods `pods`.
 fn cart(port: u16, pods: &[SocketAddr]) -> Svc {
     Svc::new("shop/cart", "127.0.0.1", port, pods)
@@ -51,15 +36,6 @@ fn cart(port: u16, pods: &[SocketAddr]) -> Svc {
 /// A `&'static str` for the keys and IPs of the `Svc`s made in a loop.
 fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
-}
-
-/// The count of `kind` in the scrape of `f`, of any Service.
-fn faults(f: &Fixture, kind: &str) -> f64 {
-    metric(
-        &f.metrics.encode(),
-        "mimic_mesh_faults_total{",
-        &[&format!("kind=\"{kind}\"")],
-    )
 }
 
 /// Whether the head is the answer of an abort of `want`.
@@ -88,7 +64,10 @@ fn heads(received: &[u8]) -> Vec<String> {
 async fn flt_22_the_first_fault_that_holds_decides_on_the_request_as_the_app_sent_it() {
     let logs = capture_logs();
     let pod = RawPod::start(|_| b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()).await;
-    let state = state(&[cart(80, &[pod.addr]).faults(F22).routes(CHAOS_ROUTE)]);
+    let state = mesh_state(
+        &[cart(80, &[pod.addr]).faults(F22).routes(CHAOS_ROUTE)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let mut ask = async |request: &str| {
@@ -141,7 +120,7 @@ async fn flt_22_a_query_match_behaves_as_a_route_match() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let list = r#"[{"abort":{"percent":100,"status":418},"match":{"queryParams":[{"name":"v","value":"2"}]}}]"#;
-    let state = state(&[cart(80, &[pod.addr]).faults(list)]);
+    let state = mesh_state(&[cart(80, &[pod.addr]).faults(list)], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for target in ["/p?v=2", "/p?v=2&v=3", "/p?v=%32", "/p?v=%zz&v=2"] {
@@ -164,7 +143,7 @@ async fn flt_23_out_of_view_stale_and_mesh_false_reach_their_destination() {
         Pod::http1("cluster", 0).await,
         Pod::http1("dest", 0).await,
     );
-    let state = state_with(&[cart(cluster.addr.port(), &[pod.addr]).faults(ALL)], |c| {
+    let state = mesh_state(&[cart(cluster.addr.port(), &[pod.addr]).faults(ALL)], |c| {
         c.stale_after = Duration::from_millis(200);
     });
     let dst = Arc::new(Mutex::new(dest.addr));
@@ -222,7 +201,10 @@ async fn flt_23_upgrade_and_connect_reach_their_destination() {
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nx-from: cluster\r\n\r\n".to_vec()
     })
     .await;
-    let state = state(&[cart(cluster.addr.port(), &[own.addr]).faults(ALL)]);
+    let state = mesh_state(
+        &[cart(cluster.addr.port(), &[own.addr]).faults(ALL)],
+        |_| {},
+    );
     let f = fixture_mesh(cluster.addr, &state, None).await;
     // ①: an `Upgrade` after a request.
     let mut client = H1Client::connect(f.addr).await;
@@ -276,7 +258,7 @@ async fn flt_23_upgrade_and_connect_reach_their_destination() {
 async fn flt_26_a_view_adding_faults_applies_from_the_next_request() {
     let _logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[cart(80, &[pod.addr])]);
+    let state = mesh_state(&[cart(80, &[pod.addr])], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let (head, body) = client.get("/a").await;
@@ -298,7 +280,7 @@ async fn flt_26_a_view_adding_faults_applies_from_the_next_request() {
 async fn flt_26_a_delay_in_flight_finishes_when_the_view_removes_its_fault() {
     let logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
-    let state = state(&[cart(80, &[pod.addr]).faults(&delay(100, 500))]);
+    let state = mesh_state(&[cart(80, &[pod.addr]).faults(&delay(100, 500))], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let addr = f.addr;
     let held = tokio::spawn(async move {
@@ -340,7 +322,7 @@ async fn flt_26_one_series_per_service_and_kind_evicted_5_minutes_after_the_serv
     let services: Vec<Svc> = (0..300)
         .map(|i| Svc::new(leak(format!("shop/s{i}")), leak(ip(i)), 80, &[pod.addr]).faults(&list))
         .collect();
-    let state = state(&services);
+    let state = mesh_state(&services, |_| {});
     let next = Arc::new(Mutex::new(0usize));
     let addrs: Vec<SocketAddr> = services.iter().map(|s| s.dst(80)).collect();
     let dst = {
@@ -389,7 +371,7 @@ async fn flt_26_no_label_or_field_carries_request_data() {
     let logs = capture_logs();
     let pod = Pod::http1("pod", 0).await;
     let list = r#"[{"abort":{"percent":100,"status":503},"match":{"headers":[{"name":"x-canary","value":"flt26-header-canary"}],"path":{"type":"Exact","value":"/flt26-path-canary"},"queryParams":[{"name":"q","value":"flt26-query-canary"}]}},{"delay":{"fixedMs":1,"percent":100},"match":{"headers":[{"name":"x-canary","value":"flt26-header-canary"}]}}]"#;
-    let state = state(&[cart(80, &[pod.addr]).faults(list)]);
+    let state = mesh_state(&[cart(80, &[pod.addr]).faults(list)], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     client

@@ -13,6 +13,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::view::{Limits, View};
+use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -381,6 +382,20 @@ pub fn view_services(services: &[Svc]) -> View {
         entries.join(",")
     );
     View::from_json(&text, &Limits::default()).unwrap()
+}
+
+/// A meshed state of seed 21 holding the view of `services` (etag `"1-a"`), with `configure`
+/// applied to its config first.
+pub fn mesh_state(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
+    let mut config = MeshConfig {
+        enabled: true,
+        seed: Some(21),
+        ..MeshConfig::default()
+    };
+    configure(&mut config);
+    let state = MeshState::new(&config);
+    state.hold(view_services(services), "\"1-a\"");
+    state
 }
 
 /// A keep-alive HTTP/1 client over one connection.
