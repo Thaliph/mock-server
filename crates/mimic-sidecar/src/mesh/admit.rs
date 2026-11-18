@@ -1,35 +1,236 @@
-//! The admission of the pod's inbound requests (spec §4.1 "Admission contract").
+//! The admission of the pod's inbound requests (spec §4.1 "Admission contract"): the pure
+//! state of `mimic_core::mesh::admission` behind one lock, the wait of a queued request, and
+//! one timer task per pod, alive while the queue is not empty, that decides the queue at the
+//! instants the state gives.
 
-use mimic_core::mesh::admission::{Contract, Counts, Refusal};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-/// The admission state of this pod: shared by every inbound connection, cheap to clone.
+use mimic_core::mesh::admission::{
+    Admission, Contract, Counts, Offer, Permit, Refusal, Resolved, Ticket, Verdict,
+};
+use tokio::sync::{Notify, oneshot};
+
+/// The admission state of this pod (spec §4.1 "Admission contract"): shared by every inbound
+/// connection, cheap to clone.
 #[derive(Clone)]
-pub(crate) struct Admitter;
+pub(crate) struct Admitter(Arc<Shared>);
 
-impl Admitter {
-    pub(crate) fn new() -> Admitter {
-        Admitter
-    }
+struct Shared {
+    /// Short sections only: never held across an `await`, an I/O, a spawn or a `Slot` drop.
+    inner: Mutex<Inner>,
+    /// The clock of the state: `now` is the time since this instant.
+    epoch: Instant,
+    /// The timer task reads `next_instant()` again.
+    wake: Notify,
+}
 
-    pub(crate) fn set_contract(&self, _contract: Option<Contract>) {}
+struct Inner {
+    admission: Admission,
+    /// Reused by every call.
+    out: Vec<Resolved>,
+    waiters: BTreeMap<Ticket, oneshot::Sender<Verdict>>,
+    /// A timer task runs.
+    driving: bool,
+}
 
-    #[allow(dead_code)]
-    pub(crate) fn contract(&self) -> Option<Contract> {
-        todo!()
-    }
-
-    pub(crate) async fn admit(&self) -> Result<Slot, Refusal> {
-        todo!()
-    }
-
-    pub(crate) fn counts(&self) -> Counts {
-        todo!()
+impl Inner {
+    /// Hands each resolved entry to its waiter. A permit whose waiter is gone is released at
+    /// once, which may admit the next entries: bounded by the queue.
+    fn dispatch(&mut self, now: Duration) {
+        let mut out = std::mem::take(&mut self.out);
+        let mut more = Vec::new();
+        while !out.is_empty() {
+            for resolved in out.drain(..) {
+                let unsent = match self.waiters.remove(&resolved.ticket) {
+                    Some(waiter) => waiter.send(resolved.verdict).err(),
+                    None => Some(resolved.verdict),
+                };
+                if let Some(Verdict::Admitted(permit)) = unsent {
+                    self.admission.release(permit, now, &mut more);
+                }
+            }
+            std::mem::swap(&mut out, &mut more);
+        }
+        self.out = out;
     }
 }
 
-/// One admitted request.
+impl Admitter {
+    /// No contract: every request is admitted.
+    pub(crate) fn new() -> Admitter {
+        Admitter(Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                admission: Admission::new(),
+                out: Vec::new(),
+                waiters: BTreeMap::new(),
+                driving: false,
+            }),
+            epoch: Instant::now(),
+            wake: Notify::new(),
+        }))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.0.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn now(&self) -> Duration {
+        self.0.epoch.elapsed()
+    }
+
+    /// Follows the view's `admission` (spec §4.1 "Contract changes").
+    pub(crate) fn set_contract(&self, contract: Option<Contract>) {
+        {
+            let mut guard = self.lock();
+            let now = self.now();
+            let inner = &mut *guard;
+            inner.admission.set_contract(contract, now, &mut inner.out);
+            inner.dispatch(now);
+        }
+        self.0.wake.notify_one();
+    }
+
+    /// The contract in force.
+    #[allow(dead_code)] // The HTTP/1 hold reads it per head (#453 step 4).
+    pub(crate) fn contract(&self) -> Option<Contract> {
+        self.lock().admission.contract()
+    }
+
+    /// Offers a request, then waits (at most 150 ms) when it is queued. Cancel-safe: dropping
+    /// the future cancels the entry, or releases a permit that was already sent to it.
+    pub(crate) async fn admit(&self) -> Result<Slot, Refusal> {
+        let (ticket, rx, spawn) = {
+            let mut guard = self.lock();
+            let now = self.now();
+            let inner = &mut *guard;
+            let offer = inner.admission.offer(now, &mut inner.out);
+            inner.dispatch(now);
+            match offer {
+                Offer::Admitted(permit) => {
+                    return Ok(Slot {
+                        admitter: self.clone(),
+                        permit: Some(permit),
+                    });
+                }
+                Offer::Refused(refusal) => return Err(refusal),
+                Offer::Queued(ticket) => {
+                    let (tx, rx) = oneshot::channel();
+                    inner.waiters.insert(ticket, tx);
+                    (ticket, rx, !std::mem::replace(&mut inner.driving, true))
+                }
+            }
+        };
+        if spawn {
+            tokio::spawn(drive(self.0.clone()));
+        } else {
+            self.0.wake.notify_one();
+        }
+        let mut waiting = Waiting {
+            admitter: self,
+            ticket,
+            rx: Some(rx),
+        };
+        let verdict = match waiting.rx.as_mut() {
+            Some(rx) => rx.await,
+            None => return Err(Refusal::QueueTimeout),
+        };
+        // Resolved: nothing is left to cancel.
+        waiting.rx = None;
+        match verdict {
+            Ok(Verdict::Admitted(permit)) => Ok(Slot {
+                admitter: self.clone(),
+                permit: Some(permit),
+            }),
+            Ok(Verdict::Refused(refusal)) => Err(refusal),
+            Err(_) => Err(Refusal::QueueTimeout),
+        }
+    }
+
+    /// The counts of the state now (spec ADM-07).
+    pub(crate) fn counts(&self) -> Counts {
+        self.lock().admission.counts(self.now())
+    }
+
+    fn release(&self, permit: Permit) {
+        let mut guard = self.lock();
+        let now = self.now();
+        let inner = &mut *guard;
+        inner.admission.release(permit, now, &mut inner.out);
+        inner.dispatch(now);
+    }
+}
+
+/// One admitted request; dropping it releases its permit, whichever way the exchange ends.
 #[must_use]
-pub(crate) struct Slot;
+pub(crate) struct Slot {
+    admitter: Admitter,
+    permit: Option<Permit>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.admitter.release(permit);
+        }
+    }
+}
+
+/// A queued request's wait: dropped before its verdict (the stream was reset), it frees the
+/// place, or releases the permit sent to it just before.
+struct Waiting<'a> {
+    admitter: &'a Admitter,
+    ticket: Ticket,
+    rx: Option<oneshot::Receiver<Verdict>>,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
+        let mut guard = self.admitter.lock();
+        let now = self.admitter.now();
+        let inner = &mut *guard;
+        inner.waiters.remove(&self.ticket);
+        if inner.admission.cancel(self.ticket) {
+            return;
+        }
+        if let Ok(Verdict::Admitted(permit)) = rx.try_recv() {
+            inner.admission.release(permit, now, &mut inner.out);
+            inner.dispatch(now);
+        }
+    }
+}
+
+/// The timer of the queue: applies the state at each instant it gives, until the queue is
+/// empty.
+async fn drive(shared: Arc<Shared>) {
+    loop {
+        let wake_at = {
+            let mut guard = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = shared.epoch.elapsed();
+            let inner = &mut *guard;
+            inner.admission.apply(now, &mut inner.out);
+            inner.dispatch(now);
+            match inner.admission.next_instant() {
+                None => {
+                    inner.driving = false;
+                    return;
+                }
+                Some(at) => shared
+                    .epoch
+                    .checked_add(at)
+                    .unwrap_or_else(|| Instant::now() + Duration::from_millis(1)),
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(wake_at.into()) => {}
+            () = shared.wake.notified() => {}
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

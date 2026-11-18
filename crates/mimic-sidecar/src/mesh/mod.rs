@@ -675,6 +675,8 @@ impl MeshState {
         self.0.router.apply(&view);
         let table = Arc::new(Table::build_routed(&view, &self.0.router));
         let (services, endpoints) = (view.services.len(), view.endpoint_count());
+        // Pulled or persisted alike; a view of `"mesh": false` has none (spec §4.1).
+        self.0.admitter.set_contract(view.admission);
         *self.0.table.write().unwrap_or_else(PoisonError::into_inner) = table;
         self.0
             .services
@@ -852,7 +854,8 @@ impl MeshState {
         }
     }
 
-    /// Ticks every second until `stop` completes.
+    /// Ticks every second until `stop` completes. Once `MIMIC_MESH_STARTUP_WAIT` has passed
+    /// without a view, held or persisted, the contract is unknown: one warning (spec §4.1).
     pub async fn run_age(self, stop: impl std::future::Future<Output = ()>) {
         let ticking = async {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -861,9 +864,15 @@ impl MeshState {
                 self.tick();
             }
         };
+        let unknown = async {
+            tokio::time::sleep_until((self.0.started + self.0.startup_wait).into()).await;
+            if !self.0.seen.load(Ordering::Acquire) {
+                tracing::warn!(target: "mesh", "admission contract unknown");
+            }
+        };
         tokio::select! {
             () = stop => {}
-            () = ticking => {}
+            ((), ()) = async { tokio::join!(unknown, ticking) } => {}
         }
     }
 
