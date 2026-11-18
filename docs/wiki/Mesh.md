@@ -3,7 +3,7 @@
 The **mimic mesh** makes the sidecar of a caller pick the pod that serves a call, instead of leaving
 the choice to kube-proxy. Today (milestones M1 to M4) it does client-side **load balancing**, **retries** of failures
 that happened before the app could process a request (with a retry budget), Gateway API **routes** (canary weights,
-header modifiers, timeouts, mirrors), **outlier detection** and a **circuit breaker**; fault injection and the rest
+header modifiers, timeouts, mirrors), **outlier detection** and a **circuit breaker**; fault injection (M4, #452) and the rest
 come in later milestones (see [What is coming](#what-is-coming)).
 It works the same in modes `none` and `discovery` (see [Concepts](Concepts)); in `mock` the mock
 answers and nothing is sent to a pod. It is on by default and has its own kill switches (below).
@@ -73,8 +73,8 @@ sequenceDiagram
   App->>SC: GET /cart to the ClusterIP of cart
   Note over SC: route matched, backend cart-v2 drawn by weight
   Note over SC: breaker slot of cart-v2 taken, else 503 breaker-open at once
-  Note over SC: mirror drawn, its copy waits for the response head
-  SC->>P1: try 1, request modifier applied
+  Note over SC: request modifier applied, then the mirror drawn, its copy waits for the response head
+  SC->>P1: try 1
   P1-->>SC: connection refused
   Note over SC: failed before the app saw it, so retried on a pod not tried yet
   SC->>P2: try 2, same head and body

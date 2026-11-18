@@ -126,7 +126,7 @@ sequenceDiagram
 
 | Prefix | Range | Issue | What |
 |---|---|---|---|
-| `RTE` | `RTE-01` to `RTE-28` (`RTE-29` to `RTE-39` free) | #447 | compile, not programmed, consent, scoping, closure, bounds, `from_json`, converter, status writer, CRD presence, kind `rte_21`, pins, chart, docs, security review |
+| `RTE` | `RTE-01` to `RTE-28` (`RTE-29` to `RTE-39` reserved, unused) | #447 | compile, not programmed, consent, scoping, closure, bounds, `from_json`, converter, status writer, CRD presence, kind `rte_21`, pins, chart, docs, security review |
 | `RTE` | `RTE-40` to `RTE-58` (`RTE-59` reserved) | #448 | precedence, paths, headers, query, method, weighted draw, modifiers, bench `mesh_route`, canary, sidecar answers, retries per backend, label bounds, kind `rte_55` |
 | `RTE` | `RTE-60` to `RTE-73` (`RTE-74` to `RTE-79` reserved) | #449 | deadlines, never retried, expiry before and after the head, no reuse, timer bounds, views, kind `rte_71` |
 | `RTE` | `RTE-80` to `RTE-96` (`RTE-97` to `RTE-99` reserved) | #450 | draw, decisions, `beforeModifier`, copy on the wire, never slows the primary, bodies, slots, share, pools, lifetime, TLS, labels, kind `rte_93`, bench `mesh-mirror`, docs, security review |
