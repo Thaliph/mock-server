@@ -205,6 +205,111 @@ spec:
                       type: integer
                       minimum: 1
                       maximum: 100000
+                faults:
+                  description: >-
+                    Faults injected by the sidecar of every caller into its mesh-routed requests to the Service
+                    (spec §7.9 "Fault injection"), at most 16, the first whose match holds applies. Service
+                    targets only.
+                  type: array
+                  maxItems: 16
+                  items:
+                    type: object
+                    properties:
+                      match:
+                        description: One Gateway API HTTPRouteMatch; absent matches every request.
+                        type: object
+                        properties:
+                          path:
+                            type: object
+                            properties:
+                              type:
+                                type: string
+                                enum: [Exact, PathPrefix]
+                                default: PathPrefix
+                              value:
+                                type: string
+                                default: /
+                                minLength: 1
+                                maxLength: 1024
+                                pattern: ^/
+                          method:
+                            type: string
+                            enum: [GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH]
+                          headers:
+                            type: array
+                            maxItems: 16
+                            items:
+                              type: object
+                              required: [name, value]
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact]
+                                  default: Exact
+                                name:
+                                  type: string
+                                  minLength: 1
+                                  maxLength: 256
+                                  pattern: ^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$
+                                value:
+                                  type: string
+                                  minLength: 1
+                                  maxLength: 4096
+                          queryParams:
+                            type: array
+                            maxItems: 16
+                            items:
+                              type: object
+                              required: [name, value]
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact]
+                                  default: Exact
+                                name:
+                                  type: string
+                                  minLength: 1
+                                  maxLength: 256
+                                value:
+                                  type: string
+                                  minLength: 1
+                                  maxLength: 1024
+                      delay:
+                        description: A fixed delay applied to the share of requests drawn by percent.
+                        type: object
+                        required: [percent, fixed]
+                        properties:
+                          percent:
+                            description: Share of the matching requests delayed, an integer 0 to 100.
+                            type: integer
+                            minimum: 0
+                            maximum: 100
+                          fixed:
+                            description: A Gateway API duration, 1ms to 60s.
+                            type: string
+                            maxLength: 28
+                            pattern: ^([0-9]{1,5}(h|m|s|ms)){1,4}$
+                            x-kubernetes-validations:
+                              - rule: "duration(self) >= duration('1ms') && duration(self) <= duration('60s')"
+                                message: "faults[].delay.fixed is 1ms to 60s"
+                      abort:
+                        description: A status answered, without reaching a pod, to the share of requests drawn by percent. An abort drawn wins over a delay drawn.
+                        type: object
+                        required: [percent, status]
+                        properties:
+                          percent:
+                            description: Share of the matching requests aborted, an integer 0 to 100.
+                            type: integer
+                            minimum: 0
+                            maximum: 100
+                          status:
+                            description: The HTTP status answered, 200 to 599.
+                            type: integer
+                            minimum: 200
+                            maximum: 599
+                    x-kubernetes-validations:
+                      - rule: "has(self.delay) || has(self.abort)"
+                        message: "faults[] needs a delay or an abort"
               x-kubernetes-validations:
                 - rule: "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')"
                   message: "destinations fit a Deployment target only"
@@ -220,3 +325,5 @@ spec:
                   message: "outlierDetection fits a Service target only"
                 - rule: "!has(self.circuitBreaker) || self.targetRefs.exists(t, t.kind == 'Service')"
                   message: "circuitBreaker fits a Service target only"
+                - rule: "!has(self.faults) || self.targetRefs.exists(t, t.kind == 'Service')"
+                  message: "faults fit a Service target only"

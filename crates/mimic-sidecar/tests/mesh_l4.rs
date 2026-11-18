@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::mesh_pods::{Blackhole, EchoPod, cluster_ip, view_on};
+use common::faults::no_series;
+use common::mesh_pods::{Blackhole, EchoPod, Svc, cluster_ip, view_on, view_services};
 use common::{capture_logs, closed_port, fixture_mesh};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -415,4 +416,30 @@ async fn rty_16_a_connection_to_the_first_pod_has_one_attempt() {
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     assert_eq!(echoed(f.addr, BINARY).await, BINARY);
     assert_eq!(attempts_of(&logs).await, 1);
+}
+
+#[tokio::test]
+async fn flt_23_l4_connections_are_never_faulted() {
+    let _logs = capture_logs();
+    let (a, b, c) = three().await;
+    let pods = [a.addr, b.addr, c.addr];
+    let state = MeshState::new(&MeshConfig {
+        enabled: true,
+        seed: Some(21),
+        ..MeshConfig::default()
+    });
+    state.hold(
+        view_services(&[Svc::new("shop/cart", "127.0.0.1", 80, &pods)
+            .faults(r#"[{"abort":{"percent":100,"status":503}}]"#)]),
+        "\"1-a\"",
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let hello = hello("cart.shop.svc");
+    for _ in 0..30 {
+        assert_eq!(echoed(f.addr, BINARY).await, BINARY);
+        assert_eq!(echoed(f.addr, &hello).await, hello);
+    }
+    assert_eq!(a.accepted() + b.accepted() + c.accepted(), 60);
+    let scrape = f.metrics.encode();
+    assert!(no_series(&scrape, "mimic_mesh_faults_total{"), "{scrape}");
 }

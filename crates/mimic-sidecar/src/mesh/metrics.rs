@@ -48,9 +48,16 @@ const MIRRORED: [&str; 4] = ["sent", "error", "skipped_body", "skipped_limit"];
 const SKIPS: [&str; 3] = ["exhausted", "method", "buffer"];
 /// Every `reason` of an ejection (spec §7.9 "Outlier detection").
 const EJECTIONS: [&str; 2] = ["consecutive_failures", "consecutive_5xx"];
+/// Every `kind` of a fault (spec §7.9 "Fault injection").
+pub(crate) const FAULT_KINDS: [&str; 2] = ["abort", "delay"];
 
 /// Every `status_class` value, to remove the series of an evicted endpoint.
 const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "none"];
+
+/// `<namespace>/<name>` of a backend label `<namespace>/<name>:<port>`.
+fn service_of(backend: &str) -> &str {
+    backend.rsplit_once(':').map_or(backend, |(s, _)| s)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct RequestLabels {
@@ -90,6 +97,12 @@ struct BackendLabels {
 struct ResultLabels {
     backend: String,
     result: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct FaultLabels {
+    service: String,
+    kind: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
@@ -165,6 +178,9 @@ pub(crate) struct MeshMetrics {
     ejections: Family<ReasonLabels, Counter>,
     /// Endpoints ejected now, per backend of the view.
     ejected: Family<BackendLabels, Gauge>,
+    /// Faults injected by the Service whose policy injected them and kind; a series exists
+    /// from its first count.
+    faults: Family<FaultLabels, Counter>,
     /// `x-mimic-*` fields removed from app responses by the inbound side (spec §4.1).
     /// Without labels, and made by the first removal: nothing of the mesh shows until then
     /// (MSH-51).
@@ -196,6 +212,7 @@ impl MeshMetrics {
             mirrored: Family::default(),
             ejections: Family::default(),
             ejected: Family::default(),
+            faults: Family::default(),
             stripped: Family::default(),
             unframed: Family::default(),
             inbound_refusals: Family::default(),
@@ -267,6 +284,11 @@ impl MeshMetrics {
             "mesh_ejected_endpoints",
             "Endpoints ejected now by outlier detection, by backend",
             self.ejected.clone(),
+        );
+        registry.register(
+            "mesh_faults",
+            "Faults injected into mesh-routed requests, by the Service whose policy injected them and kind",
+            self.faults.clone(),
         );
         registry.register(
             "mesh_reconnects",
@@ -377,6 +399,19 @@ impl MeshMetrics {
             .get_or_create(&ReasonLabels {
                 backend: backend.to_string(),
                 reason,
+            })
+            .inc();
+    }
+
+    /// A fault of `kind` (one of [`FAULT_KINDS`]) of the policy of `backend`'s Service was
+    /// injected. Its series goes with the last port of the Service (`evict_backends`).
+    pub(crate) fn fault(&self, backend: &str, kind: &'static str) {
+        debug_assert!(FAULT_KINDS.contains(&kind), "{kind}");
+        self.track(backend, None);
+        self.faults
+            .get_or_create(&FaultLabels {
+                service: service_of(backend).to_string(),
+                kind,
             })
             .inc();
     }
@@ -540,6 +575,8 @@ impl MeshMetrics {
     /// Removes the per-Service series of the backends that left the view 5 minutes before `now`.
     fn evict_backends(&self, now: Instant) {
         let mut all = self.series.lock().unwrap_or_else(PoisonError::into_inner);
+        // The Services of the backends removed: their fault series go with their last port.
+        let mut gone = BTreeSet::new();
         all.retain(|backend, series| {
             let due = series
                 .left
@@ -547,8 +584,8 @@ impl MeshMetrics {
             if !due {
                 return true;
             }
-            // `<namespace>/<name>:<port>`.
-            let service = backend.rsplit_once(':').map_or(&**backend, |(s, _)| s);
+            let service = service_of(backend);
+            gone.insert(service.to_string());
             let mut services = BTreeSet::from([service.to_string()]);
             for (called, route, status_class, reason) in &series.requests {
                 services.insert(called.clone());
@@ -606,6 +643,17 @@ impl MeshMetrics {
             }
             false
         });
+        for service in gone {
+            if all.keys().any(|backend| service_of(backend) == service) {
+                continue;
+            }
+            for kind in FAULT_KINDS {
+                self.faults.remove(&FaultLabels {
+                    service: service.clone(),
+                    kind,
+                });
+            }
+        }
     }
 
     pub(crate) fn in_flight_gauge(&self, backend: &str, endpoint: &str) -> Gauge {
@@ -831,5 +879,37 @@ mod tests {
             "{}",
             text(&metrics)
         );
+    }
+
+    #[test]
+    fn flt_26_fault_series_live_as_long_as_a_port_of_their_service() {
+        let metrics = MeshMetrics::new(10);
+        for backend in ["shop/cart:80", "shop/cart:81", "shop/cart-v1:80"] {
+            metrics.backend_seen(backend);
+        }
+        metrics.fault("shop/cart:80", "abort");
+        metrics.fault("shop/cart:81", "delay");
+        metrics.fault("shop/cart-v1:80", "abort");
+        let abort = "mesh_faults_total{service=\"shop/cart\",kind=\"abort\"} 1";
+        let delay = "mesh_faults_total{service=\"shop/cart\",kind=\"delay\"} 1";
+        let other = "mesh_faults_total{service=\"shop/cart-v1\",kind=\"abort\"} 1";
+        let has = |line: &str| text(&metrics).lines().any(|l| l == line);
+        assert!(has(abort) && has(delay) && has(other), "{}", text(&metrics));
+        let now = Instant::now();
+        // One port left, another stays.
+        metrics.backend_left("shop/cart:80", now);
+        metrics.evict(now + EVICT_AFTER);
+        assert!(has(abort) && has(delay), "{}", text(&metrics));
+        // The last port left.
+        metrics.backend_left("shop/cart:81", now);
+        metrics.evict(now + EVICT_AFTER);
+        assert!(!has(abort) && !has(delay), "{}", text(&metrics));
+        assert!(has(other), "{}", text(&metrics));
+        // A count made after the Service left is evicted 5 minutes later.
+        metrics.fault("shop/cart:80", "abort");
+        assert!(has(abort), "{}", text(&metrics));
+        metrics.evict(Instant::now() + EVICT_AFTER);
+        assert!(!has(abort), "{}", text(&metrics));
+        assert!(has(other), "{}", text(&metrics));
     }
 }

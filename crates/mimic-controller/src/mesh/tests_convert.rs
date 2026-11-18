@@ -4,8 +4,8 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    BreakerSpec, Destination, GrantFrom, GrantTo, OutlierSpec, RetryBudgetSpec, Target, TargetKind,
-    TargetPort,
+    AbortSpec, BreakerSpec, DelaySpec, Destination, GrantFrom, GrantTo, OutlierSpec,
+    RetryBudgetSpec, Target, TargetKind, TargetPort,
 };
 use mimic_core::mesh::policy::validate;
 use serde_json::json;
@@ -349,5 +349,94 @@ fn cbr_03_a_base_ejection_time_that_does_not_parse_makes_the_config_invalid_and_
     let c = service_config(
         json!({"targetRefs": target, "outlierDetection": {"consecutiveFailures": -1}}),
     );
+    assert!(validate(&c).is_err());
+}
+
+fn fault_config(faults: serde_json::Value) -> mimic_core::mesh::input::Config {
+    let target = json!([{"group": "", "kind": "Service", "name": "cart"}]);
+    service_config(json!({"targetRefs": target, "faults": faults}))
+}
+
+#[test]
+fn flt_03_faults_convert_durations_to_milliseconds_and_absent_members_are_none() {
+    let c = fault_config(json!([
+        {"match": {"path": {"type": "PathPrefix", "value": "/checkout"}, "method": "POST",
+                   "headers": [{"name": "X-Trace", "value": "1"}],
+                   "queryParams": [{"name": "q", "value": "2"}]},
+         "abort": {"percent": 10, "status": 503},
+         "delay": {"percent": 20, "fixed": "500ms"}},
+        {"delay": {"percent": 1, "fixed": "1s"}},
+        {"abort": {"percent": 0, "status": 599}, "delay": {"percent": 100, "fixed": "1m"}}
+    ]));
+    let faults = c.faults.clone().expect("faults");
+    assert_eq!(faults.len(), 3);
+    assert_eq!(
+        faults[0].delay,
+        Some(DelaySpec {
+            percent: 20,
+            fixed_ms: 500
+        })
+    );
+    assert_eq!(
+        faults[0].abort,
+        Some(AbortSpec {
+            percent: 10,
+            status: 503
+        })
+    );
+    let m = faults[0].r#match.clone().expect("match");
+    assert_eq!(m.method.as_deref(), Some("POST"));
+    assert_eq!(
+        m.path.map(|p| (p.kind, p.value)),
+        Some(("PathPrefix".into(), "/checkout".into()))
+    );
+    assert_eq!((m.headers.len(), m.query_params.len()), (1, 1));
+    assert_eq!(
+        faults[1].delay,
+        Some(DelaySpec {
+            percent: 1,
+            fixed_ms: 1000
+        })
+    );
+    assert_eq!(
+        (faults[1].r#match.clone(), faults[1].abort.clone()),
+        (None, None)
+    );
+    assert_eq!(
+        faults[2].delay,
+        Some(DelaySpec {
+            percent: 100,
+            fixed_ms: 60_000
+        })
+    );
+    assert_eq!(validate(&c), Ok(()));
+    let c =
+        service_config(json!({"targetRefs": [{"group": "", "kind": "Service", "name": "cart"}]}));
+    assert_eq!(c.faults, None);
+}
+
+#[test]
+fn flt_03_a_fixed_that_does_not_parse_or_is_over_60s_makes_the_config_invalid_never_a_panic() {
+    for fixed in [
+        json!("500"),
+        json!(500),
+        json!("-1s"),
+        json!("1.5s"),
+        json!("soon"),
+        json!(""),
+        json!("61s"),
+        json!("1h"),
+        json!("0s"),
+        json!("60001ms"),
+    ] {
+        let c = fault_config(json!([{"delay": {"percent": 1, "fixed": fixed}}]));
+        let err = validate(&c).expect_err("must not validate");
+        assert!(err.contains("faults[0].delay.fixed"), "{fixed}: {err}");
+    }
+    let c = fault_config(json!([{"delay": {"percent": 1}}]));
+    assert!(validate(&c).is_err(), "a delay without fixed");
+    let c = fault_config(json!([{"abort": {"status": 503}}]));
+    assert!(validate(&c).is_err(), "an abort without percent");
+    let c = fault_config(json!([{"abort": {"percent": "1", "status": -1}}]));
     assert!(validate(&c).is_err());
 }

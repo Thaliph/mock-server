@@ -13,6 +13,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::view::{Limits, View};
+use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -27,6 +28,8 @@ pub struct Counts {
     pub in_flight: Arc<AtomicUsize>,
     /// How long each request is held before it is answered, in milliseconds.
     pub delay_ms: Arc<AtomicU64>,
+    /// When each request arrived, in order.
+    pub arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
 }
 
 impl Counts {
@@ -40,6 +43,10 @@ impl Counts {
 
     pub fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
+    }
+
+    pub fn arrivals(&self) -> Vec<std::time::Instant> {
+        self.arrivals.lock().unwrap().clone()
     }
 }
 
@@ -61,6 +68,11 @@ async fn answer(
     counts: Counts,
     _req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    counts
+        .arrivals
+        .lock()
+        .unwrap()
+        .push(std::time::Instant::now());
     counts.requests.fetch_add(1, Ordering::SeqCst);
     counts.in_flight.fetch_add(1, Ordering::SeqCst);
     let delay = counts.delay_ms.load(Ordering::SeqCst);
@@ -227,7 +239,7 @@ pub fn view_on(
         .collect();
     let services = if mesh {
         format!(
-            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
+            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"faults":[],"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
             endpoints.join(",")
         )
     } else {
@@ -248,6 +260,16 @@ pub struct Svc {
     pub percent: u32,
     pub min_per_second: u32,
     pub window: u32,
+    /// The `faults` of the policy, a JSON array.
+    pub faults: String,
+    /// `maxRequests`, `maxConnections`.
+    pub breaker: (u32, u32),
+    /// `baseEjectionSeconds`, `consecutive5xx`, `consecutiveFailures`, `maxEjectionPercent`.
+    pub outlier: (u32, u32, u32, u32),
+    /// The routes of the Service, JSON objects separated by commas; none when empty.
+    pub routes: String,
+    /// No ClusterIP: `ips` is empty.
+    pub headless: bool,
 }
 
 impl Svc {
@@ -261,7 +283,38 @@ impl Svc {
             percent: 20,
             min_per_second: 10,
             window: 10,
+            faults: "[]".to_string(),
+            breaker: (1024, 1024),
+            outlier: (30, 0, 5, 50),
+            routes: String::new(),
+            headless: false,
         }
+    }
+
+    pub fn faults(mut self, faults: &str) -> Svc {
+        self.faults = faults.to_string();
+        self
+    }
+
+    pub fn breaker(mut self, max_requests: u32, max_connections: u32) -> Svc {
+        self.breaker = (max_requests, max_connections);
+        self
+    }
+
+    pub fn outlier(mut self, base: u32, fives: u32, failures: u32, percent: u32) -> Svc {
+        self.outlier = (base, fives, failures, percent);
+        self
+    }
+
+    /// `routes`: route objects, as the view writes them, separated by commas.
+    pub fn routes(mut self, routes: &str) -> Svc {
+        self.routes = routes.to_string();
+        self
+    }
+
+    pub fn headless(mut self) -> Svc {
+        self.headless = true;
+        self
     }
 
     pub fn budget(mut self, percent: u32, min_per_second: u32, window: u32) -> Svc {
@@ -300,11 +353,23 @@ pub fn view_services(services: &[Svc]) -> View {
             .iter()
             .map(|(port, _)| format!(r#""{port}":{{"targetPort":8080}}"#))
             .collect();
+        let ips = if s.headless {
+            String::new()
+        } else {
+            format!("\"{}\"", s.ip)
+        };
+        let routes = if s.routes.is_empty() {
+            String::new()
+        } else {
+            format!(r#","routes":[{}]"#, s.routes)
+        };
+        let (requests, connections) = s.breaker;
+        let (base, fives, failures, percent) = s.outlier;
         entries.push(format!(
-            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":["{}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}}}"#,
+            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":[{ips}],"policy":{{"circuitBreaker":{{"maxConnections":{connections},"maxRequests":{requests}}},"faults":{},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":{base},"consecutive5xx":{fives},"consecutiveFailures":{failures},"maxEjectionPercent":{percent}}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}{routes}}}"#,
             s.key,
             endpoints.join(","),
-            s.ip,
+            s.faults,
             s.retries,
             s.min_per_second,
             s.percent,
@@ -317,6 +382,20 @@ pub fn view_services(services: &[Svc]) -> View {
         entries.join(",")
     );
     View::from_json(&text, &Limits::default()).unwrap()
+}
+
+/// A meshed state of seed 21 holding the view of `services` (etag `"1-a"`), with `configure`
+/// applied to its config first.
+pub fn mesh_state(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
+    let mut config = MeshConfig {
+        enabled: true,
+        seed: Some(21),
+        ..MeshConfig::default()
+    };
+    configure(&mut config);
+    let state = MeshState::new(&config);
+    state.hold(view_services(services), "\"1-a\"");
+    state
 }
 
 /// A keep-alive HTTP/1 client over one connection.

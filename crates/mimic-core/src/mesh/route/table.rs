@@ -146,8 +146,182 @@ fn entry(route: usize, rule: usize, m: &MatchView) -> Entry {
     }
 }
 
+/// Whether `m` holds for `req` as the match of a route: the oracle of the fault tests (FLT-07).
+#[cfg(test)]
+pub(crate) fn route_holds(m: &MatchView, req: &RequestParts) -> bool {
+    entry(0, 0, m).holds(req)
+}
+
+/// Matches tried in their order, each holding as it does in a route, made once (when a view
+/// is built) so that a request looks each header name up once and compares each header item
+/// once, however many matches hold it: a policy's faults (spec §7.9 "Fault injection", FLT-10).
+pub struct Matches {
+    /// `None`: holds for every request.
+    entries: Vec<Option<Interned>>,
+    /// The header names of all items, once each, lower-cased.
+    names: Vec<String>,
+    /// `(name_key, index in names)` at the slot of the key, the next free one on a collision:
+    /// a power of two of at least twice the names.
+    slots: Vec<Option<(u64, usize)>>,
+    /// The header items of all matches, once each: `(index in names, value)`.
+    items: Vec<(usize, String)>,
+}
+
+/// A match whose header items are their index in [`Matches::items`].
+struct Interned {
+    /// Its `headers` are empty.
+    entry: Entry,
+    headers: Vec<usize>,
+}
+
+/// What one request has shown of the header items, filled as they are needed.
+struct Seen {
+    /// For each name, its first line and whether another follows.
+    lines: Vec<Option<(usize, bool)>>,
+    /// For each item, whether it holds, once compared.
+    items: Vec<Option<bool>>,
+}
+
+impl Matches {
+    pub fn new<'m>(matches: impl IntoIterator<Item = Option<&'m MatchView>>) -> Self {
+        let mut names: Vec<String> = vec![];
+        let mut items: Vec<(usize, String)> = vec![];
+        let entries = matches
+            .into_iter()
+            .map(|m| {
+                let mut entry = entry(0, 0, m?);
+                let headers = std::mem::take(&mut entry.headers)
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let name = index_of(&mut names, name.to_ascii_lowercase());
+                        index_of(&mut items, (name, value))
+                    })
+                    .collect();
+                Some(Interned { entry, headers })
+            })
+            .collect();
+        let mut slots = vec![None; (names.len() * 2).next_power_of_two()];
+        for (id, n) in names.iter().enumerate() {
+            let key = name_key(n);
+            let mut at = slot(key, slots.len());
+            while slots[at].is_some() {
+                at = (at + 1) & (slots.len() - 1);
+            }
+            slots[at] = Some((key, id));
+        }
+        Matches {
+            entries,
+            names,
+            slots,
+            items,
+        }
+    }
+
+    /// The index of the first match that holds for `req`.
+    pub fn first(&self, req: &RequestParts) -> Option<usize> {
+        // Made at the first header item and kept for the next ones.
+        let mut seen: Option<Seen> = None;
+        self.entries.iter().position(|m| {
+            let Some(Interned { entry, headers }) = m else {
+                return true;
+            };
+            entry.path_and_method_hold(req)
+                && (headers.is_empty() || {
+                    let seen = seen.get_or_insert_with(|| Seen {
+                        lines: self.lines(req.headers),
+                        items: vec![None; self.items.len()],
+                    });
+                    headers.iter().all(|i| {
+                        *seen.items[*i].get_or_insert_with(|| {
+                            let (name, want) = &self.items[*i];
+                            match seen.lines[*name] {
+                                None => false,
+                                Some((first, false)) => req.headers[first].1 == want.as_bytes(),
+                                Some((first, true)) => header_equals(
+                                    &req.headers[first..],
+                                    &self.names[*name],
+                                    want.as_bytes(),
+                                ),
+                            }
+                        })
+                    })
+                })
+                && entry.query_holds(req)
+        })
+    }
+
+    /// For each of `names`, the first of `headers` of that name and whether another follows.
+    fn lines(&self, headers: &[(&str, &[u8])]) -> Vec<Option<(usize, bool)>> {
+        let mut lines = vec![None; self.names.len()];
+        for (i, (name, _)) in headers.iter().enumerate() {
+            if let Some(id) = self.name_index(name) {
+                match &mut lines[id] {
+                    Some((_, more)) => *more = true,
+                    none => *none = Some((i, false)),
+                }
+            }
+        }
+        lines
+    }
+
+    /// The index in `names` of `name`, in any case.
+    fn name_index(&self, name: &str) -> Option<usize> {
+        let key = name_key(name);
+        let mut at = slot(key, self.slots.len());
+        // The table is never full: a free slot ends the probe.
+        while let Some((k, id)) = *self.slots.get(at)? {
+            if k == key && self.names[id].eq_ignore_ascii_case(name) {
+                return Some(id);
+            }
+            at = (at + 1) & (self.slots.len() - 1);
+        }
+        None
+    }
+}
+
+/// The slot of `key` in a table of `len` slots, a power of two.
+fn slot(key: u64, len: usize) -> usize {
+    ((key ^ key >> 32).wrapping_mul(0xFF51_AFD7_ED55_8CCD) >> 32) as usize & (len - 1)
+}
+
+/// The index of `item` in `list`, pushed when it is not there.
+fn index_of<T: PartialEq>(list: &mut Vec<T>, item: T) -> usize {
+    list.iter().position(|e| *e == item).unwrap_or_else(|| {
+        list.push(item);
+        list.len() - 1
+    })
+}
+
+/// A key of a header name, one for the names equal in any case: its length and its first and
+/// last 8 bytes (4 when shorter), each byte with bit 5 set (which folds the ASCII letters).
+/// Names of two keys differ; names of one key are compared.
+fn name_key(name: &str) -> u64 {
+    const FOLD: u64 = 0x2020_2020_2020_2020;
+    let name = name.as_bytes();
+    let (head, tail) = if let (Some(h), Some(t)) = (name.first_chunk(), name.last_chunk()) {
+        (u64::from_le_bytes(*h), u64::from_le_bytes(*t))
+    } else if let (Some(h), Some(t)) = (name.first_chunk(), name.last_chunk()) {
+        (
+            u64::from(u32::from_le_bytes(*h)),
+            u64::from(u32::from_le_bytes(*t)),
+        )
+    } else {
+        (name.iter().fold(0, |w, b| w << 8 | u64::from(*b)), 0)
+    };
+    (head | FOLD).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (tail | FOLD) ^ name.len() as u64
+}
+
 impl Entry {
     fn holds(&self, req: &RequestParts) -> bool {
+        self.path_and_method_hold(req)
+            && self
+                .headers
+                .iter()
+                .all(|(name, value)| header_equals(req.headers, name, value.as_bytes()))
+            && self.query_holds(req)
+    }
+
+    fn path_and_method_hold(&self, req: &RequestParts) -> bool {
         if let Some(item) = &self.path {
             // `*` and an empty path match no path item.
             if !req.path.starts_with('/') {
@@ -164,16 +338,13 @@ impl Entry {
                 return false;
             }
         }
-        if self.method.as_deref().is_some_and(|m| m != req.method) {
-            return false;
-        }
-        self.headers
+        self.method.as_deref().is_none_or(|m| m == req.method)
+    }
+
+    fn query_holds(&self, req: &RequestParts) -> bool {
+        self.query
             .iter()
-            .all(|(name, value)| header_equals(req.headers, name, value.as_bytes()))
-            && self
-                .query
-                .iter()
-                .all(|(name, value)| query_equals(req.query, name, value))
+            .all(|(name, value)| query_equals(req.query, name, value))
     }
 }
 

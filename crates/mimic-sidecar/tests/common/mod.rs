@@ -6,8 +6,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod faults;
 pub mod mesh_pods;
 pub mod mock_rig;
+pub mod tls_rig;
 
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::listener::{Direction, OriginalDst, Shared, TunnelMetrics, spawn_listener};
@@ -281,4 +283,46 @@ impl Logs {
         assert_eq!(lines.len(), n, "access lines:\n{}", self.text());
         lines
     }
+}
+
+/// The sum of the samples of `name` whose line holds every one of `labels`.
+pub fn metric(scrape: &str, name: &str, labels: &[&str]) -> f64 {
+    scrape
+        .lines()
+        .filter(|l| l.starts_with(name) && labels.iter().all(|f| l.contains(f)))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+/// Waits (at most 5 s) until `cond` holds.
+pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..500 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never: {what}");
+}
+
+pub fn median(mut values: Vec<u64>) -> u64 {
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+pub type H2Sender =
+    hyper::client::conn::http2::SendRequest<http_body_util::Empty<hyper::body::Bytes>>;
+
+/// An `h2c` client over one connection.
+pub async fn h2_client(addr: SocketAddr) -> H2Sender {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (sender, connection) =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .handshake::<_, http_body_util::Empty<hyper::body::Bytes>>(
+                hyper_util::rt::TokioIo::new(stream),
+            )
+            .await
+            .unwrap();
+    tokio::spawn(connection);
+    sender
 }
