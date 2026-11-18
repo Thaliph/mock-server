@@ -1,8 +1,9 @@
 # Mesh
 
 The **mimic mesh** makes the sidecar of a caller pick the pod that serves a call, instead of leaving
-the choice to kube-proxy. Today (milestones M1 and M2) it does client-side **load balancing** and **retries** of failures that
-happened before the app could process a request; the retry budget, routing, outlier detection and the rest
+the choice to kube-proxy. Today (milestones M1 to M4) it does client-side **load balancing**, **retries** of failures
+that happened before the app could process a request (with a retry budget), Gateway API **routes** (canary weights,
+header modifiers, timeouts, mirrors), **outlier detection** and a **circuit breaker**; fault injection and the rest
 come in later milestones (see [What is coming](#what-is-coming)).
 It works the same in modes `none` and `discovery` (see [Concepts](Concepts)); in `mock` the mock
 answers and nothing is sent to a pod. It is on by default and has its own kill switches (below).
@@ -31,13 +32,66 @@ life). **Slow start**: a pod that joins a Service port after the sidecar first s
 `max(0.1, min(1, age / window))`, the window being `policy.loadBalancer.slowStartSeconds` (default
 30 s, 0 disables). A pod that leaves and comes back is new again.
 
-**Pools** are per (pod IP, port, protocol, and server name for TLS): at most 1024 HTTP/1 connections
-and 16 HTTP/2 connections per pod; idle ones close after `MIMIC_MESH_POOL_IDLE_TIMEOUT`; the pool of a
+**Pools** are per (pod IP, port, protocol, and server name for TLS): at most `maxConnections` HTTP/1
+connections per pool (1024 unless a `MimicConfig` says otherwise,
+[Circuit breaker](#circuit-breaker)) and 16 HTTP/2 connections per pod; idle ones close after `MIMIC_MESH_POOL_IDLE_TIMEOUT`; the pool of a
 pod that leaves the view is dropped.
 
 Discovery records one exchange per request under the authority the app sent (never the pod's address).
 No header is added to a request or a response. A meshed sidecar does remove the `x-mimic-*` fields of its
 **own app's** responses (see [Retries](#retries)).
+
+## How it works, in two diagrams
+
+**How the controller builds your view.** Both controller replicas watch the cluster and build, for each
+deployment, the same view; your sidecar follows it by long polling and checks it before using it.
+
+```mermaid
+flowchart TD
+  Objects["Services, EndpointSlices, MimicConfigs, ReferenceGrants, HTTPRoutes"] --> Ctl["mimic controller, both replicas"]
+  Ctl --> Scope{"In your namespace, or a destination whose namespace consents?"}
+  Scope -->|no| Out["Left out of your view"]
+  Scope -->|yes| Policy["Ports, ready pod IPs, the policy of its MimicConfig or the defaults"]
+  Policy --> Routes["The routes that apply to your namespace, and their backends"]
+  Routes --> View["Your view: canonical JSON with an ETag"]
+  View -->|"long poll, at most one new view per second"| Sidecar["Your sidecar"]
+  Sidecar --> Check{"Parses within the bounds and is not older?"}
+  Check -->|no| Kept["The view it holds is kept"]
+  Check -->|yes| Applied["Applied in one step, saved to state/mesh.json"]
+```
+
+**One request through your sidecar.** A call to `cart` whose route sends 10 % of the requests to `cart-v2`
+and mirrors them to `cart-shadow`, the first pod tried refusing the connection:
+
+```mermaid
+sequenceDiagram
+  participant App as Your app
+  participant SC as Your sidecar
+  participant P1 as cart-v2 pod 1
+  participant P2 as cart-v2 pod 2
+  participant Sh as cart-shadow pod
+  App->>SC: GET /cart to the ClusterIP of cart
+  Note over SC: route matched, backend cart-v2 drawn by weight
+  Note over SC: breaker slot of cart-v2 taken, else 503 breaker-open at once
+  Note over SC: mirror drawn, its copy waits for the response head
+  SC->>P1: try 1, request modifier applied
+  P1-->>SC: connection refused
+  Note over SC: failed before the app saw it, so retried on a pod not tried yet
+  SC->>P2: try 2, same head and body
+  P2-->>SC: 200 response head
+  SC-->>App: 200, response modifier applied
+  SC->>Sh: copy of the request, one try
+  Sh-->>SC: answer read and dropped
+  Note over SC: slot given back at the last body byte
+```
+
+Without a route the request goes to the pods of `cart` itself, and the route, mirror and modifier steps do
+not happen. A try is retried only when it failed before the app could process it, at most `1 + retries` tries
+per request and within the retry budget: **`retries: 3` (the default) means up to 4 tries**. A pod whose
+failures pile up is ejected from the choice for a while ([Outlier detection](#outlier-detection)). The rule's
+timeouts, when it has some, bound the call and each try ([Timeouts](#timeouts)). The design pages behind
+these diagrams are in
+[`docs/design/mesh/`](https://github.com/Thaliph/mock-server/blob/main/docs/design/mesh/README.md).
 
 ## Scope
 
@@ -642,9 +696,9 @@ parse, once per streak), `tls verification failed`.
   the callers of a pod that forwards its answers retry.
 - **Idempotent by method name.** A `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` or `DELETE` that a pod read and
   then dropped without an answer is sent to another pod: an app whose such methods have side effects can see
-  one request twice. Until the retry budget (#446) nothing bounds this per caller but `retries`, so a reset
-  that every tier propagates as a reset can cost 4 tries per tier; refusals and connect failures never reach
-  an app twice, at any depth.
+  one request twice. The retry budget bounds this per caller pod and Service: a reset that every tier
+  propagates as a reset costs at most a factor `(1 + percent / 100)` per tier, plus the floors
+  (`minPerSecond` per caller pod); refusals and connect failures never reach an app twice, at any depth.
 - **An injected callee whose app refuses connections over TLS looks like a reset.** On cleartext HTTP/1 and
   `h2c` its meshed sidecar answers `503` `x-mimic-error: connect-failed` with `x-mimic-endpoint` (its pod
   address) and `x-mimic-origin: inbound; pod=<name>`, and every method is retried on another pod. Over inbound
@@ -680,8 +734,8 @@ parse, once per streak), `tls verification failed`.
 
 ## What is coming
 
-- **M2**: retries of proxy-level failures on another pod are in (above); the retry budget and
-  `MimicConfig.retries` are next (#446).
+- **M2**: retries of proxy-level failures on another pod, the retry budget and `MimicConfig.retries` are in
+  ([Retries](#retries)).
 - **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts ([Timeouts](#timeouts)) and mirrors ([Mirroring](#mirroring)) are in.
 - **M4**: outlier detection and circuit breaker are in ([above](#outlier-detection-and-circuit-breaker)); fault injection is next.
 - **M5**: admission contract, failure signalling and HPA.
