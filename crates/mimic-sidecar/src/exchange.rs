@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response, StatusCode};
+use mimic_core::mesh::fault;
 use mimic_core::mesh::timeout::Kind;
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
 use mimic_core::proxy::http1::{CAPTURE_BODY_LIMIT, Captured, Event, RequestHead, Side};
@@ -258,6 +259,9 @@ pub(crate) struct Tracker {
     mirrored: Arc<AtomicBool>,
     /// Mesh-routed: the `x-mimic-error` of an answer of the sidecar (spec §4.1 `reason`).
     reason: Option<&'static str>,
+    /// Mesh-routed: the fault injected (spec §4.1 `fault`) and the delay of a `delay`.
+    fault: Option<&'static str>,
+    fault_delay_ms: Option<u64>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -351,6 +355,8 @@ impl Tracker {
             timeout: None,
             mirrored: Arc::new(AtomicBool::new(false)),
             reason: None,
+            fault: None,
+            fault_delay_ms: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -391,6 +397,14 @@ impl Tracker {
     pub(crate) fn matched(&mut self, route: &str, rule: usize) {
         self.route = Some(Arc::from(route));
         self.rule = Some(rule);
+    }
+
+    /// A fault of the drawn backend's policy was injected (spec §4.1 `fault`).
+    pub(crate) fn fault(&mut self, kind: fault::Kind) {
+        (self.fault, self.fault_delay_ms) = match kind {
+            fault::Kind::Abort { .. } => (Some("abort"), None),
+            fault::Kind::Delay { ms } => (Some("delay"), Some(ms)),
+        };
     }
 
     /// The flag a copy of the request sets when it is sent to a mirror (spec §7.9 "Mirrors"): the
@@ -586,6 +600,8 @@ impl Tracker {
             timeout: self.timeout,
             mirrored: self.mirrored.load(Ordering::SeqCst),
             reason: self.reason,
+            fault: self.fault,
+            fault_delay_ms: self.fault_delay_ms,
         });
     }
 }
@@ -731,6 +747,8 @@ pub(crate) fn rejected(ctx: &Ctx) {
         timeout: None,
         mirrored: false,
         reason: None,
+        fault: None,
+        fault_delay_ms: None,
     });
 }
 
@@ -774,6 +792,8 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
         timeout: None,
         mirrored: false,
         reason: None,
+        fault: None,
+        fault_delay_ms: None,
     });
 }
 
@@ -1099,6 +1119,8 @@ impl Http1Tracker {
             timeout: None,
             mirrored: false,
             reason: None,
+            fault: None,
+            fault_delay_ms: None,
         });
     }
 }

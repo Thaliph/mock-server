@@ -88,6 +88,10 @@ pub struct Exchange {
     pub mirrored: bool,
     /// Mesh-routed requests the sidecar answered itself (spec §4.1): the `x-mimic-error` it wrote.
     pub reason: Option<&'static str>,
+    /// Mesh-routed requests a fault of the drawn backend's policy was injected into (spec §7.9
+    /// "Fault injection"): `abort` or `delay`, and the delay of a `delay`.
+    pub fault: Option<&'static str>,
+    pub fault_delay_ms: Option<u64>,
 }
 
 /// One finished opaque or TLS connection.
@@ -157,6 +161,8 @@ pub fn exchange(e: &Exchange) {
         timeout = e.timeout,
         mirrored = e.mirrored.then_some(true),
         reason = e.reason,
+        fault = e.fault,
+        fault_delay_ms = e.fault_delay_ms,
         "http exchange"
     );
 }

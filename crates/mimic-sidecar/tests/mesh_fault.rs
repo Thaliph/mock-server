@@ -280,6 +280,16 @@ async fn flt_11_configured_statuses_204_304_and_head() {
     let (head, body) = client.get("/cart").await;
     assert!(head.starts_with("HTTP/1.1 200") && body == "pod", "{head}");
     assert_eq!(pod.counts.requests(), 1);
+    // The same over `h2c`, where nothing removes a `content-length` the sidecar would write.
+    let sender = h2_client(f.addr).await;
+    for want in [200, 418, 599, 204, 304] {
+        let (code, error, _, length, body) = h2_call(&sender, "GET", &format!("/s{want}")).await;
+        assert_eq!(code, want);
+        assert_eq!(error.as_deref(), Some("fault-injected"));
+        let none = want == 204 || want == 304;
+        assert_eq!(length.as_deref(), (!none).then_some("0"), "{want}");
+        assert!(body.is_empty());
+    }
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use mimic_core::mesh::fault::Faults;
 use mimic_core::mesh::lb::Endpoints;
 use mimic_core::mesh::mirror::{self, Body, Candidate, Decision as Mirrored};
 use mimic_core::mesh::outlier::{self, Outlier, Restoration};
@@ -111,6 +112,8 @@ pub(crate) struct ServiceRetry {
     max_requests: AtomicU32,
     max_connections: pool::Limit,
     opened: Mutex<Limiter>,
+    /// The faults of the Service (spec §7.9 "Fault injection"), made once per view.
+    faults: RwLock<Arc<Faults>>,
 }
 
 /// A slot of a Service's breaker, taken by a request and given back when dropped (the count it
@@ -140,12 +143,16 @@ impl ServiceRetry {
             max_requests: AtomicU32::new(policy.circuit_breaker.max_requests),
             max_connections: Arc::new(AtomicU32::new(policy.circuit_breaker.max_connections)),
             opened: Mutex::new(Limiter::default()),
+            faults: RwLock::new(Arc::new(Faults::new(&policy.faults))),
         }
     }
 
-    /// A new view: `retries` and the rates apply at once; a new window starts the budget empty.
+    /// A new view: `retries`, the rates and the faults apply at once; a new window starts the
+    /// budget empty.
     fn configure(&self, policy: &Policy) {
         self.retries.store(policy.retries, Ordering::Release);
+        *self.faults.write().unwrap_or_else(PoisonError::into_inner) =
+            Arc::new(Faults::new(&policy.faults));
         self.max_requests
             .store(policy.circuit_breaker.max_requests, Ordering::Release);
         self.max_connections
@@ -164,6 +171,23 @@ impl ServiceRetry {
 
     pub(crate) fn retries(&self) -> u32 {
         self.retries.load(Ordering::Acquire)
+    }
+
+    /// The faults of the view held, in its order; empty when it has none.
+    pub(crate) fn faults(&self) -> Arc<Faults> {
+        self.faults
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the view held gives the Service faults (no clone of them).
+    pub(crate) fn has_faults(&self) -> bool {
+        !self
+            .faults
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 
     /// The HTTP/1 connections a pool may hold for a request of this Service, as the view now

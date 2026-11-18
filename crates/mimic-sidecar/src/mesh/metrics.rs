@@ -48,6 +48,8 @@ const MIRRORED: [&str; 4] = ["sent", "error", "skipped_body", "skipped_limit"];
 const SKIPS: [&str; 3] = ["exhausted", "method", "buffer"];
 /// Every `reason` of an ejection (spec §7.9 "Outlier detection").
 const EJECTIONS: [&str; 2] = ["consecutive_failures", "consecutive_5xx"];
+/// Every `kind` of a fault (spec §7.9 "Fault injection").
+pub(crate) const FAULT_KINDS: [&str; 2] = ["abort", "delay"];
 
 /// Every `status_class` value, to remove the series of an evicted endpoint.
 const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "none"];
@@ -90,6 +92,12 @@ struct BackendLabels {
 struct ResultLabels {
     backend: String,
     result: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct FaultLabels {
+    service: String,
+    kind: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
@@ -165,6 +173,9 @@ pub(crate) struct MeshMetrics {
     ejections: Family<ReasonLabels, Counter>,
     /// Endpoints ejected now, per backend of the view.
     ejected: Family<BackendLabels, Gauge>,
+    /// Faults injected by the Service whose policy injected them and kind; a series exists
+    /// from its first count.
+    faults: Family<FaultLabels, Counter>,
     /// `x-mimic-*` fields removed from app responses by the inbound side (spec §4.1).
     /// Without labels, and made by the first removal: nothing of the mesh shows until then
     /// (MSH-51).
@@ -196,6 +207,7 @@ impl MeshMetrics {
             mirrored: Family::default(),
             ejections: Family::default(),
             ejected: Family::default(),
+            faults: Family::default(),
             stripped: Family::default(),
             unframed: Family::default(),
             inbound_refusals: Family::default(),
@@ -267,6 +279,11 @@ impl MeshMetrics {
             "mesh_ejected_endpoints",
             "Endpoints ejected now by outlier detection, by backend",
             self.ejected.clone(),
+        );
+        registry.register(
+            "mesh_faults",
+            "Faults injected into mesh-routed requests, by the Service whose policy injected them and kind",
+            self.faults.clone(),
         );
         registry.register(
             "mesh_reconnects",
@@ -377,6 +394,17 @@ impl MeshMetrics {
             .get_or_create(&ReasonLabels {
                 backend: backend.to_string(),
                 reason,
+            })
+            .inc();
+    }
+
+    /// A fault of `kind` (one of [`FAULT_KINDS`]) of the policy of `service` was injected.
+    pub(crate) fn fault(&self, service: &str, kind: &'static str) {
+        debug_assert!(FAULT_KINDS.contains(&kind), "{kind}");
+        self.faults
+            .get_or_create(&FaultLabels {
+                service: service.to_string(),
+                kind,
             })
             .inc();
     }
