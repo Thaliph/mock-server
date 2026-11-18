@@ -3430,7 +3430,10 @@ no insignificant whitespace):
     the try reads the body and the request ends as any whose app left during its try (§11.1).
     Mesh-level counts are
     the request's own after the delay (tries, budget, outlier outcomes, endpoint `in_flight`: a
-    delayed request is in no pod's `in_flight` while it waits). On `SIGTERM` a delay in flight is
+    delayed request is in no pod's `in_flight` while it waits). Endpoints ejected during the wait
+    are seen by the plan that follows it: when every endpoint is ejected by then, the request is
+    answered `breaker-open` after the delay, which was waited and is counted (`fault: delay` on
+    its line). On `SIGTERM` a delay in flight is
     not shortened: the grace bounds it like any slow request.
   - **Not faulted**: requests the mock answers (a passthrough request on a mesh-routed
     connection, accepted in `none` or `discovery` and then switched to `mock`, is faulted like
@@ -3448,8 +3451,8 @@ no insignificant whitespace):
   - **Observability**: `mimic_mesh_faults_total{service,kind}` counts each injection once
     (`service` the `<namespace>/<name>` of the Service whose policy injected it, the drawn
     backend's; `kind` `delay` or `abort`; a delay that a route timeout cut is counted, a delay
-    drawn for a request then answered `no-endpoint` or `breaker-open` is not injected and not
-    counted); an abort
+    drawn for a request answered `no-endpoint` or `breaker-open` before its wait is not injected
+    and not counted); an abort
     also counts `mimic_mesh_requests_total` with `reason="fault-injected"` and the `status_class`
     of its status, `backend` the drawn Service port. The access line has `fault` (§4.1). No
     component log line per fault: the policy is visible in the view and `mesh view applied`.
