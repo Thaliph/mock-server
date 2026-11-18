@@ -11,10 +11,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    AbortSpec, BackendRef, BreakerSpec, Config, DelaySpec, Destination, Endpoint, EndpointSlice,
-    FaultSpec, GATEWAY_GROUP, GrantFrom, GrantTo, HeaderModifier, Mirror, NameMatch, OutlierSpec,
-    ParentRef, PathMatch, ReferenceGrant, RetryBudgetSpec, Route, RouteFilter, RouteMatch,
-    RouteRule, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
+    AbortSpec, AdmissionSpec, BackendRef, BreakerSpec, Config, DelaySpec, Destination, Endpoint,
+    EndpointSlice, FaultSpec, GATEWAY_GROUP, GrantFrom, GrantTo, HeaderModifier, Mirror, NameMatch,
+    OutlierSpec, ParentRef, PathMatch, ReferenceGrant, RetryBudgetSpec, Route, RouteFilter,
+    RouteMatch, RouteRule, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
 };
 use mimic_core::mesh::route::duration_ms;
 use serde_json::Value;
@@ -244,7 +244,12 @@ pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
             .get("faults")
             .and_then(Value::as_array)
             .map(|list| list.iter().map(fault).collect()),
-        admission: None,
+        // A field that cannot be read is `u32::MAX`, and a non-object `admission` has neither
+        // field: `validate` refuses both (ADM-11).
+        admission: spec.get("admission").map(|a| AdmissionSpec {
+            concurrency: a.get("concurrency").map(bounded),
+            rps: a.get("rps").map(bounded),
+        }),
     };
     Some((key, config))
 }

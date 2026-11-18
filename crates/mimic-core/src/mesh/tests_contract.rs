@@ -305,11 +305,6 @@ fn adm_10_the_contract_counts_in_the_byte_bound_of_the_view() {
     assert_eq!(exact.view.admission, contract_of(64, 200));
     let short = at(l - 1);
     assert_eq!(short.truncated, 1);
-    assert!(
-        short.json.len() <= l - 1,
-        "{} over {}",
-        short.json.len(),
-        l - 1
-    );
+    assert!(short.json.len() < l, "{} over {}", short.json.len(), l - 1);
     assert_eq!(short.view.admission, contract_of(64, 200));
 }

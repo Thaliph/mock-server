@@ -479,15 +479,22 @@ fn adm_11_a_value_the_api_server_did_not_check_makes_the_config_invalid_never_a_
         json!(null),
         json!(10_000_000_000u64),
     ];
+    // A value that cannot be read is out of bounds, not absent.
     for bad in &values {
         let c = admission_config(json!({"concurrency": bad, "rps": 200}));
-        let err = validate(&c).expect_err("must not validate");
-        assert!(err.contains("admission.concurrency"), "{bad}: {err}");
+        assert_eq!(
+            validate(&c),
+            Err("admission.concurrency is not 1 to 100000".into()),
+            "{bad}"
+        );
     }
     for bad in values.iter().filter(|v| **v != json!(100_001)) {
         let c = admission_config(json!({"concurrency": 64, "rps": bad}));
-        let err = validate(&c).expect_err("must not validate");
-        assert!(err.contains("admission.rps"), "{bad}: {err}");
+        assert_eq!(
+            validate(&c),
+            Err("admission.rps is not 1 to 1000000".into()),
+            "{bad}"
+        );
     }
     let c = admission_config(json!({"concurrency": 64, "rps": 1_000_001}));
     assert!(
