@@ -21,7 +21,7 @@ branch of the directory you start in.
 ## The step spec
 
 Post it as one issue comment (`gh issue comment <n> --body-file -`), first line
-`<!-- mimic-step-spec: <n> step <k> -->`, at most three screens:
+`<!-- mimic-step-spec: <n> step <k> -->`, at most three screens of text (the diagrams do not count, the Tests section is never cut):
 
 1. **Goal**: one sentence, plus the criterion IDs it covers.
 2. **Placement**: files and modules to create or change, and why there (the layering:
@@ -43,10 +43,12 @@ Post it as one issue comment (`gh issue comment <n> --body-file -`), first line
    - **Sequence**: a `sequenceDiagram` of one request or reconcile through the actors
      (application, sidecar, upstream, controller, API server), with timeouts and errors as `alt`
      or `opt` blocks.
-   Label edges with the criterion ID they implement (`FLT-04`). Draw what the step builds,
+   Label edges with the criterion ID they implement (`FLT-04`); leave an internal edge unlabelled.
+   The behaviour table is the reference: a diagram that disagrees with it is wrong. Draw what the step builds,
    matching the contract and the behaviour table, not the whole feature; skip a diagram only if
-   the step has nothing of that kind, and say so in one line. Keep to plain Mermaid syntax (node
-   IDs without spaces, labels in quotes when they hold `()`, `:` or `/`) so GitHub renders it.
+   the step has nothing of that kind, and say so in one line. Keep to plain Mermaid syntax so GitHub renders it:
+   node IDs without spaces, flowchart labels in quotes when they hold `()`, `:` or `/` (sequence
+   messages and state transitions take no quotes: they would show).
 7. **Tests**: the list of test names (`<id>_<what>`), the level (unit / integration / e2e), the
    setup, the stimulus and the exact assertion, and for each one the mutation it must catch
    (the wrong code that would still pass a weaker test).
