@@ -149,6 +149,45 @@ the request. When it expired after the head the app sees a cut response (a close
 `INTERNAL_ERROR`) and the access line has the pod's status. A producer route in the callee's namespace binds
 callers that have no route of their own: check `kubectl get httproute -A`.
 
+**Any status (often `503`) with `x-mimic-error: fault-injected`.** A fault of the backend Service's `MimicConfig`
+aborted the call in the caller's own sidecar ([Mesh](Mesh#fault-injection)); nothing was sent to any pod. The
+caller's access line has `fault: abort`, `reason: fault-injected`, the configured `status` and the `backend`
+whose policy injected it, and no `upstream`; `mimic_mesh_faults_total{service,kind="abort"}` and
+`mimic_mesh_requests_total{reason="fault-injected"}` count them. Find the fault in the namespace of that Service:
+
+```bash
+kubectl -n <ns> get mimicconfig -o json \
+  | jq '.items[] | select(.spec.faults) | {name: .metadata.name, targets: .spec.targetRefs, faults: .spec.faults}'
+```
+
+Remove it when the test is over: the calls are normal again from the caller sidecar's next `mesh view applied`
+line. The answer is never retried and names no pod. When the
+caller's line has **no** `fault` but an `upstream`, the `fault-injected` answer came from a pod: that app forwarded
+an abort its own sidecar injected into one of its calls, so look one tier further down.
+
+**Calls to a Service take a fixed extra time, or all time out together.** The access lines of the caller have
+`fault: delay` and `fault_delay_ms` (the time injected; `duration_ms` and `head_ms` include it), and
+`mimic_mesh_faults_total{kind="delay"}` rises: a delay fault of the Service, same search as above. The delay counts
+against the rule's `timeouts.request`, so a delay longer than it gives `504` `timeout` with `fault: delay` on the
+line and nothing sent to a pod. Delayed calls hold their breaker slot during the wait, so `breaker-open` answers
+can follow.
+
+**A fault does not apply.** `mimic_mesh_faults_total` has no series for the Service on the caller's sidecar:
+
+- The `MimicConfig` is not the Service's winning one: `Accepted: False` with `Conflicted` (an older config
+  targets the Service: put `faults` in that one), `Invalid` (the message names the field and the item index) or
+  `TargetNotFound` (no such Service in that namespace; `targetRefs` cannot name another namespace).
+- The caller sidecar has not applied the view yet: wait for its next `mesh view applied` line.
+- The route sends the call to another backend Service: the faults that apply are the **drawn backend's**, not the
+  parent Service's.
+- An earlier item matches first: the faults are tried in order and only the first whose `match` holds applies. A
+  `match` sees the request as the app sent it, before the route's `RequestHeaderModifier`.
+- The call is never faulted: a caller without a sidecar or with the mesh off, mode `mock` (the mock answers), a stale
+  view, `Upgrade`, `CONNECT`, an L4 connection (opaque TCP, TLS passed through), inbound traffic, a mirror copy, or a
+  connection to a `spec.mock.passthrough` destination accepted while in `mock` (byte relay, #549: run the test in
+  `discovery`).
+- `percent` is drawn per request by each caller sidecar: at low traffic a small percentage may not show yet.
+
 **Mirrored requests do not arrive, or not all of them.** Look at `mimic_mesh_mirrored_total{backend,result}` of
 the caller's sidecar ([Mesh](Mesh#mirroring)); a copy is best effort and each result says why:
 
