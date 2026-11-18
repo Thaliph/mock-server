@@ -12,9 +12,13 @@ criterion IDs. Never paste the conversation into a brief.
 | Agent | Model | Used for |
 |---|---|---|
 | `architect` | Opus | once per feature: criteria, design, threat model, steps |
-| `rust-dev` | Sonnet | each Rust step, test-first |
+| `spec-writer` | Opus | each step with Rust code: the step spec (contract, reuse, tests) |
+| `rust-dev` | Sonnet | each Rust step, test-first, from the step spec |
 | `ops` | Haiku | each CI / Dockerfile / Helm / kind step |
-| `reviewer` | Sonnet | each PR, one pass |
+| `code-critic` | Opus | each PR, before the reviewer: duplication, layering, coherence |
+| `reviewer` | Sonnet | each PR, one pass, plus delta re-reviews |
+| `ci-triage` | Haiku | a failing CI run: diff, flake or infra |
+| `security-auditor` | Opus | once per milestone, on `main`, after its last merge |
 
 Do small mechanical things yourself instead of spawning an agent (a typo, a version bump, a
 one-line fix asked by a review): a spawn costs more than the fix.
@@ -35,8 +39,11 @@ Brief `architect`: issue, branch. When it returns, read its issue comment.
 ## 3. Steps
 
 For each step, in order (steps that share no file may run in parallel):
-1. Brief `rust-dev` (Rust) or `ops` (delivery chain): issue, branch, step, criterion IDs.
-2. Check its report; run `cargo test --workspace` yourself only if the report is unclear.
+1. Rust step: brief `spec-writer` (issue, branch, step). Read its step spec; an open question
+   goes to the architect (criteria) or to the user (product). Skip it for a step under ~50 lines.
+2. Brief `rust-dev` (Rust) or `ops` (delivery chain): issue, branch, its own worktree, step,
+   criterion IDs, the Valkey URL. Parallel agents never share a worktree.
+3. Check its report; run `cargo test --workspace` yourself only if the report is unclear.
 
 One PR per feature by default (`gh pr create` from the feature branch, body: `Closes #<n>`,
 criteria covered, how verified, `🤖 Generated with [Claude Code](https://claude.com/claude-code)`).
@@ -44,14 +51,24 @@ Split into stacked PRs only when the diff exceeds ~1500 lines.
 
 ## 4. Review and merge
 
-1. Brief `reviewer` with the PR number.
-2. Blocking findings → brief the author agent with only those findings; repeat review once.
-   Disagreement on a product point → ask the user.
-3. Merge when `gh pr checks <n> --watch` is green **and** the last `mimic-review` marker is
+1. Brief `code-critic` with the PR number. Its Must items go to the author agent before the
+   review; Could items only if cheap.
+2. Brief `reviewer` with the PR number.
+3. Blocking findings → brief the author agent with only those findings; repeat review once.
+   Disagreement on a product point → ask the user. After any new commit or a merge of `main`,
+   brief the reviewer for a delta re-review: the approval must be newer than the head.
+4. A red CI run → brief `ci-triage` with the run id instead of reading the logs yourself.
+5. Merge when `gh pr checks <n> --watch` is green **and** the last `mimic-review` marker is
    `APPROVE`: `gh pr merge <n> --merge --delete-branch`. A failing e2e unrelated to the diff may
    be re-run once (`gh run rerun <id> --failed`).
-4. Close the loop: tick the feature in the issue, update memory with the feature status, tell the
+6. Close the loop: tick the feature in the issue, update memory with the feature status, tell the
    user in a few lines (what works now, how to try it, what is next).
+
+## 5. Milestone audit
+
+When the last PR of a milestone merges, brief `security-auditor` with the milestone issues and the
+commit range. Its `[high]` and `[medium]` findings are fixed before the next milestone starts;
+`[low]` ones join the follow-ups.
 
 ## Tooling (kept here so a fresh machine or session needs nothing else)
 
@@ -80,5 +97,7 @@ Split into stacked PRs only when the diff exceeds ~1500 lines.
 ## Cost rules
 
 - Read only the spec sections and files a step needs; prefer `gh … --json` with `-q`.
-- No Opus agent for implementation or review; no second review pass for non-blocking findings.
+- Opus only for the judgment roles (architect, spec-writer, code-critic, security-auditor); never
+  for implementation or the correctness review. No second review pass for non-blocking findings.
+- Benchmarks follow the `bench` skill; e2e the `kind-e2e` skill.
 - Public repo + GitHub-hosted runners + GHCR only (free tier).
