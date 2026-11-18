@@ -146,15 +146,7 @@ fn bounded(value: &Value) -> u32 {
 /// A `faults` item: a percent, a status or a `fixed` that is missing or cannot be read arrives
 /// out of bounds, so that `validate` refuses the object (FLT-03).
 fn fault(value: &Value) -> FaultSpec {
-    let match_ = value.get("match").map(|m| RouteMatch {
-        path: m.get("path").map(|p| PathMatch {
-            kind: text(p, "type").unwrap_or_else(|| "PathPrefix".into()),
-            value: text(p, "value").unwrap_or_else(|| "/".into()),
-        }),
-        headers: names(m, "headers"),
-        query_params: names(m, "queryParams"),
-        method: text(m, "method"),
-    });
+    let match_ = value.get("match").map(route_match);
     let number = |v: &Value, field: &str| v.get(field).map_or(u32::MAX, bounded);
     FaultSpec {
         r#match: match_,
@@ -426,6 +418,19 @@ fn filter(value: &Value, at: &str, out: &mut Vec<String>) -> RouteFilter {
     }
 }
 
+/// An `HTTPRouteMatch`, of a route rule or of a fault: the path defaults to `PathPrefix /`.
+fn route_match(m: &Value) -> RouteMatch {
+    RouteMatch {
+        path: m.get("path").map(|p| PathMatch {
+            kind: text(p, "type").unwrap_or_else(|| "PathPrefix".into()),
+            value: text(p, "value").unwrap_or_else(|| "/".into()),
+        }),
+        headers: names(m, "headers"),
+        query_params: names(m, "queryParams"),
+        method: text(m, "method"),
+    }
+}
+
 fn rule(value: &Value, at: &str, out: &mut Vec<String>) -> RouteRule {
     unknown(value, at, &RULE_FIELDS, out);
     let matches = list(value, "matches")
@@ -434,15 +439,7 @@ fn rule(value: &Value, at: &str, out: &mut Vec<String>) -> RouteRule {
         .map(|(j, m)| {
             let at = format!("{at}.matches[{j}]");
             unknown(m, &at, &MATCH_FIELDS, out);
-            RouteMatch {
-                path: m.get("path").map(|p| PathMatch {
-                    kind: text(p, "type").unwrap_or_else(|| "PathPrefix".into()),
-                    value: text(p, "value").unwrap_or_else(|| "/".into()),
-                }),
-                headers: names(m, "headers"),
-                query_params: names(m, "queryParams"),
-                method: text(m, "method"),
-            }
+            route_match(m)
         })
         .collect();
     let filters = list(value, "filters")

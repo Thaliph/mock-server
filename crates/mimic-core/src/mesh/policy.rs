@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::input::{
     Config, FaultSpec, MIMIC_GROUP, ReferenceGrant, RouteMatch, Snapshot, TargetKind,
 };
-use super::route::{MatchView, NameValue, PathView};
-use super::view::{MAX_ITEMS, header_name, header_value, method, path_value};
+use super::route::{MatchView, match_unsupported, match_view};
 
 /// `loadBalancer.slowStart` when no `MimicConfig` sets it, in seconds.
 pub const DEFAULT_SLOW_START_SECS: u32 = 30;
@@ -257,18 +256,6 @@ pub fn effective(winner: Option<&Config>) -> Policy {
 
 /// A fault of a valid config as the view carries it: header names lower-cased.
 fn fault_view(spec: &FaultSpec) -> Fault {
-    let names = |list: &[super::input::NameMatch], lower: bool| -> Vec<NameValue> {
-        list.iter()
-            .map(|n| NameValue {
-                name: if lower {
-                    n.name.to_ascii_lowercase()
-                } else {
-                    n.name.clone()
-                },
-                value: n.value.clone(),
-            })
-            .collect()
-    };
     Fault {
         abort: spec.abort.as_ref().map(|a| FaultAbort {
             percent: a.percent,
@@ -278,15 +265,7 @@ fn fault_view(spec: &FaultSpec) -> Fault {
             fixed_ms: d.fixed_ms,
             percent: d.percent,
         }),
-        r#match: spec.r#match.as_ref().map(|m| MatchView {
-            headers: names(&m.headers, true),
-            method: m.method.clone(),
-            path: m.path.as_ref().map(|p| PathView {
-                kind: p.kind.clone(),
-                value: p.value.clone(),
-            }),
-            query_params: names(&m.query_params, false),
-        }),
+        r#match: spec.r#match.as_ref().map(match_view),
     }
 }
 
@@ -322,33 +301,15 @@ fn validate_faults(faults: &[FaultSpec]) -> Result<(), String> {
     Ok(())
 }
 
+/// The checks of a route match (spec §7.9 "Routing"), and a query parameter name that is not
+/// empty (the CRD's `minLength`).
 fn validate_match(i: usize, m: &RouteMatch) -> Result<(), String> {
     let at = format!("faults[{i}].match");
-    if let Some(p) = &m.path
-        && (!matches!(p.kind.as_str(), "Exact" | "PathPrefix") || !path_value(&p.value))
-    {
-        return Err(format!(
-            "{at}.path is not Exact or PathPrefix with a value of 1 to 1024 bytes starting with /"
-        ));
+    if let Some(path) = match_unsupported(&at, m) {
+        return Err(format!("{path} is not valid"));
     }
-    if m.method.as_deref().is_some_and(|name| !method(name)) {
-        return Err(format!("{at}.method is not one of the HTTPRoute CRD"));
-    }
-    for (field, list, named) in [
-        ("headers", &m.headers, true),
-        ("queryParams", &m.query_params, false),
-    ] {
-        if list.len() > MAX_ITEMS {
-            return Err(format!("{at}.{field} holds more than {MAX_ITEMS} items"));
-        }
-        if list.iter().any(|n| {
-            n.kind != "Exact"
-                || !header_value(&n.value)
-                || n.name.is_empty()
-                || (named && !header_name(&n.name.to_ascii_lowercase()))
-        }) {
-            return Err(format!("{at}.{field} holds an item that is not valid"));
-        }
+    if let Some(k) = m.query_params.iter().position(|n| n.name.is_empty()) {
+        return Err(format!("{at}.queryParams[{k}].name is not valid"));
     }
     Ok(())
 }

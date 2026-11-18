@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::input::{
     BackendRef, GATEWAY_GROUP, HeaderModifier, Mirror, NameMatch, ReferenceGrant, Route,
-    RouteFilter, RouteRule, Service,
+    RouteFilter, RouteMatch, RouteRule, Service,
 };
 use super::policy::Condition;
 mod apply;
@@ -400,18 +400,7 @@ fn compile_rule(rule: &RouteRule, resolver: &mut Resolver) -> RuleView {
             ..MatchView::default()
         }]
     } else {
-        rule.matches
-            .iter()
-            .map(|m| MatchView {
-                headers: name_values(&m.headers, true),
-                method: m.method.clone(),
-                path: m.path.as_ref().map(|p| PathView {
-                    kind: p.kind.clone(),
-                    value: p.value.clone(),
-                }),
-                query_params: name_values(&m.query_params, false),
-            })
-            .collect()
+        rule.matches.iter().map(match_view).collect()
     };
     let backends = rule
         .backend_refs
@@ -499,6 +488,20 @@ fn mirror_fraction(m: &Mirror) -> (u32, u32) {
 
 fn resolve_backend(b: &BackendRef, resolver: &mut Resolver) -> Option<(String, u16)> {
     resolver.resolve(&b.group, &b.kind, b.namespace.as_deref(), &b.name, b.port)
+}
+
+/// An `HTTPRouteMatch` as the view carries it, of a route rule or of a fault: header names
+/// lower-cased.
+pub(super) fn match_view(m: &RouteMatch) -> MatchView {
+    MatchView {
+        headers: name_values(&m.headers, true),
+        method: m.method.clone(),
+        path: m.path.as_ref().map(|p| PathView {
+            kind: p.kind.clone(),
+            value: p.value.clone(),
+        }),
+        query_params: name_values(&m.query_params, false),
+    }
 }
 
 fn name_values(matches: &[NameMatch], lower: bool) -> Vec<NameValue> {
@@ -618,17 +621,8 @@ fn rule_unsupported(i: usize, rule: &RouteRule) -> Option<String> {
         }
     }
     for (j, m) in rule.matches.iter().enumerate() {
-        let at = format!("{at}.matches[{j}]");
-        if let Some(p) = &m.path
-            && p.kind != "Exact"
-            && p.kind != "PathPrefix"
-        {
-            return Some(format!("{at}.path.type: {}", p.kind));
-        }
-        for (list, items) in [("headers", &m.headers), ("queryParams", &m.query_params)] {
-            if let Some(k) = items.iter().position(|n| n.kind != "Exact") {
-                return Some(format!("{at}.{list}[{k}].type: {}", items[k].kind));
-            }
+        if let Some(path) = match_type_unsupported(&format!("{at}.matches[{j}]"), m) {
+            return Some(path);
         }
     }
     if let Some(path) = value_unsupported(&at, rule) {
@@ -640,6 +634,61 @@ fn rule_unsupported(i: usize, rule: &RouteRule) -> Option<String> {
     ] {
         if value.as_deref().is_some_and(|v| duration_ms(v).is_none()) {
             return Some(format!("{at}.timeouts.{field}"));
+        }
+    }
+    None
+}
+
+/// The path of the first item of the match `m` at `at` that is not supported or that the view
+/// would refuse: the checks of a route match (RTE-12) and of a fault's (FLT-01).
+pub(super) fn match_unsupported(at: &str, m: &RouteMatch) -> Option<String> {
+    match_type_unsupported(at, m).or_else(|| match_value_unsupported(at, m))
+}
+
+/// A path or item type the mesh does not support.
+fn match_type_unsupported(at: &str, m: &RouteMatch) -> Option<String> {
+    if let Some(p) = &m.path
+        && p.kind != "Exact"
+        && p.kind != "PathPrefix"
+    {
+        return Some(format!("{at}.path.type: {}", p.kind));
+    }
+    for (list, items) in [("headers", &m.headers), ("queryParams", &m.query_params)] {
+        if let Some(k) = items.iter().position(|n| n.kind != "Exact") {
+            return Some(format!("{at}.{list}[{k}].type: {}", items[k].kind));
+        }
+    }
+    None
+}
+
+/// A value of the match the view would refuse (`View::from_json`), found by the predicates it
+/// uses.
+fn match_value_unsupported(at: &str, m: &RouteMatch) -> Option<String> {
+    if m.headers.len() > MAX_ITEMS {
+        return Some(format!("{at}.headers"));
+    }
+    if m.query_params.len() > MAX_ITEMS {
+        return Some(format!("{at}.queryParams"));
+    }
+    if let Some(p) = &m.path
+        && !path_value(&p.value)
+    {
+        return Some(format!("{at}.path.value"));
+    }
+    if m.method.as_deref().is_some_and(|v| !method(v)) {
+        return Some(format!("{at}.method"));
+    }
+    for (list, items, lower) in [
+        ("headers", &m.headers, true),
+        ("queryParams", &m.query_params, false),
+    ] {
+        for (k, n) in items.iter().enumerate() {
+            if lower && !header_name(&n.name.to_ascii_lowercase()) {
+                return Some(format!("{at}.{list}[{k}].name"));
+            }
+            if !header_value(&n.value) {
+                return Some(format!("{at}.{list}[{k}].value"));
+            }
         }
     }
     None
@@ -671,33 +720,8 @@ fn value_unsupported(at: &str, rule: &RouteRule) -> Option<String> {
         return Some(format!("{at}.filters"));
     }
     for (j, m) in rule.matches.iter().enumerate() {
-        let at = format!("{at}.matches[{j}]");
-        if m.headers.len() > MAX_ITEMS {
-            return Some(format!("{at}.headers"));
-        }
-        if m.query_params.len() > MAX_ITEMS {
-            return Some(format!("{at}.queryParams"));
-        }
-        if let Some(p) = &m.path
-            && !path_value(&p.value)
-        {
-            return Some(format!("{at}.path.value"));
-        }
-        if m.method.as_deref().is_some_and(|v| !method(v)) {
-            return Some(format!("{at}.method"));
-        }
-        for (list, items, lower) in [
-            ("headers", &m.headers, true),
-            ("queryParams", &m.query_params, false),
-        ] {
-            for (k, n) in items.iter().enumerate() {
-                if lower && !header_name(&n.name.to_ascii_lowercase()) {
-                    return Some(format!("{at}.{list}[{k}].name"));
-                }
-                if !header_value(&n.value) {
-                    return Some(format!("{at}.{list}[{k}].value"));
-                }
-            }
+        if let Some(path) = match_value_unsupported(&format!("{at}.matches[{j}]"), m) {
+            return Some(path);
         }
     }
     // Modifiers of one type merge into one list: the view bounds the merged lists.
