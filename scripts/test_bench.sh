@@ -313,7 +313,7 @@ adm_32_mesh_admission_setup_planned() {
   check "every run asks for the 50 ms delay" runs_with "delay=50ms" 11
   check "the pairs log every request's latency" runs_with "-access-log-file /dev/stderr" 8
   check "the plan names the order" has "ABBA"
-  check "the plan names the added p99 budget" has "+0.5 ms"
+  check "the plan names the added p90 budget" has "+0.5 ms"
   check "the plan names the median" has "median"
   check "the plan names the refusal budget" has "at most 1 ms"
   check "the plan names the queue-timeout budget" has "at most 160 ms"

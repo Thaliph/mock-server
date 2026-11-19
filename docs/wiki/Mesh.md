@@ -980,7 +980,7 @@ mock.
 
 3. **Check it above the contract with a client that is not a load test.** A load test stops at the first refusal:
    a refusal has no `x-mimic-load` field, so the generator ends the run `Unverified` (load tests count refusals from
-   #454). From a pod, send about twice the contract to one pod's IP (or through the Service, still at one
+   #454). From a pod without a mimic sidecar (a meshed caller retries the refusals on other pods), send about twice the contract to one pod's IP (or through the Service, still at one
    replica) with fortio or hey instead, for example
    `fortio load -qps <2 × rps> -c <2 × concurrency> -uniform -t 30s http://<pod ip>:<port>/` (`-uniform` spreads
    the connections in time; started together, they send in bursts). Or keep the load test at or
