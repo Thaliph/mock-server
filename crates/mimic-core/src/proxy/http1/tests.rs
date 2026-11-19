@@ -1239,6 +1239,12 @@ fn adm_20_held_request_frames_a_head_as_the_codec_does() {
     for (name, bytes, body, version, close, expect) in cases {
         let held = held_request(bytes);
         assert_eq!(held.head.as_ref().map(|h| h.version), version, "{name}");
+        // A framed head is whole; a whole head ends where its framing says.
+        match (held.state, &held.framing) {
+            (HeadState::Whole(end), Some(framing)) => assert_eq!(end, framing.end, "{name}"),
+            (_, Some(_)) => panic!("{name}: framed but not whole"),
+            _ => {}
+        }
         assert_eq!(
             held.framing.is_some(),
             codec_frames(bytes),
@@ -1302,5 +1308,24 @@ fn adm_20_held_request_frames_a_head_as_the_codec_does() {
     }
     big.extend_from_slice(b"\r\n");
     assert_eq!(held_request(&big).framing, None);
+    assert_eq!(held_request(&big).state, HeadState::Unframed);
+    // The states of the scan: open, whole even when the codec refuses its framing, unframed.
+    let cases: [(&[u8], HeadState); 6] = [
+        (b"", HeadState::Open),
+        (b"\r\n\r\n\n", HeadState::Open),
+        (b"GET / HTTP/1.1\r\nHo", HeadState::Open),
+        (
+            b"\r\nPOST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\nrest",
+            HeadState::Whole(68),
+        ),
+        (b"GET / HTTP/1.1\r\nBad Header : x\r\n", HeadState::Unframed),
+        (
+            b"GET / HTTP/1.1\r\nno colon here\r\n\r\n",
+            HeadState::Unframed,
+        ),
+    ];
+    for (bytes, state) in cases {
+        assert_eq!(held_request(bytes).state, state, "{bytes:?}");
+    }
     assert!(!codec_frames(&big));
 }

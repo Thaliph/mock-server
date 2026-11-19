@@ -503,20 +503,7 @@ impl MeshState {
             pod: config.pod.clone().filter(|pod| {
                 mimic_core::mesh::retry::origin(format!("inbound; pod={pod}").as_bytes())
             }),
-            router: Router::new(
-                config.pool_idle_timeout,
-                config.max_endpoint_labels,
-                config.seed,
-                config.connect_timeout,
-                config.avoid_failed_for,
-                config.refusal_delay,
-                router::MirrorConfig {
-                    max_in_flight: config.mirror_max_in_flight,
-                    max_in_flight_total: config.mirror_max_in_flight_total,
-                    timeout: config.mirror_timeout,
-                },
-                config.redirect.clone(),
-            ),
+            router: Router::new(config),
             seen: AtomicBool::new(false),
             admitter: Admitter::new(),
         }))

@@ -84,7 +84,9 @@ BREAKER_OPEN_BUDGET_MS=1    # mesh-breaker: the p99 of the access duration_ms of
 EJECT_PER_EJECTION=5        # mesh-eject: consecutiveFailures (default); the bound per ejection adds the connections in flight - 1
 BREAKER_CONNECTIONS=32      # mesh-breaker: fortio connections, more than maxRequests so that the breaker opens (BEN-03: at most 64)
 BREAKER_OPEN_MIN_PERCENT=10 # mesh-breaker: breaker-open answers, at least this share of the requests, proves it opened (CBR-34)
-ADMISSION_UNDER_CONCURRENCY=64 ADMISSION_UNDER_RPS=1000   # mesh-admission: never binding, 200 rps over 3 pods is about 67 per pod
+ADMISSION_DELAY_MS=$BREAKER_DELAY_MS                      # mesh-admission: the backend of mesh-breaker
+ADMISSION_CONNECTIONS=$BREAKER_CONNECTIONS                # and its fortio connections, the "off" and "under" runs
+ADMISSION_UNDER_CONCURRENCY=64 ADMISSION_UNDER_RPS=1000   # never binding: 200 rps over 3 pods is about 67 per pod
 ADMISSION_OVER_CONCURRENCY=64                             # a queue of 7 places
 ADMISSION_RPS=30                                          # per pod, the "over" runs
 ADMISSION_OVER_RATE=$((2 * MESH_PODS * ADMISSION_RPS))    # 180 rps, under the 200 cap
@@ -197,11 +199,12 @@ for setup in "${ORDERED_SETUPS[@]}"; do
 done
 
 # setup_connections <setup> [variant]: the fortio connections of a run: CONNECTIONS, BREAKER_CONNECTIONS for
-# mesh-breaker and mesh-admission, ADMISSION_OVER_CONNECTIONS for the adm-over run of mesh-admission.
+# mesh-breaker, ADMISSION_CONNECTIONS for mesh-admission and ADMISSION_OVER_CONNECTIONS for its adm-over run.
 setup_connections() {
   case $1/${2:--} in
     mesh-admission/adm-over) echo "$ADMISSION_OVER_CONNECTIONS" ;;
-    mesh-breaker/* | mesh-admission/*) echo "$BREAKER_CONNECTIONS" ;;
+    mesh-admission/*) echo "$ADMISSION_CONNECTIONS" ;;
+    mesh-breaker/*) echo "$BREAKER_CONNECTIONS" ;;
     *) echo "$CONNECTIONS" ;;
   esac
 }
@@ -234,6 +237,7 @@ eject_bound() { echo $((EJECT_PER_EJECTION + CONNECTIONS - 1)); }
 # server), the others use the default.
 fortio_args() {
   local url="http://fortio-server:8080/?size=1024&delay=${BREAKER_DELAY_MS}ms"
+  if [[ ${3:-} == mesh-admission ]]; then url="http://fortio-server:8080/?size=1024&delay=${ADMISSION_DELAY_MS}ms"; fi
   FORTIO_ARGS=(load -qps "$2" -t "$DURATION" -c "$(setup_connections "${3:-}" "${4:-}")" -p "50,90,99,99.9" -json -)
   if [[ $1 == h2c ]]; then FORTIO_ARGS+=(-h2); fi
   case ${3:-}/${4:--} in
@@ -302,7 +306,7 @@ if ((DRY_RUN)); then
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
       mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $(eject_bound) requests per ejection of the caller sidecar ($EJECT_PER_EJECTION consecutive failures + $CONNECTIONS connections - 1)" ;;
       mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the p99 of the access duration_ms of the breaker-open lines must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
-      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract, then under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod, $BREAKER_CONNECTIONS connections: the p99 under it must be at most +$ADMISSION_P99_BUDGET_MS ms over the run without it, with no error; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
+      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $ADMISSION_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract, then under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod, $ADMISSION_CONNECTIONS connections: the p99 under it must be at most +$ADMISSION_P99_BUDGET_MS ms over the run without it, with no error; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -1318,7 +1322,7 @@ run_one() {
   jq -e '.DurationHistogram.Count' <<<"$raw" >/dev/null || { echo "FAIL run $index printed no fortio JSON" >&2; exit 1; }
   if [[ $setup == mesh-admission ]]; then
     admission_json=$(jq -nc --arg variant "$variant" --argjson contract "$(admission_contract "$variant")" \
-      '{variant: $variant, contract: $contract}')
+      --arg label "$(variant_label "$variant")" '{variant: $variant, label: $label, contract: $contract}')
   fi
   if [[ $variant == adm-over ]]; then
     : >"$WORK/admission.pods"
@@ -1383,10 +1387,7 @@ write_results() {
   jq -r --arg date "$TODAY" --arg setup "$setup" '
     def v: if . == null then "-" else tostring end;
     def r2: if . == null then "-" else (. * 100 | round / 100 | tostring) end;
-    def admission: if .admission == null then ""
-      elif .admission.contract == null then " (no admission)"
-      else " (admission \(.admission.contract.concurrency)/\(.admission.contract.rps)\(if .admission.variant == "adm-over" then ", 2x" else "" end))" end;
-    "| \($date) | \($setup)\(if .mirror.enabled == false then (if .mirror.route then " (route, no mirror)" else " (no route)" end) else "" end)\(admission) | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
+    "| \($date) | \($setup)\(if .mirror.enabled == false then (if .mirror.route then " (route, no mirror)" else " (no route)" end) else "" end)\(.admission.label // "") | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
     "$WORK/$setup.jsonl" >>"$OUT_DIR/README.md"
   echo "wrote $file"
 }

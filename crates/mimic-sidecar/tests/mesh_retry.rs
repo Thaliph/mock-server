@@ -288,8 +288,8 @@ async fn rty_08_a_pod_refusing_connections_is_skipped_by_every_method_and_protoc
             let method = if n % 2 == 0 { "POST" } else { "GET" };
             let sent = if n % 2 == 0 { body.clone() } else { Vec::new() };
             let (status, got) = if h2 {
-                let (status, _, got) = h2_call(f.addr, method, sent).await.unwrap();
-                (status, got)
+                let answer = h2_call(f.addr, method, sent).await.unwrap();
+                (answer.status, answer.body)
             } else {
                 let (head, got) = h1_request(&mut client, method, &sent).await;
                 (head[9..12].parse().unwrap(), got)
@@ -394,7 +394,8 @@ async fn rty_09_refused_streams_and_goaway_are_retried_on_another_pod() {
         let f = fixture_mesh(cluster_ip(), &state, None).await;
         let body = payload(512);
         for _ in 0..20 {
-            let (status, _, got) = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+            let answer = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+            let (status, got) = (answer.status, answer.body);
             assert_eq!(status, 200);
             assert_eq!(got, b"ok");
         }
@@ -432,7 +433,8 @@ async fn rty_09_an_internal_error_reset_is_retried_for_a_get_and_not_for_a_post(
     let state = state_for(cluster_ip(), &[broken, ok.addr], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     for _ in 0..10 {
-        let (status, _, got) = h2_call(f.addr, "GET", Vec::new()).await.unwrap();
+        let answer = h2_call(f.addr, "GET", Vec::new()).await.unwrap();
+        let (status, got) = (answer.status, answer.body);
         assert_eq!((status, got), (200, b"ok".to_vec()));
     }
     let single = state_for(cluster_ip(), &[broken], |_| {});
@@ -850,7 +852,8 @@ async fn rty_14_an_h2c_post_in_the_buffer_is_retried() {
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let body = payload(60 * 1024);
     for _ in 0..10 {
-        let (status, _, got) = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+        let answer = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+        let (status, got) = (answer.status, answer.body);
         assert_eq!((status, got), (200, b"ok".to_vec()));
     }
     assert!(ok.seen.lock().unwrap().iter().all(|(_, b, _)| *b == body));
@@ -1192,8 +1195,8 @@ async fn rty_37_a_post_refused_by_a_callee_app_is_retried_on_another_pod() {
             let method = if n % 2 == 0 { "POST" } else { "GET" };
             let sent = if n % 2 == 0 { body.clone() } else { Vec::new() };
             let (status, headers, got) = if h2 {
-                let (status, headers, got) = h2_call(f.addr, method, sent).await.unwrap();
-                (status, format!("{headers:?}"), got)
+                let answer = h2_call(f.addr, method, sent).await.unwrap();
+                (answer.status, format!("{:?}", answer.headers), answer.body)
             } else {
                 let (head, got) = h1_request(&mut client, method, &sent).await;
                 (head[9..12].parse().unwrap(), head, got)

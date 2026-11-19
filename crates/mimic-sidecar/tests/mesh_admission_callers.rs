@@ -9,12 +9,12 @@ mod common;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use common::admission::{contract, inbound, meshed};
+use common::admission::{contract, inbound};
 use common::mesh_pods::{
-    BINARY, EchoPod, H1Client, Pod, Svc, cluster_ip, echoed, h1_request, h2_connect, h2_send,
-    mesh_state, payload, retries,
+    BINARY, EchoPod, H1Client, Pod, Svc, cluster_ip, echoed, h1_request, mesh_state, meshed,
+    payload, retries,
 };
-use common::{Fixture, capture_logs, closed_port, fixture_mesh, metric};
+use common::{Fixture, capture_logs, closed_port, fixture_mesh, h2_client, h2_send, metric};
 use mimic_sidecar::mesh::MeshState;
 
 const PODS: usize = 3;
@@ -112,12 +112,7 @@ fn check(tier: &Tier, answers: &[Got]) {
     }
     assert_eq!(answers.len(), CLIENTS * REQUESTS);
     for app in &tier.apps {
-        assert!(
-            app.counts
-                .max_in_flight
-                .load(std::sync::atomic::Ordering::SeqCst)
-                <= 1
-        );
+        assert!(app.counts.max_in_flight() <= 1);
         for (method, body) in app.counts.seen.lock().unwrap().iter() {
             match method.as_str() {
                 "POST" => assert_eq!(body, &payload(1024), "a POST body was cut"),
@@ -126,12 +121,7 @@ fn check(tier: &Tier, answers: &[Got]) {
             }
         }
     }
-    assert!(tier.apps.iter().any(|app| {
-        app.counts
-            .max_in_flight
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 1
-    }));
+    assert!(tier.apps.iter().any(|app| app.counts.max_in_flight() == 1));
     let admitted: usize = tier.apps.iter().map(|app| app.counts.requests()).sum();
     assert_eq!(admitted, ok, "a refused request reached an app");
     let scrape = tier.caller.metrics.encode();
@@ -231,23 +221,19 @@ async fn adm_29_h2c_callers_retry_refusals_on_another_pod() {
     for _ in 0..CLIENTS {
         let addr = tier.caller.addr;
         tasks.push(tokio::spawn(async move {
-            let mut sender = h2_connect(addr).await;
+            let mut sender = h2_client(addr).await;
             let mut got = Vec::new();
             for n in 0..REQUESTS {
                 let (method, body) = request(n);
-                let (status, headers, body) =
-                    h2_send(&mut sender, method, body).await.expect("an answer");
-                let value = |name: &str| {
-                    headers
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                };
+                let answer = h2_send(&mut sender, method, "/p", &[], body)
+                    .await
+                    .expect("an answer");
+                let value = |name: &str| answer.header(name).map(str::to_string);
                 got.push((
-                    status,
+                    answer.status,
                     value("x-mimic-error"),
                     value("x-mimic-endpoint"),
-                    body,
+                    answer.body.clone(),
                 ));
             }
             got

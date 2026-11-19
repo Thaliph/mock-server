@@ -93,7 +93,6 @@ impl Admitter {
     }
 
     /// The contract in force.
-    #[allow(dead_code)] // The HTTP/1 hold reads it per head (#453 step 4).
     pub(crate) fn contract(&self) -> Option<Contract> {
         self.lock().admission.contract()
     }

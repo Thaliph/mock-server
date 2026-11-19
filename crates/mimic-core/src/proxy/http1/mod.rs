@@ -169,9 +169,22 @@ pub struct RequestFraming {
     pub expect: bool,
 }
 
+/// How far [`held_request`] read the head at the start of some bytes, with the codec's scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadState {
+    /// Not whole yet, every byte so far valid.
+    Open,
+    /// Whole: its end, leading blank lines and its blank line included. Its framing may still
+    /// be one the codec refuses (see [`HeldRequest::framing`]).
+    Whole(usize),
+    /// A byte the scanner rejects: a line, or a limit ([`HEAD_LIMIT`], [`LINE_LIMIT`]).
+    Unframed,
+}
+
 /// What [`held_request`] read of the request head at the start of some bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldRequest {
+    pub state: HeadState,
     /// The request line read as the codec reads it (with `host` once the head is whole); `None`
     /// when no complete request line parses.
     pub head: Option<RequestHead>,
@@ -208,10 +221,15 @@ pub fn held_request(held: &[u8]) -> HeldRequest {
                 close: fields.connection_close,
                 expect: fields.expect,
             });
-            HeldRequest { head, framing }
+            HeldRequest {
+                state: HeadState::Whole(end),
+                head,
+                framing,
+            }
         }
         // As the codec names an unframed head: its first line, no field.
         Scan::Unframed(_) => HeldRequest {
+            state: HeadState::Unframed,
             head: scanner
                 .lines()
                 .next()
@@ -220,6 +238,7 @@ pub fn held_request(held: &[u8]) -> HeldRequest {
         },
         // Only a request line read whole (its line end seen) is one.
         Scan::More => HeldRequest {
+            state: HeadState::Open,
             head: scanner
                 .raw()
                 .contains(&b'\n')

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::admission::meshed;
+use common::mesh_pods::meshed;
 use common::{capture_logs, closed_port, read_all};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;

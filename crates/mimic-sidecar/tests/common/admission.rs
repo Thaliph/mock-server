@@ -20,13 +20,14 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::admission::Contract;
 use mimic_core::mesh::view::View;
 use mimic_sidecar::listener::{Direction, Shared};
-use mimic_sidecar::mesh::{MeshConfig, MeshState};
+use mimic_sidecar::mesh::MeshState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+pub use super::Answer;
 use super::mesh_pods::{Counts, H1Client, view_services};
-use super::{Fixture, H2Sender, fixture_mesh_on, until};
+use super::{Fixture, H2Sender, fixture_mesh_on, h2_send, until};
 
 /// The time any one answer may take before the test fails.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,17 +45,6 @@ pub fn contract(c: u32, r: u32) -> View {
 /// A view of no Service and no contract.
 pub fn no_contract() -> View {
     view_services(&[])
-}
-
-/// A meshed state (`MIMIC_MESH=on`, no view held) with `tune` applied to its config.
-pub fn meshed(pod: Option<&str>, tune: impl FnOnce(&mut MeshConfig)) -> MeshState {
-    let mut config = MeshConfig {
-        enabled: true,
-        pod: pod.map(str::to_string),
-        ..MeshConfig::default()
-    };
-    tune(&mut config);
-    MeshState::new(&config)
 }
 
 /// An inbound listener of a meshed sidecar whose app is at `app`.
@@ -113,14 +103,6 @@ impl App {
         });
         App { addr, counts }
     }
-
-    pub fn in_flight(&self) -> usize {
-        self.counts.in_flight.load(Ordering::SeqCst)
-    }
-
-    pub fn max_in_flight(&self) -> usize {
-        self.counts.max_in_flight.load(Ordering::SeqCst)
-    }
 }
 
 async fn route(
@@ -169,84 +151,22 @@ async fn route(
                 .unwrap())
         }
         _ => {
-            let now = counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            counts.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            let in_flight = counts.enter();
             let delay = counts.delay_ms.load(Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            counts.in_flight.fetch_sub(1, Ordering::SeqCst);
+            drop(in_flight);
             Ok(Response::new(Full::new(Bytes::from("ok")).boxed()))
         }
     }
 }
 
-/// One answer as the client saw it.
-#[derive(Debug)]
-pub struct Answer {
-    pub status: u16,
-    /// Every field, sorted.
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-    /// From just before the request was sent to the end of the body.
-    pub elapsed: Duration,
-}
-
-impl Answer {
-    pub fn error(&self) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n == "x-mimic-error")
-            .map(|(_, v)| v.as_str())
-    }
-}
-
 /// Sends `GET path` with `headers` on `sender` and reads the whole answer.
 pub async fn call(sender: &mut H2Sender, path: &str, headers: &[(&str, &str)]) -> Answer {
-    call_as(sender, hyper::Method::GET, path, headers).await
-}
-
-/// Like [`call`], with `method`.
-pub async fn call_as(
-    sender: &mut H2Sender,
-    method: hyper::Method,
-    path: &str,
-    headers: &[(&str, &str)],
-) -> Answer {
-    let mut request = Request::builder()
-        .method(method)
-        .uri(format!("http://cart.shop.svc{path}"));
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    let request = request.body(http_body_util::Empty::<Bytes>::new()).unwrap();
-    let start = Instant::now();
-    let answered = tokio::time::timeout(ANSWER_TIMEOUT, async {
-        let response = sender.send_request(request).await.expect("an answer");
-        let (head, body) = response.into_parts();
-        let body = body
-            .collect()
-            .await
-            .expect("a whole body")
-            .to_bytes()
-            .to_vec();
-        (head, body)
-    })
-    .await
-    .expect("answered in time");
-    let (head, body) = answered;
-    let mut headers: Vec<(String, String)> = head
-        .headers
-        .iter()
-        .map(|(n, v)| (n.to_string(), v.to_str().unwrap().to_string()))
-        .collect();
-    headers.sort();
-    Answer {
-        status: head.status.as_u16(),
-        headers,
-        body,
-        elapsed: start.elapsed(),
-    }
+    h2_send(sender, "GET", path, headers, Vec::new())
+        .await
+        .expect("an answer in time")
 }
 
 /// The four fields of a refusal of the pod at `app`, sorted.
@@ -320,14 +240,6 @@ impl Http1App {
             }
         });
         app
-    }
-
-    pub fn in_flight(&self) -> usize {
-        self.counts.in_flight.load(Ordering::SeqCst)
-    }
-
-    pub fn max_in_flight(&self) -> usize {
-        self.counts.max_in_flight.load(Ordering::SeqCst)
     }
 
     /// Whether the app read `needle` anywhere.
@@ -510,13 +422,12 @@ impl Http1Conn {
                     return;
                 }
                 _ => {
-                    let now = self.counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    self.counts.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    let in_flight = self.counts.enter();
                     let delay = self.counts.delay_ms.load(Ordering::SeqCst);
                     if delay > 0 {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
-                    self.counts.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    drop(in_flight);
                     if !self
                         .write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
                         .await
@@ -536,7 +447,7 @@ pub async fn full_queue(f: &Fixture, app: &Http1App, state: &MeshState) -> (H1Cl
     let mut held = H1Client::connect(f.addr).await;
     held.send(b"GET /slow HTTP/1.1\r\nHost: cart.shop.svc\r\n\r\n")
         .await;
-    until("the app holds /slow", || app.in_flight() == 1).await;
+    until("the app holds /slow", || app.counts.in_flight() == 1).await;
     let mut filler = H1Client::connect(f.addr).await;
     filler
         .send(b"GET /filler HTTP/1.1\r\nHost: cart.shop.svc\r\n\r\n")

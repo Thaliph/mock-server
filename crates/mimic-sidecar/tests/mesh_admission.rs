@@ -9,12 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::admission::{
-    ANSWER_TIMEOUT, Answer, App, call, call_as, contract, inbound, meshed, no_contract,
-    refusal_fields,
+    ANSWER_TIMEOUT, Answer, App, call, contract, inbound, no_contract, refusal_fields,
 };
 use common::faults::no_series;
+use common::mesh_pods::meshed;
 use common::{
-    Fixture, H2Sender, Logs, capture_logs, counted, fixture_mesh_on, h2_client, metric, until,
+    Fixture, H2Sender, Logs, capture_logs, counted, fixture_mesh_on, h2_client, h2_send, metric,
+    until,
 };
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -44,7 +45,7 @@ async fn hold_slot(app: &App, sender: &H2Sender) -> JoinHandle<Answer> {
     let before = app.counts.requests();
     let held = spawn_call(sender, "/");
     until("the app holds the first request", || {
-        app.counts.requests() > before && app.in_flight() >= 1
+        app.counts.requests() > before && app.counts.in_flight() >= 1
     })
     .await;
     held
@@ -120,7 +121,7 @@ async fn adm_16_h2c_a_refused_grpc_request_gets_the_same_answer_without_grpc_sta
     let request = Request::post("http://cart.shop.svc/shop.Cart/Get")
         .header("content-type", "application/grpc")
         .header("te", "trailers")
-        .body(http_body_util::Empty::<Bytes>::new())
+        .body(http_body_util::Full::new(Bytes::new()))
         .unwrap();
     let (head, trailers) = tokio::time::timeout(ANSWER_TIMEOUT, async {
         let response = client.send_request(request).await.expect("an answer");
@@ -155,7 +156,7 @@ async fn adm_17_h2c_twice_the_concurrency_never_exceeds_it_and_refuses_the_rest(
             let (mut ok, mut overloaded, mut timeouts, mut errors, mut other) = (0, 0, 0, 0, 0);
             while Instant::now() < end {
                 let request = Request::get("http://cart.shop.svc/")
-                    .body(http_body_util::Empty::<Bytes>::new())
+                    .body(http_body_util::Full::new(Bytes::new()))
                     .unwrap();
                 let answered = tokio::time::timeout(ANSWER_TIMEOUT, async {
                     let response = sender.send_request(request).await?;
@@ -191,7 +192,7 @@ async fn adm_17_h2c_twice_the_concurrency_never_exceeds_it_and_refuses_the_rest(
             (ok + a, overloaded + b, timeouts + c, errors + d, other + e);
     }
     assert_eq!(
-        app.max_in_flight(),
+        app.counts.max_in_flight(),
         4,
         "the app never has more than 4 in flight"
     );
@@ -260,7 +261,7 @@ async fn adm_18_h2c_a_response_with_trailers_frees_the_slot_at_the_trailers() {
     let (app, state, f) = rig(contract(1, 1000), 0).await;
     let mut client = h2_client(f.addr).await;
     let request = Request::get("http://cart.shop.svc/trailers")
-        .body(http_body_util::Empty::<Bytes>::new())
+        .body(http_body_util::Full::new(Bytes::new()))
         .unwrap();
     let a = tokio::time::timeout(ANSWER_TIMEOUT, client.send_request(request))
         .await
@@ -290,7 +291,7 @@ async fn adm_18_h2c_an_sse_stream_holds_the_slot_and_a_stream_reset_frees_it() {
     let (app, _state, f) = rig(contract(1, 1000), 0).await;
     let mut events = h2_client(f.addr).await;
     let request = Request::get("http://cart.shop.svc/sse")
-        .body(http_body_util::Empty::<Bytes>::new())
+        .body(http_body_util::Full::new(Bytes::new()))
         .unwrap();
     let mut a = tokio::time::timeout(ANSWER_TIMEOUT, async {
         let response = events.send_request(request).await.expect("a head");
@@ -326,7 +327,7 @@ async fn adm_18_h2c_an_app_that_closes_without_answering_frees_the_slot() {
     let (_app, _state, f) = rig(contract(1, 1000), 0).await;
     let mut first = h2_client(f.addr).await;
     let request = Request::get("http://cart.shop.svc/close")
-        .body(http_body_util::Empty::<Bytes>::new())
+        .body(http_body_util::Full::new(Bytes::new()))
         .unwrap();
     let a = tokio::time::timeout(ANSWER_TIMEOUT, first.send_request(request))
         .await
@@ -347,7 +348,7 @@ async fn adm_24_a_view_that_adds_a_contract_applies_to_the_next_stream() {
     for answer in three {
         assert_eq!(answer.await.unwrap().status, 200);
     }
-    assert_eq!(app.max_in_flight(), 3);
+    assert_eq!(app.counts.max_in_flight(), 3);
     state.hold(contract(1, 1000), "\"2-a\"");
     app.counts.delay_ms.store(1000, Ordering::SeqCst);
     let _held = hold_slot(&app, &client).await;
@@ -361,7 +362,7 @@ async fn adm_24_a_lower_contract_cuts_nothing_and_refuses_until_below_it() {
     let (app, state, f) = rig(contract(4, 1000), 500).await;
     let mut client = h2_client(f.addr).await;
     let four: Vec<_> = (0..4).map(|_| spawn_call(&client, "/")).collect();
-    until("4 in flight", || app.in_flight() == 4).await;
+    until("4 in flight", || app.counts.in_flight() == 4).await;
     app.counts.delay_ms.store(0, Ordering::SeqCst);
     state.hold(contract(1, 1000), "\"2-a\"");
     let refused = call(&mut client, "/", &[]).await;
@@ -405,7 +406,10 @@ async fn adm_24_a_higher_or_removed_contract_admits_the_queued_stream_at_once() 
             for answer in three {
                 assert_eq!(answer.await.unwrap().status, 200);
             }
-            assert!(app.max_in_flight() >= 3, "later streams are not held");
+            assert!(
+                app.counts.max_in_flight() >= 3,
+                "later streams are not held"
+            );
         }
     }
 }
@@ -499,7 +503,7 @@ async fn adm_28_without_a_view_one_warning_after_the_startup_wait_and_nothing_he
     for answer in six {
         assert_eq!(answer.await.unwrap().status, 200);
     }
-    assert_eq!(app.max_in_flight(), 6, "nothing is held");
+    assert_eq!(app.counts.max_in_flight(), 6, "nothing is held");
     tokio::time::sleep_until((t0 + Duration::from_secs(1)).into()).await;
     let warned = lines(&logs, "admission contract unknown").await;
     assert_eq!(warned.len(), 1, "{warned:?}");
@@ -586,7 +590,9 @@ async fn adm_27_h2c_each_refusal_writes_one_line_counts_5xx_and_synthetic() {
         state.admission_counts_for_test().depth == 1
     })
     .await;
-    let c = call_as(&mut client, hyper::Method::POST, "/c", &[]).await;
+    let c = h2_send(&mut client, "POST", "/c", &[], Vec::new())
+        .await
+        .expect("an answer");
     assert_refused(&c, "overloaded", app.addr);
     let b = b.await.unwrap();
     assert_refused(&b, "queue-timeout", app.addr);

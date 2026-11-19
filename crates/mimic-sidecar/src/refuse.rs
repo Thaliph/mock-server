@@ -92,19 +92,16 @@ pub(crate) async fn drain(
     }
 }
 
-/// Answers an HTTP/1 request the admission refused (spec §4.1): the head with
-/// `connection: close`, then the client's FIN and drain, together with a FIN and a short drain
-/// to the app, which got no byte of the request.
-pub(crate) async fn admission_http1(
+/// Answers an HTTP/1 request this side refused before any byte of it was forwarded (spec §4.1:
+/// the load marker, the admission) and closes: `answer`, then the client's FIN and bounded drain,
+/// together with a FIN and a short drain to the app, which got no byte of the request.
+pub(crate) async fn close_with(
     client: &mut Stream,
     upstream: &mut Stream,
-    dst: SocketAddr,
-    error: &str,
-    origin: &str,
+    answer: &[u8],
     abort: impl Future<Output = ()>,
 ) {
-    let head = http1_head(error, dst, origin, true);
-    let written = client.write_all(head.as_bytes()).await.is_ok() && client.flush().await.is_ok();
+    let written = client.write_all(answer).await.is_ok() && client.flush().await.is_ok();
     if written {
         tokio::join!(drain(client, abort), crate::http1::close_upstream(upstream));
     } else {

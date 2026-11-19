@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use common::admission::{App, Http1App, contract, full_queue, inbound, meshed, no_contract};
-use common::mesh_pods::view_services;
+use common::admission::{App, Http1App, contract, full_queue, inbound, no_contract};
+use common::mesh_pods::{meshed, view_services};
 use common::prx_corpus::corpus;
 use common::{
     Fixture, capture_logs, counted, echo_server, fixture, fixture_mesh_on, metric, read_all, until,
@@ -76,7 +76,7 @@ async fn connect(f: &Fixture, app: &Http1App) -> TcpStream {
 async fn hold_slot(f: &Fixture, app: &Http1App) -> TcpStream {
     let mut c = connect(f, app).await;
     c.write_all(&get("/slow")).await.unwrap();
-    until("the app holds /slow", || app.in_flight() == 1).await;
+    until("the app holds /slow", || app.counts.in_flight() == 1).await;
     c
 }
 
@@ -330,7 +330,7 @@ async fn adm_17_http1_twice_the_concurrency_never_exceeds_it_and_refuses_the_res
         all.lost += t.lost;
         all.other += t.other;
     }
-    assert_eq!(app.max_in_flight(), 4, "{all:?}");
+    assert_eq!(app.counts.max_in_flight(), 4, "{all:?}");
     assert_eq!((all.lost, all.other), (0, 0), "{all:?}");
     assert!(all.overloaded > 0 && all.timeouts > 0, "{all:?}");
     assert_eq!(all.ok, app.counts.requests(), "{all:?}");
@@ -862,7 +862,7 @@ async fn six_at_once(f: &Fixture, app: &Http1App) {
     for task in tasks {
         assert_eq!(task.await.unwrap(), OK);
     }
-    assert_eq!(app.max_in_flight(), 6);
+    assert_eq!(app.counts.max_in_flight(), 6);
     app.counts.delay_ms.store(0, Ordering::SeqCst);
 }
 
@@ -1269,7 +1269,7 @@ async fn adm_27_http1_each_refusal_writes_one_line_counts_5xx_and_synthetic() {
     .await;
     let mut a = connect(&f, &app).await;
     a.write_all(&get("/ok")).await.unwrap();
-    until("the app holds /ok", || app.in_flight() == 1).await;
+    until("the app holds /ok", || app.counts.in_flight() == 1).await;
     logs.settled().await;
     let before = logs.text().len();
     let b = spawn_refused(&f, &app, "/b?q=1");
@@ -1407,7 +1407,10 @@ async fn adm_27_a_refusal_line_carries_no_header_value_query_or_body() {
             .unwrap();
         first.send_request(request).await.map(|r| r.status())
     });
-    until("the app holds the first stream", || app.in_flight() == 1).await;
+    until("the app holds the first stream", || {
+        app.counts.in_flight() == 1
+    })
+    .await;
     let request = hyper::Request::post(format!("http://cart.shop.svc/p?token={CANARY}"))
         .header("x-api-key", CANARY)
         .body(Full::new(bytes::Bytes::from(secret_body)))

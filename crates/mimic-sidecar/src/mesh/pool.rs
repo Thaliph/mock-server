@@ -779,10 +779,26 @@ impl Pool {
 /// A pool is per pod address, protocol and, for re-originated TLS, the name verified.
 type PoolKey = (SocketAddr, Protocol, Option<Arc<str>>);
 
+/// Tests only (ADM-29, `MeshConfig.redirect`): pods dialled at another address, as the callee
+/// pod's own redirection to its sidecar does in a cluster. Only the connect reads it: the choice,
+/// the labels, the binding of refusals and the access line keep the pod's address.
+#[derive(Clone, Default)]
+pub(crate) struct Redirect(Arc<BTreeMap<SocketAddr, SocketAddr>>);
+
+impl Redirect {
+    pub(crate) fn new(redirect: BTreeMap<SocketAddr, SocketAddr>) -> Redirect {
+        Redirect(Arc::new(redirect))
+    }
+
+    /// Where `pod` is dialled: its own address unless it is redirected.
+    pub(crate) fn dialled(&self, pod: SocketAddr) -> SocketAddr {
+        self.0.get(&pod).copied().unwrap_or(pod)
+    }
+}
+
 pub(crate) struct Pools {
     idle_timeout: Duration,
-    /// Tests only: pod addresses dialled at another address (`MeshConfig.redirect`).
-    redirect: Arc<BTreeMap<SocketAddr, SocketAddr>>,
+    redirect: Redirect,
     pools: Mutex<HashMap<PoolKey, Arc<Pool>>>,
     sweeping: AtomicBool,
     /// Checkouts left that hand out a closed connection (test hook).
@@ -792,16 +808,7 @@ pub(crate) struct Pools {
 }
 
 impl Pools {
-    #[cfg(test)]
-    pub(crate) fn new(idle_timeout: Duration) -> Arc<Pools> {
-        Pools::with_redirect(idle_timeout, Arc::default())
-    }
-
-    /// Pools whose connections to a pod of `redirect` go to its other address (tests only).
-    pub(crate) fn with_redirect(
-        idle_timeout: Duration,
-        redirect: Arc<BTreeMap<SocketAddr, SocketAddr>>,
-    ) -> Arc<Pools> {
+    pub(crate) fn new(idle_timeout: Duration, redirect: Redirect) -> Arc<Pools> {
         Arc::new(Pools {
             idle_timeout,
             redirect,
@@ -838,7 +845,7 @@ impl Pools {
                 }
                 let origin = origin.cloned();
                 // Resolved once: the pool still names, labels and binds `addr`.
-                let dial = self.redirect.get(&addr).copied().unwrap_or(addr);
+                let dial = self.redirect.dialled(addr);
                 let pool = Arc::new(match protocol {
                     Protocol::Http1 => Pool::Http1(Arc::new(H1Pool::new(
                         dial,
@@ -1002,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn msh_76_a_checkout_cancelled_while_connecting_gives_its_slot_back() {
         let (addr, _) = pod(false).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let mut cancelled = 0;
         let limit = Arc::new(AtomicU32::new(1024));
         for _ in 0..50 {
@@ -1039,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn msh_77_a_pod_has_at_most_8_pools_and_empty_ones_are_swept() {
         let (addr, _) = pod(true).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let mut last = None;
         for n in 0..9 {
             let origin = Arc::new(Origin::for_test(&format!("n{n}.shop.svc")));
@@ -1109,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn cbr_31_an_unrelated_close_does_not_make_the_pool_close_one_more() {
         let (addr, _) = pod(false).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let limit = Arc::new(AtomicU32::new(4));
         let lease = async || {
             pools
@@ -1140,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn msh_78_a_fresh_checkout_keeps_a_healthy_idle_connection() {
         let (addr, accepted) = pod(false).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let mut failed = get(&pools, addr, None).await;
         let idle = get(&pools, addr, None).await;
         drop(idle);

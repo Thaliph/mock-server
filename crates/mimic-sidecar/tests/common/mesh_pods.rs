@@ -14,6 +14,8 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::view::{Limits, View};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
+
+use super::{Answer, h2_client, h2_send};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -39,7 +41,31 @@ pub struct Counts {
 /// A request as a fake pod read it: its method and its whole body.
 pub type Seen = (String, Vec<u8>);
 
+/// A request being served: counted in `in_flight`, and in `max_in_flight`, until dropped.
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Counts {
+    /// A request starts being served.
+    pub fn enter(&self) -> InFlight {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        InFlight(self.in_flight.clone())
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
     }
@@ -81,8 +107,7 @@ async fn answer(
         .unwrap()
         .push(std::time::Instant::now());
     counts.requests.fetch_add(1, Ordering::SeqCst);
-    let now = counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-    counts.max_in_flight.fetch_max(now, Ordering::SeqCst);
+    let in_flight = counts.enter();
     let (parts, body) = req.into_parts();
     let body = body
         .collect()
@@ -98,7 +123,7 @@ async fn answer(
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
-    counts.in_flight.fetch_sub(1, Ordering::SeqCst);
+    drop(in_flight);
     Ok(Response::builder()
         .header("x-pod", name.as_str())
         .body(Full::new(Bytes::from(name)))
@@ -403,16 +428,22 @@ pub fn view_services(services: &[Svc]) -> View {
     View::from_json(&text, &Limits::default()).unwrap()
 }
 
-/// A meshed state of seed 21 holding the view of `services` (etag `"1-a"`), with `configure`
-/// applied to its config first.
-pub fn mesh_state(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
+/// A meshed state (`MIMIC_MESH=on`, seed 21) of the pod `pod`, holding no view, with
+/// `configure` applied to its config first: the one builder of the tests' mesh states.
+pub fn meshed(pod: Option<&str>, configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
     let mut config = MeshConfig {
         enabled: true,
         seed: Some(21),
+        pod: pod.map(str::to_string),
         ..MeshConfig::default()
     };
     configure(&mut config);
-    let state = MeshState::new(&config);
+    MeshState::new(&config)
+}
+
+/// [`meshed`], holding the view of `services` (etag `"1-a"`).
+pub fn mesh_state(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
+    let state = meshed(None, configure);
     state.hold(view_services(services), "\"1-a\"");
     state
 }
@@ -673,50 +704,10 @@ impl Blackhole {
     }
 }
 
-/// An `h2c` connection to `addr` that sends `Full` bodies.
-pub async fn h2_connect(addr: SocketAddr) -> hyper::client::conn::http2::SendRequest<Full<Bytes>> {
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(connection);
-    sender
-}
-
-/// `method /p` with `body` on `sender`: the status, the head and the body, or the error.
-pub async fn h2_send(
-    sender: &mut hyper::client::conn::http2::SendRequest<Full<Bytes>>,
-    method: &str,
-    body: Vec<u8>,
-) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
-    let request = Request::builder()
-        .method(method)
-        .uri("http://cart.shop.svc/p")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_err(|e| format!("{e:?}"))?
-        .to_bytes();
-    Ok((parts.status.as_u16(), parts.headers, body.to_vec()))
-}
-
-/// An `h2c` request through the sidecar, on a new connection: the status, the head and the
-/// body, or the error.
-pub async fn h2_call(
-    addr: SocketAddr,
-    method: &str,
-    body: Vec<u8>,
-) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
-    let mut sender = h2_connect(addr).await;
-    h2_send(&mut sender, method, body).await
+/// An `h2c` request `method /p` with `body` through the sidecar, on a new connection: the
+/// answer, or the error.
+pub async fn h2_call(addr: SocketAddr, method: &str, body: Vec<u8>) -> Result<Answer, String> {
+    h2_send(&mut h2_client(addr).await, method, "/p", &[], body).await
 }
 
 /// `method /p` with `body` on `client`: the head and the body of the answer.

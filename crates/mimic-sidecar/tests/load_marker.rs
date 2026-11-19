@@ -1233,7 +1233,7 @@ fn assert_admission_refused(answer: &Answer, error: &str, name: &str) {
 async fn adm_26_http1_the_marker_is_checked_before_admission() {
     let root = root("deployment root");
     let app = common::admission::App::http1(1000).await;
-    let state = common::admission::meshed(Some("p"), |_| {});
+    let state = common::mesh_pods::meshed(Some("p"), |_| {});
     state.hold(common::admission::contract(1, 1000), "\"1-a\"");
     let rig = rig_meshed(
         &app_at(app.addr),
@@ -1245,7 +1245,7 @@ async fn adm_26_http1_the_marker_is_checked_before_admission() {
     )
     .await;
     let (mut held, _) = plain(rig.addr, "/slow").await;
-    common::until("the app holds /slow", || app.in_flight() == 1).await;
+    common::until("the app holds /slow", || app.counts.in_flight() == 1).await;
 
     // (1) A refused ticket takes no place: the plain request after it is queued.
     let mut x = TcpStream::connect(rig.addr).await.unwrap();
@@ -1290,7 +1290,7 @@ async fn adm_26_http1_the_marker_is_checked_before_admission() {
 async fn adm_26_h2c_the_marker_is_checked_before_admission() {
     let root = root("deployment root");
     let app = common::admission::App::h2c(1000).await;
-    let state = common::admission::meshed(Some("p"), |_| {});
+    let state = common::mesh_pods::meshed(Some("p"), |_| {});
     state.hold(common::admission::contract(1, 1000), "\"1-a\"");
     let rig = rig_meshed(
         &app_at(app.addr),
@@ -1303,7 +1303,7 @@ async fn adm_26_h2c_the_marker_is_checked_before_admission() {
     .await;
     let mut first = h2c(rig.addr).await;
     let held = tokio::spawn(async move { h2_call(&mut first, None).await.status });
-    common::until("the app holds the first", || app.in_flight() == 1).await;
+    common::until("the app holds the first", || app.counts.in_flight() == 1).await;
 
     // (1) The refused ticket and a plain request at the same time, on two connections.
     let (mut x, mut y) = (h2c(rig.addr).await, h2c(rig.addr).await);

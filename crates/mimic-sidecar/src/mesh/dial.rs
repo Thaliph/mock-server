@@ -137,7 +137,7 @@ impl MeshState {
             };
             // A test redirect changes where the pod is dialled, never how it is named.
             let dialled = if pick.is_some() {
-                router.dialled(upstream)
+                router.redirect.dialled(upstream)
             } else {
                 upstream
             };
