@@ -689,7 +689,18 @@ impl MeshState {
         let (services, endpoints) = (view.services.len(), view.endpoint_count());
         // Pulled or persisted alike; a view of `"mesh": false` has none (spec §4.1).
         let previous = self.0.admitter.set_contract(view.admission);
-        let _ = previous;
+        if previous != view.admission {
+            let (now, before) = (view.admission, previous);
+            tracing::info!(
+                target: "mesh",
+                concurrency = now.map(|c| c.concurrency),
+                rps = now.map(|c| c.rps),
+                previous_concurrency = before.map(|c| c.concurrency),
+                previous_rps = before.map(|c| c.rps),
+                etag,
+                "admission contract changed"
+            );
+        }
         self.admission_tick();
         *self.0.table.write().unwrap_or_else(PoisonError::into_inner) = table;
         self.0

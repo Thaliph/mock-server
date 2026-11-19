@@ -67,7 +67,29 @@ impl Signals {
     /// What one sample makes of the state. A sample not after the last one keeps the snapshot,
     /// so a counter never goes back.
     fn update(state: &mut State, now: Duration, contract: Option<Contract>, counts: Counts) {
-        let _ = (state, now, contract, counts);
+        if state.at.is_some_and(|at| now <= at) {
+            return;
+        }
+        state.at = Some(now);
+        state.utilization.tick(now, contract, counts);
+        if state.totals.is_some() || contract.is_some() || counts != Counts::default() {
+            state.totals = Some(Totals {
+                admitted: counts
+                    .admitted_at_once
+                    .saturating_add(counts.admitted_from_queue),
+                queued: counts.queued,
+                overloaded: counts.overloaded,
+                queue_timeout: counts.queue_timeout,
+                cancelled: counts.cancelled,
+                in_flight_seconds: counts.in_flight_ns as f64 / 1e9,
+            });
+        }
+        state.gauges = contract.map(|limit| Gauges {
+            in_flight: counts.in_flight,
+            depth: counts.depth,
+            limit,
+            utilization: state.utilization.value().unwrap_or(0.0),
+        });
     }
 }
 
@@ -80,9 +102,66 @@ where
 }
 
 impl Collector for Signals {
-    fn encode(&self, encoder: DescriptorEncoder) -> std::fmt::Result {
-        let _ = encoder;
-        Ok(())
+    fn encode(&self, mut encoder: DescriptorEncoder) -> std::fmt::Result {
+        let (totals, gauges) = {
+            let state = self.lock();
+            (state.totals, state.gauges)
+        };
+        let Some(t) = totals else {
+            return Ok(());
+        };
+        let mut family = encoder.encode_descriptor(
+            "admission_requests",
+            "Requests offered to the admission contract, by result",
+            None,
+            MetricType::Counter,
+        )?;
+        for (result, n) in [
+            ("admitted", t.admitted),
+            ("queued", t.queued),
+            (Reason::Overloaded.as_str(), t.overloaded),
+            (Reason::QueueTimeout.as_str(), t.queue_timeout),
+            ("cancelled", t.cancelled),
+        ] {
+            ConstCounter::new(n).encode(family.encode_family(&ResultLabel { result })?)?;
+        }
+        let seconds = Unit::Seconds;
+        ConstCounter::new(t.in_flight_seconds).encode(encoder.encode_descriptor(
+            "admission_in_flight",
+            "Integral of the admitted requests in flight over time, in seconds",
+            Some(&seconds),
+            MetricType::Counter,
+        )?)?;
+        let Some(g) = gauges else {
+            return Ok(());
+        };
+        gauge(
+            &mut encoder,
+            "admission_in_flight",
+            "Admitted requests in flight",
+            i64::from(g.in_flight),
+        )?;
+        gauge(
+            &mut encoder,
+            "admission_queue_depth",
+            "Requests waiting in the admission queue",
+            i64::from(g.depth),
+        )?;
+        let mut family = encoder.encode_descriptor(
+            "admission_limit",
+            "Admission contract in force, by kind",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (kind, value) in [("concurrency", g.limit.concurrency), ("rps", g.limit.rps)] {
+            ConstGauge::new(i64::from(value)).encode(family.encode_family(&KindLabel { kind })?)?;
+        }
+        gauge(
+            &mut encoder,
+            "admission_utilization",
+            "Share of the admission contract used, smoothed over 15 s, refused demand included",
+            g.utilization,
+        )
     }
 }
 
