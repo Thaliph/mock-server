@@ -477,3 +477,135 @@ fn plh_09_credentials_replace_only_the_supplied_field() {
     outputs.push(metrics);
     assert!(outputs.iter().all(|o| !o.contains(CANARY)));
 }
+
+/// The number after the whole series `series` (labels included) in a scrape.
+fn series_value(metrics: &str, series: &str) -> Option<u64> {
+    metrics
+        .lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .and_then(|v| v.parse().ok())
+}
+
+fn wait_final(rig: &Rig) -> serde_json::Value {
+    let began = Instant::now();
+    loop {
+        if let Some(post) = rig.state().final_post() {
+            return post;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "no final post");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn adm_59_inbound_refusals_are_counted_by_reason_and_the_run_completes() {
+    let rig = Rig::new(
+        &simple_plan(),
+        &Params::open(20, 100, 5_000),
+        &[Probe::Good, Probe::Good],
+    );
+    let (t0, t1) = (&rig.targets[0], &rig.targets[1]);
+    t0.refuse_every(3, "overloaded");
+    t1.refuse_every(5, "queue-timeout");
+    *rig.state().final_hold.lock().unwrap() = Duration::from_millis(1_500);
+    let mut generator = rig.spawn("2s", &[]);
+    let admin = generator.admin_addr();
+    let post = wait_final(&rig);
+    let (_, metrics) = http_get(admin, "/metrics");
+    let status = generator.wait_exit(Duration::from_secs(20));
+    assert_eq!(status.code(), Some(0), "{status}");
+    assert_eq!(post["reason"], "Completed");
+
+    let (overloaded, queued) = (t0.refused("overloaded"), t1.refused("queue-timeout"));
+    assert!(overloaded > 0 && queued > 0, "{overloaded} {queued}");
+    assert!(overloaded + queued > 100, "{overloaded} {queued}");
+    assert_eq!(
+        (t0.refused("queue-timeout"), t1.refused("overloaded")),
+        (0, 0)
+    );
+    let ok = t0.ok() + t1.ok();
+    let endpoint = &post["results"]["endpoints"][0];
+    assert_eq!(
+        endpoint["mimicErrors"],
+        serde_json::json!({"overloaded": overloaded, "queue-timeout": queued})
+    );
+    assert_eq!(endpoint["statuses"], serde_json::json!({"2xx": ok}));
+    let errors = endpoint["errors"].as_object().expect("errors");
+    assert!(
+        !errors.contains_key("unverified") && !errors.contains_key("refused"),
+        "{errors:?}"
+    );
+    let failed: u64 = errors.values().filter_map(serde_json::Value::as_u64).sum();
+    assert_eq!(
+        endpoint["requests"].as_u64(),
+        Some((ok + overloaded + queued) as u64 + failed)
+    );
+
+    let series = |result: &str| {
+        series_value(
+            &metrics,
+            &format!("mimic_load_requests_total{{endpoint=\"GET /items\",result=\"{result}\"}}"),
+        )
+    };
+    assert_eq!(series("overloaded"), Some(overloaded as u64), "{metrics}");
+    assert_eq!(series("queue-timeout"), Some(queued as u64), "{metrics}");
+    assert_eq!(series("2xx"), Some(ok as u64), "{metrics}");
+    assert_eq!(
+        series_value(
+            &metrics,
+            "mimic_load_request_duration_seconds_count{endpoint=\"GET /items\"}"
+        ),
+        Some(ok as u64),
+        "{metrics}"
+    );
+
+    let logs = generator.logs();
+    assert!(logs.len() < 30, "{} lines", logs.len());
+    for entry in &logs {
+        let text = entry.to_string();
+        assert!(
+            !text.contains("overloaded") && !text.contains("queue-timeout"),
+            "a line per refusal: {entry}"
+        );
+    }
+    // A refusal on a verified connection keeps it.
+    assert!(
+        t0.accepted() * 2 < overloaded,
+        "{} connections for {overloaded} refusals",
+        t0.accepted()
+    );
+}
+
+#[test]
+fn adm_59_a_refusal_as_the_first_answer_verifies_nothing() {
+    let rig = Rig::new(
+        &simple_plan(),
+        &Params::open(10, 50, 3_000),
+        &[Probe::Good, Probe::Good],
+    );
+    let refusing = &rig.targets[1];
+    refusing.refuse_every(1, "overloaded");
+    let mut generator = rig.spawn("1s", &[]);
+    let status = generator.wait_exit(Duration::from_secs(20));
+    assert!(status.success(), "{status}");
+    let requests = refusing.count();
+    assert!(requests > 10, "{requests} requests");
+    assert_eq!(refusing.ok(), 0);
+    // Never verified by an `ok` answer: each request on a connection of its own, probed first.
+    assert!(
+        refusing.accepted() >= requests,
+        "{} connections",
+        refusing.accepted()
+    );
+    assert!(
+        refusing.probes() >= requests,
+        "{} probes",
+        refusing.probes()
+    );
+    let post = rig.state().final_post().expect("a final post");
+    assert_eq!(post["reason"], "Completed");
+    assert_eq!(
+        post["results"]["endpoints"][0]["mimicErrors"],
+        serde_json::json!({"overloaded": requests})
+    );
+}

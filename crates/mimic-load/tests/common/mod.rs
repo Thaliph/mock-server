@@ -168,6 +168,8 @@ pub struct ApiState {
     pub late: std::sync::atomic::AtomicUsize,
     pub posts: Mutex<Vec<Post>>,
     pub authorizations: Mutex<Vec<String>>,
+    /// How long the reply to a `final: true` post waits after it is recorded.
+    pub final_hold: Mutex<Duration>,
 }
 
 impl ApiState {
@@ -323,11 +325,16 @@ async fn api_route(
             let raw = String::from_utf8_lossy(&raw.unwrap_or_default()).into_owned();
             match serde_json::from_str::<Value>(&raw) {
                 Ok(body) => {
+                    let last = body["final"] == true;
                     state.posts.lock().unwrap().push(Post {
                         at: Instant::now(),
                         raw,
                         body,
                     });
+                    if last {
+                        let hold = *state.final_hold.lock().unwrap();
+                        tokio::time::sleep(hold).await;
+                    }
                     reply(200, json!({"stop": stop}).to_string())
                 }
                 Err(_) => reply(400, "{}".into()),
@@ -357,6 +364,18 @@ pub enum Answer {
     NoMarker,
 }
 
+/// Refusals of the target's inbound admission (spec §4.1): the `n`-th request (1-based)
+/// answers `503` with the three fields when `n % every == 0`.
+#[derive(Clone, Debug)]
+pub struct Inbound {
+    pub every: usize,
+    pub reason: &'static str,
+    /// The `pod=` of `x-mimic-origin`.
+    pub pod: String,
+    /// The `x-mimic-endpoint`: the target's `ip:port`.
+    pub endpoint: String,
+}
+
 pub struct Seen {
     pub at: Instant,
     pub method: String,
@@ -382,6 +401,11 @@ pub struct TargetState {
     /// When the first non-`ok` answer was sent.
     pub first_refusal: Mutex<Option<Instant>>,
     pub last_request: Mutex<Option<Instant>>,
+    pub inbound: Mutex<Option<Inbound>>,
+    /// Inbound refusals sent, by reason.
+    pub refused: Mutex<BTreeMap<&'static str, usize>>,
+    /// `x-mimic-load: ok` answers sent.
+    pub ok: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -415,6 +439,39 @@ impl Target {
     pub fn max_in_flight(&self) -> usize {
         self.state.max_in_flight.load(Ordering::SeqCst)
     }
+
+    pub fn probes(&self) -> usize {
+        self.state.probes.load(Ordering::SeqCst)
+    }
+
+    /// Every `every`-th request is refused `reason` by this target's own inbound side.
+    pub fn refuse_every(&self, every: usize, reason: &'static str) {
+        self.refuse_as(every, reason, &self.pod.clone());
+    }
+
+    /// The same, naming the pod `pod` in `x-mimic-origin`.
+    pub fn refuse_as(&self, every: usize, reason: &'static str, pod: &str) {
+        *self.state.inbound.lock().unwrap() = Some(Inbound {
+            every,
+            reason,
+            pod: pod.to_string(),
+            endpoint: SocketAddr::new(self.ip, REQUEST_PORT).to_string(),
+        });
+    }
+
+    pub fn refused(&self, reason: &str) -> usize {
+        self.state
+            .refused
+            .lock()
+            .unwrap()
+            .get(reason)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn ok(&self) -> usize {
+        self.state.ok.load(Ordering::SeqCst)
+    }
 }
 
 async fn start_target(ip: IpAddr, probe: Probe) -> Target {
@@ -433,6 +490,9 @@ async fn start_target(ip: IpAddr, probe: Probe) -> Target {
         seen: Mutex::new(Vec::new()),
         first_refusal: Mutex::new(None),
         last_request: Mutex::new(None),
+        inbound: Mutex::new(None),
+        refused: Mutex::new(BTreeMap::new()),
+        ok: AtomicUsize::new(0),
     });
     let probe_listener = TcpListener::bind(SocketAddr::new(ip, 15100)).await.unwrap();
     let request_listener = TcpListener::bind(SocketAddr::new(ip, REQUEST_PORT))
@@ -526,13 +586,31 @@ async fn request_answer(state: &TargetState, req: Request<Incoming>) -> Response
         body: if keep { body.to_vec() } else { Vec::new() },
     });
     drop(body);
-    state.count.fetch_add(1, Ordering::SeqCst);
+    let n = state.count.fetch_add(1, Ordering::SeqCst) + 1;
     *state.last_request.lock().unwrap() = Some(now);
     let delay = *state.delay.lock().unwrap();
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
+    let inbound = state.inbound.lock().unwrap().clone();
+    if let Some(inbound) = inbound.filter(|i| n % i.every == 0) {
+        *state
+            .refused
+            .lock()
+            .unwrap()
+            .entry(inbound.reason)
+            .or_default() += 1;
+        state.first_refusal.lock().unwrap().get_or_insert(now);
+        return Response::builder()
+            .status(503)
+            .header("x-mimic-error", inbound.reason)
+            .header("x-mimic-origin", format!("inbound; pod={}", inbound.pod))
+            .header("x-mimic-endpoint", inbound.endpoint)
+            .header("content-length", "0")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+    }
     let answer = *state.answer.lock().unwrap();
     if answer != Answer::Ok {
         state.first_refusal.lock().unwrap().get_or_insert(now);
@@ -544,10 +622,13 @@ async fn request_answer(state: &TargetState, req: Request<Incoming>) -> Response
         response = response.header("x-echo", echo.as_str());
     }
     match answer {
-        Answer::Ok => response
-            .status(200)
-            .header("x-mimic-load", "ok")
-            .body(Full::new(Bytes::from(text))),
+        Answer::Ok => {
+            state.ok.fetch_add(1, Ordering::SeqCst);
+            response
+                .status(200)
+                .header("x-mimic-load", "ok")
+                .body(Full::new(Bytes::from(text)))
+        }
         Answer::Refused(reason) => response
             .status(599)
             .header("x-mimic-load", format!("refused; reason={reason}"))

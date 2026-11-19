@@ -58,6 +58,35 @@ fn ldt_13_an_answer_without_the_marker_stops_the_run_unverified() {
 }
 
 #[test]
+fn adm_59_a_refusal_naming_another_pod_stops_the_run_unverified() {
+    let rig = Rig::new(
+        &simple_plan(),
+        &Params::closed(8, 60_000),
+        &[Probe::Good, Probe::Good],
+    );
+    for target in &rig.targets {
+        target.set_delay(Duration::from_millis(20));
+    }
+    let mut generator = rig.spawn("1s", &[]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(rig.targets.iter().all(|t| t.count() > 0));
+    let other = rig.targets[1].pod.clone();
+    rig.targets[0].refuse_as(1, "overloaded", &other);
+    let status = generator.wait_exit(Duration::from_secs(20));
+    assert_eq!(status.code(), Some(1));
+    let refused = rig.targets[0]
+        .state
+        .first_refusal
+        .lock()
+        .unwrap()
+        .expect("a refusal was sent");
+    silent_after(&rig, refused, Duration::from_secs(2));
+    let post = rig.state().final_post().unwrap();
+    assert_eq!(post["reason"], "Unverified");
+    assert!(post["results"]["endpoints"][0].get("mimicErrors").is_none());
+}
+
+#[test]
 fn ldt_13_stop_in_the_targets_answer_stops_within_one_interval() {
     let rig = Rig::new(&simple_plan(), &Params::closed(4, 60_000), &[Probe::Good]);
     rig.targets[0].set_delay(Duration::from_millis(20));
