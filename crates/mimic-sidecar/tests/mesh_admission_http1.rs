@@ -1342,6 +1342,8 @@ async fn adm_27_http1_each_refusal_writes_one_line_counts_5xx_and_synthetic() {
     let a = line("/ok");
     assert_eq!(a["status"], 200, "{a}");
     assert!(a.get("reason").is_none(), "{a}");
+    // The authority is read as for an admitted request.
+    assert_eq!(b["authority"], a["authority"], "{b}");
 
     let scrape = f.metrics.encode();
     assert_eq!(

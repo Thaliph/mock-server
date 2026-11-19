@@ -21,18 +21,21 @@ use std::time::{Duration, Instant};
 use mimic_core::mesh::admission::Refusal as AdmissionRefusal;
 use mimic_core::mesh::strip::strip;
 use mimic_core::proxy::http1::{
-    Codec, Event, HEAD_LIMIT, HeldRequest, READ_AHEAD, Side as FrameSide,
+    Codec, Event, HEAD_LIMIT, HeldRequest, READ_AHEAD, RequestBody, Side as FrameSide, Version,
+    held_request,
 };
 use prometheus_client::metrics::histogram::Histogram;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::access::Outcome;
+use crate::exchange::{RefusalLog, RefusedRequest};
 use crate::listener::DETECT_STALL;
 use crate::load::{MARKER_HEADER, REQUEST_HEADER, Refusal, Watch};
 use crate::mesh::{Admitter, MeshState, Slot};
 use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
+use crate::refuse;
 use crate::transport::Stream;
 
 const CHUNK: usize = 16 * 1024;
@@ -157,6 +160,13 @@ struct Relay<F> {
     slots: Mutex<VecDeque<Option<Slot>>>,
     /// The slots of admitted heads that could not be judged: kept until the relay ends.
     pinned: Mutex<Vec<Slot>>,
+    /// The answer to a refused request on a kept connection: written by the server pump before
+    /// any later byte of the app, then cleared.
+    answer: Mutex<Option<Vec<u8>>>,
+    /// `answer` was set (a permit is stored).
+    inject: Notify,
+    /// The observation of the refusals: `Some` exactly when `admit` is.
+    log: Option<RefusalLog>,
 }
 
 fn is_token(name: &[u8]) -> bool {
@@ -216,8 +226,16 @@ fn held_head(held: &[u8]) -> HeldHead {
 
 /// Body bytes to drop when the connection is kept after a refusal; `None`: `connection: close`.
 fn kept(request: &HeldRequest) -> Option<u64> {
-    let _ = (request, KEEP_BODY, KEEP_DRAIN);
-    None
+    let framing = request.framing.as_ref()?;
+    let head = request.head.as_ref()?;
+    if head.version != Version::Http11 || framing.close || framing.expect {
+        return None;
+    }
+    match framing.body {
+        RequestBody::None => Some(0),
+        RequestBody::Length(n) if n <= KEEP_BODY => Some(n),
+        RequestBody::Length(_) | RequestBody::Chunked => None,
+    }
 }
 
 /// The final responses to requests that `events` complete: a `Response` that answers a request
@@ -402,6 +420,7 @@ impl<F: FnMut(Event)> Relay<F> {
     fn close_if_idle(&self) {
         if self.stopping.load(Ordering::Relaxed)
             && self.primed.load(Ordering::Acquire)
+            && lock(&self.answer).is_none()
             && self.with(|codec| (codec.idle(), Vec::new()))
         {
             self.closing.notify_one();
@@ -538,19 +557,31 @@ impl<F: FnMut(Event)> Relay<F> {
                         }
                     }
                     let slot = match self.admit.as_ref() {
-                        Some(admit) => match admit.admit().await {
-                            Ok(slot) => Some(slot),
-                            Err(refusal) => {
-                                // The earlier responses are written to their last byte first.
-                                while !self.slots_empty()
-                                    && !self.server_closed.load(Ordering::Acquire)
-                                {
-                                    self.unblocked.notified().await;
+                        Some(admit) => {
+                            // The decision point a refusal line is timed from.
+                            let offered = Instant::now();
+                            match admit.admit().await {
+                                Ok(slot) => Some(slot),
+                                Err(refusal) => {
+                                    let refused = Refusing {
+                                        refusal,
+                                        offered,
+                                        unjudged,
+                                        ended,
+                                    };
+                                    if self
+                                        .refused_head(
+                                            client, upstream, &mut held, &mut buf, refused,
+                                        )
+                                        .await?
+                                    {
+                                        judged = false;
+                                        continue;
+                                    }
+                                    return Ok(());
                                 }
-                                self.refuse(Refused::Admission(refusal));
-                                return Ok(());
                             }
-                        },
+                        }
                         None => None,
                     };
                     if let Some(watch) = self.watch.as_ref() {
@@ -601,6 +632,86 @@ impl<F: FnMut(Event)> Relay<F> {
             held.drain(..used);
             judged = false;
         }
+    }
+
+    /// A head the admission refused (spec §4.1): answered once the earlier responses and any
+    /// earlier answer are written, on a kept connection when the head allows it (its body is
+    /// then read and dropped). `Ok(true)`: the pump goes on with the next head; `Ok(false)`: it
+    /// ends (the caller answers a closed one, see [`Relayed::refused`]).
+    async fn refused_head(
+        &self,
+        client: &mut (impl AsyncRead + Unpin),
+        upstream: &mut (impl AsyncWrite + Unpin),
+        held: &mut Vec<u8>,
+        buf: &mut [u8],
+        refused: Refusing,
+    ) -> Result<bool, Failure> {
+        let Refusing {
+            refusal,
+            offered,
+            unjudged,
+            ended,
+        } = refused;
+        // At most one answer waits per connection, and the wire order is the request order.
+        while (!self.slots_empty() || lock(&self.answer).is_some())
+            && !self.server_closed.load(Ordering::Acquire)
+        {
+            self.unblocked.notified().await;
+        }
+        // Read with the codec's rules: only what it frames is kept, so that no byte the client
+        // sent as a body is ever read as the next request.
+        let request = held_request(held);
+        let observed = RefusedRequest::http1(request.head.as_ref());
+        let keep = match (&self.log, &self.strip) {
+            (Some(log), Some(mesh)) if !unjudged && !self.server_closed.load(Ordering::Acquire) => {
+                kept(&request).map(|body| (log, mesh, body))
+            }
+            _ => None,
+        };
+        let (Some((log, mesh, body)), Some(framing)) = (keep, request.framing.as_ref()) else {
+            if let Some(log) = &self.log {
+                log.refused(&observed, refusal, offered.elapsed());
+            }
+            self.refuse(Refused::Admission(refusal));
+            return Ok(false);
+        };
+        let answer = refuse::http1_head(refusal.as_str(), log.dst(), &mesh.origin(), false);
+        // Set before the permit, so that the server pump finds it.
+        *lock(&self.answer) = Some(answer.into_bytes());
+        self.inject.notify_one();
+        log.refused(&observed, refusal, offered.elapsed());
+        // The head, then the body, at most 1 s from the answer: the bytes after it are the
+        // next request.
+        let deadline = tokio::time::Instant::now() + KEEP_DRAIN;
+        held.drain(..framing.end);
+        let mut left = body;
+        let from_held = held.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        held.drain(..from_held);
+        left -= from_held as u64;
+        while left > 0 {
+            let n = if ended {
+                0
+            } else {
+                match tokio::time::timeout_at(deadline, client.read(buf)).await {
+                    // The body did not come: a FIN on both sides (`close_idle`).
+                    Err(_) => {
+                        self.closing.notify_one();
+                        return Ok(false);
+                    }
+                    Ok(read) => read.map_err(|e| (Side::Client, e))?,
+                }
+            };
+            if n == 0 {
+                self.first_to_close(CLIENT);
+                fin(upstream, Side::Upstream).await?;
+                return Ok(false);
+            }
+            self.to_upstream.fetch_add(n as u64, Ordering::Relaxed);
+            let dropped = n.min(usize::try_from(left).unwrap_or(usize::MAX));
+            left -= dropped as u64;
+            held.extend_from_slice(&buf[dropped..n]);
+        }
+        Ok(true)
     }
 
     /// Destination to client.
@@ -726,10 +837,21 @@ impl<F: FnMut(Event)> Relay<F> {
         loop {
             if held.is_empty() {
                 release = false;
-                let n = upstream
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| (Side::Upstream, e))?;
+                // The answer to a refused request, before any later byte of the app; it goes
+                // through neither the strip nor the codec. Cleared once written.
+                let answer = lock(&self.answer).clone();
+                if let Some(answer) = answer {
+                    send(client, &answer).await.map_err(|e| (Side::Client, e))?;
+                    *lock(&self.answer) = None;
+                    self.unblocked.notify_one();
+                    self.close_if_idle();
+                    continue;
+                }
+                let n = tokio::select! {
+                    biased;
+                    () = self.inject.notified() => continue,
+                    read = upstream.read(&mut buf) => read.map_err(|e| (Side::Upstream, e))?,
+                };
                 if n == 0 {
                     self.first_to_close(SERVER);
                     let done = self.with(|codec| {
@@ -874,6 +996,17 @@ impl<F: FnMut(Event)> Relay<F> {
     }
 }
 
+/// A refusal of the admission, as the client pump saw it.
+struct Refusing {
+    refusal: AdmissionRefusal,
+    /// When the head became whole and was offered.
+    offered: Instant,
+    /// The head could not be judged: never kept.
+    unjudged: bool,
+    /// The client sent its FIN.
+    ended: bool,
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -953,6 +1086,7 @@ pub async fn relay(
         None,
         DETECT_STALL,
         None,
+        None,
         on_event,
         stop,
         abort_signal,
@@ -969,8 +1103,10 @@ pub async fn relay(
 /// ([`Relayed::refused`]). With a `strip` (inbound, mesh on) each final response head is held
 /// whole and loses its `x-mimic-*` fields (spec §4.1), and the pod's admission applies: under a
 /// contract each request head is held whole (at most `stall` silent), then admitted, queued or
-/// refused, and its slot is kept until its response is written to its last byte; a refused one
-/// ends the relay once the earlier answers are written (spec §4.1 "Admission contract").
+/// refused, and its slot is kept until its response is written to its last byte. A refused one
+/// is answered once the earlier answers are written (spec §4.1 "Admission contract"): on the
+/// kept connection when its head allows it, else it ends the relay (the caller answers it).
+/// `log` writes the access line of each refusal.
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_with(
     client: &mut Stream,
@@ -981,6 +1117,7 @@ pub async fn relay_with(
     watch: Option<Watch>,
     strip: Option<MeshState>,
     stall: Duration,
+    log: Option<RefusalLog>,
     overhead: Option<Histogram>,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
@@ -1029,6 +1166,9 @@ pub async fn relay_with(
         stall,
         slots: Mutex::new(VecDeque::new()),
         pinned: Mutex::new(Vec::new()),
+        answer: Mutex::new(None),
+        inject: Notify::new(),
+        log,
     };
     let mut mock_closed = false;
     let mut handed = false;

@@ -23,7 +23,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::discovery::Tap;
-use crate::exchange::{self, Ctx, ReqBody, Tracker};
+use crate::exchange::{self, Ctx, RefusedRequest, ReqBody, Tracker};
 use crate::load::{Body, Marker, mark_answer, refused, screen};
 use crate::mesh::{MeshState, Slot};
 use crate::mock::{self, Mock};
@@ -325,11 +325,27 @@ async fn forward(
         Some(mesh) => match mesh.admitter().admit().await {
             Ok(slot) => Some(slot),
             Err(refusal) => {
-                return Ok(refuse::h2_response(
-                    refusal.as_str(),
-                    state.ctx.dst,
-                    &mesh.origin(),
-                ));
+                let response = refuse::h2_response(refusal.as_str(), state.ctx.dst, &mesh.origin());
+                let request = RefusedRequest {
+                    method: Some(req.method().as_str()),
+                    path: Some(req.uri().path()),
+                    uri_authority: req.uri().authority().map(|a| a.as_str()),
+                    host: req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .map(|host| host.to_str().unwrap_or("")),
+                };
+                // A load request was counted as one already.
+                let tap = state.tap.as_ref().filter(|_| load_run.is_none());
+                exchange::admission_refused(
+                    &state.ctx,
+                    PROTOCOL,
+                    tap,
+                    &request,
+                    refusal,
+                    began.elapsed(),
+                );
+                return Ok(response);
             }
         },
         None => None,

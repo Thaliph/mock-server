@@ -16,7 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::access;
-use crate::exchange::{Ctx, Http1Tracker};
+use crate::exchange::{Ctx, Http1Tracker, RefusalLog};
 use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
@@ -991,6 +991,8 @@ impl Conn<'_> {
                     watch,
                     self.strip(),
                     self.shared.detect_stall(),
+                    self.strip()
+                        .map(|_| RefusalLog::new(self.ctx(), tap.cloned())),
                     Some(proxy.overhead_histogram(direction)),
                     |event| tracker.event(event),
                     self.shared.stopped(),

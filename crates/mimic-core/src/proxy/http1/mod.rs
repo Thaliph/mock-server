@@ -183,10 +183,51 @@ pub struct HeldRequest {
 /// syntax, framing); the bytes after its blank line are not read. A relay that holds a head
 /// and answers it itself decides from this where the request ends.
 pub fn held_request(held: &[u8]) -> HeldRequest {
-    let _ = held;
-    HeldRequest {
-        head: None,
-        framing: None,
+    let mut scanner = HeadScanner::new(Kind::Request);
+    let (end, scan) = scanner.feed(held);
+    let no_fields = || collect_fields(std::iter::empty());
+    match scan {
+        Scan::Done => {
+            let mut lines = scanner.lines();
+            let start = lines.next().unwrap_or_default();
+            let fields = collect_fields(lines);
+            let head = request_head(start, &fields);
+            let body = head
+                .as_ref()
+                .and_then(|head| fields.framing(true, head.version).ok())
+                .and_then(|framing| match framing {
+                    Framing::Length(n) if n > 0 => Some(RequestBody::Length(n)),
+                    Framing::Length(_) | Framing::None => Some(RequestBody::None),
+                    Framing::Chunked => Some(RequestBody::Chunked),
+                    // Never a request's.
+                    Framing::UntilClose => None,
+                });
+            let framing = body.map(|body| RequestFraming {
+                end,
+                body,
+                close: fields.connection_close,
+                expect: fields.expect,
+            });
+            HeldRequest { head, framing }
+        }
+        // As the codec names an unframed head: its first line, no field.
+        Scan::Unframed(_) => HeldRequest {
+            head: scanner
+                .lines()
+                .next()
+                .and_then(|line| request_head(line, &no_fields())),
+            framing: None,
+        },
+        // Only a request line read whole (its line end seen) is one.
+        Scan::More => HeldRequest {
+            head: scanner
+                .raw()
+                .contains(&b'\n')
+                .then(|| scanner.lines().next())
+                .flatten()
+                .and_then(|line| request_head(line, &no_fields())),
+            framing: None,
+        },
     }
 }
 
@@ -200,7 +241,11 @@ struct Fields {
     coding_parameters: bool,
     host: Option<String>,
     connection_upgrade: bool,
+    /// A `connection` field holds the token `close`.
+    connection_close: bool,
     has_upgrade: bool,
+    /// An `expect` field, any value.
+    expect: bool,
 }
 
 enum Framing {
@@ -228,7 +273,9 @@ fn collect_fields<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Fields {
         coding_parameters: false,
         host: None,
         connection_upgrade: false,
+        connection_close: false,
         has_upgrade: false,
+        expect: false,
     };
     for line in lines {
         // A folded continuation belongs to a header that is not a framing header (the
@@ -269,14 +316,14 @@ fn collect_fields<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Fields {
                 f.host = Some(String::from_utf8_lossy(value).into_owned());
             }
         } else if name.eq_ignore_ascii_case(b"connection") {
-            if value
-                .split(|&b| b == b',')
-                .any(|t| trim_ows(t).eq_ignore_ascii_case(b"upgrade"))
-            {
-                f.connection_upgrade = true;
+            for token in value.split(|&b| b == b',').map(trim_ows) {
+                f.connection_upgrade |= token.eq_ignore_ascii_case(b"upgrade");
+                f.connection_close |= token.eq_ignore_ascii_case(b"close");
             }
         } else if name.eq_ignore_ascii_case(b"upgrade") {
             f.has_upgrade = true;
+        } else if name.eq_ignore_ascii_case(b"expect") {
+            f.expect = true;
         }
     }
     f

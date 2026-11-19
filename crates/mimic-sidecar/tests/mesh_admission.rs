@@ -619,12 +619,8 @@ async fn adm_27_h2c_each_refusal_writes_one_line_counts_5xx_and_synthetic() {
         "{b}"
     );
     assert_eq!(
-        (&b["direction"], &b["result"], &b["authority"]),
-        (
-            &serde_json::json!("inbound"),
-            &serde_json::json!("ok"),
-            &serde_json::json!("cart.shop.svc:80")
-        ),
+        (&b["direction"], &b["result"]),
+        (&serde_json::json!("inbound"), &serde_json::json!("ok")),
         "{b}"
     );
     assert!(b["duration_ms"].as_u64().unwrap() >= 150, "{b}");
@@ -643,6 +639,8 @@ async fn adm_27_h2c_each_refusal_writes_one_line_counts_5xx_and_synthetic() {
     let a = line("/");
     assert_eq!(a["status"], 200, "{a}");
     assert!(a.get("reason").is_none(), "{a}");
+    // The authority is read as for an admitted request.
+    assert_eq!(b["authority"], a["authority"], "{b}");
 
     let scrape = f.metrics.encode();
     assert_eq!(

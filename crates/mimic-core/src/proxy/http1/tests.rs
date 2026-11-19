@@ -1026,14 +1026,15 @@ fn adm_20_held_request_frames_a_head_as_the_codec_does() {
     use RequestBody as B;
     use Version::{Http10 as V10, Http11 as V11};
     // (name, bytes, the body when framed, the version of the head, close, expect)
-    let cases: Vec<(
-        &str,
-        &[u8],
+    type Case<'a> = (
+        &'a str,
+        &'a [u8],
         Option<RequestBody>,
         Option<Version>,
         bool,
         bool,
-    )> = vec![
+    );
+    let cases: Vec<Case> = vec![
         (
             "get",
             b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n",
