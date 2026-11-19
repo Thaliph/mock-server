@@ -440,39 +440,13 @@ runs `mesh-breaker` with 32 connections and at least 10 % breaker-open answers. 
 `-allow-initial-errors`, as its warm-up requests (one per connection) are already refused.
 
 | Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-11-15 | mesh-lb | http1 | 200 | 199.93 | 8.53 | 9.57 | 10.95 | 15.83 | 0 | 0.214 | 0.076 | 15.9 | 14.3 |
 | 2026-11-15 | mesh-lb | h2c | 200 | 199.92 | 10.03 | 11.36 | 13.98 | 18 | 0 | 0.272 | 0.098 | 17 | 14.8 |
 | 2026-11-15 | mesh-eject | http1 | 200 | 199.93 | 8.46 | 9.47 | 11.62 | 14.8 | 0 | 0.21 | 0.088 | 16 | 14.1 |
 | 2026-11-15 | mesh-eject | h2c | 200 | 199.92 | 9.78 | 10.93 | 13.29 | 16.46 | 0 | 0.262 | 0.123 | 17 | 14.7 |
 | 2026-11-15 | mesh-breaker | http1 | 200 | 199.64 | 5.71 | 56.01 | 59.61 | 59.97 | 4488 | 0.17 | 0.021 | 18.5 | 14.2 |
 | 2026-11-15 | mesh-breaker | h2c | 200 | 199.58 | 3.59 | 56.15 | 59.84 | 66.13 | 4488 | 0.137 | 0.027 | 18.9 | 14.4 |
-| 2026-11-19 | mesh-admission (no admission) | http1 | 50 | 49.89 | 59.18 | 67.91 | 69.99 | 76.68 | 0 | 0.057 | 0.02 | 18.3 | 15.2 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 50 | 49.87 | 59.01 | 67.84 | 69.97 | 73.35 | 0 | 0.053 | 0.019 | 18.8 | 15.6 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 50 | 49.9 | 59.02 | 68.09 | 74.24 | 77.32 | 0 | 0.057 | 0.02 | 19.1 | 15.6 |
-| 2026-11-19 | mesh-admission (no admission) | http1 | 50 | 49.89 | 59.93 | 67.46 | 69.16 | 69.33 | 0 | 0.054 | 0.019 | 19.2 | 15.7 |
-| 2026-11-19 | mesh-admission (no admission) | http1 | 100 | 99.78 | 59.06 | 65.38 | 66.83 | 66.98 | 0 | 0.108 | 0.037 | 19.5 | 15.7 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 100 | 99.78 | 58.66 | 65.87 | 67.63 | 67.8 | 0 | 0.108 | 0.038 | 19.6 | 15.9 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 100 | 99.79 | 58.82 | 67.11 | 69.16 | 69.36 | 0 | 0.108 | 0.038 | 19.6 | 15.9 |
-| 2026-11-19 | mesh-admission (no admission) | http1 | 100 | 99.79 | 58.73 | 67.67 | 69.93 | 74.16 | 0 | 0.109 | 0.038 | 19.6 | 16 |
-| 2026-11-19 | mesh-admission (no admission) | http1 | 200 | 199.57 | 59.26 | 67.84 | 69.86 | 72.77 | 0 | 0.217 | 0.075 | 19.6 | 16 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 200 | 199.54 | 60.29 | 68.46 | 78.01 | 122.74 | 0 | 0.213 | 0.075 | 20 | 16 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 200 | 199.56 | 59.98 | 68.03 | 69.84 | 71.6 | 0 | 0.221 | 0.078 | 20.1 | 16 |
-| 2026-11-19 | mesh-admission (no admission) | http1 | 200 | 199.57 | 59.16 | 67.85 | 69.92 | 77.9 | 0 | 0.216 | 0.075 | 20.2 | 16.1 |
-| 2026-11-19 | mesh-admission (admission 64/30, 2x) | http1 | 180 | 176.75 | 172.35 | 224.25 | 389.95 | 566.34 | 2638 | 0.241 | 0.064 | 23.1 | 16.1 |
-| 2026-11-19 | mesh-admission (no admission) | h2c | 50 | 49.89 | 64.48 | 69.43 | 76.47 | 77.79 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 50 | 49.88 | 64.24 | 69.17 | 75.31 | 77.43 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 50 | 49.87 | 64.28 | 69.41 | 78.94 | 80.54 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (no admission) | h2c | 50 | 49.89 | 64.21 | 68.99 | 71.04 | 72.72 | 0 | 0.066 | 0.023 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (no admission) | h2c | 100 | 99.79 | 64.34 | 69.23 | 76.9 | 79.2 | 0 | 0.128 | 0.045 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 100 | 99.7 | 64.2 | 69.38 | 80.08 | 88.89 | 0 | 0.13 | 0.045 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 100 | 99.76 | 64.19 | 69.11 | 73 | 74.53 | 0 | 0.129 | 0.045 | 23.2 | 16.6 |
-| 2026-11-19 | mesh-admission (no admission) | h2c | 100 | 99.78 | 64.19 | 69.05 | 72.77 | 74.94 | 0 | 0.125 | 0.045 | 23.2 | 16.7 |
-| 2026-11-19 | mesh-admission (no admission) | h2c | 200 | 199.53 | 64.18 | 69.07 | 76.39 | 81.46 | 0 | 0.255 | 0.089 | 23.2 | 16.7 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 200 | 199.55 | 64.41 | 69.21 | 75.46 | 77.46 | 0 | 0.26 | 0.09 | 23.2 | 16.7 |
-| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 200 | 199.53 | 64.29 | 69.16 | 76.84 | 79.78 | 0 | 0.256 | 0.09 | 23.2 | 16.7 |
-| 2026-11-19 | mesh-admission (no admission) | h2c | 200 | 199.52 | 64.27 | 69.13 | 74.95 | 77.39 | 0 | 0.254 | 0.09 | 23.2 | 16.7 |
-| 2026-11-19 | mesh-admission (admission 64/30, 2x) | h2c | 180 | 176.73 | 170.42 | 224.8 | 390.08 | 542.72 | 2637 | 0.257 | 0.077 | 23.2 | 16.7 |
 
 | Check | Result | Budget | Verdict |
 |---|---|---|---|
@@ -527,8 +501,9 @@ SETUPS=mesh-admission scripts/bench.sh --dry-run            # the plan, nothing 
   pulled a view after it (`mimic_mesh_view_pulls_total{result="ok"}`), then 2 s.
 - For each `adm-over` run, the script records per backend pod the deltas of its inbound requests
   (`mimic_http_requests_total{direction="inbound"}`, all and `2xx`) and the `duration_ms` of its sidecar's
-  refusal lines, grouped by `reason`, read with `kubectl logs --since-time` at the end of the run (kubelet
-  rotates a container log at about 10 MiB).
+  refusal lines by `reason`, as counts per millisecond `[{ms, n}]` (`scripts/bench/admission-refusals.jq`), read
+  with `kubectl logs --since-time` at the end of the run (kubelet rotates a container log at about 10 MiB). The
+  verdict merges the counts of the pods before it takes their p99 and maximum (`scripts/bench/admission-summary.jq`).
 
 The verdicts are in `mesh.admission` of `<date>-mesh-admission.json`. A false one adds the setup to the failed
 setups (exit 1 once the file is written):
@@ -538,12 +513,12 @@ setups (exit 1 once the file is written):
 | Per protocol, the median over the rates of the added p90 under the contract (`pair_medians[].median_delta_p90_ms`, from `pairs[].delta_p90_ms`), and no error under it; the p50 and p99 deltas are recorded only | at most +0.5 ms |
 | Load sent in an `adm-over` run (`over[].actual_qps`) | at least 95 % of 180 rps |
 | Admitted rate per pod (`2xx` delta over fortio's `ActualDuration`) | within 5 % of 30 rps per pod |
-| p99 of the `duration_ms` of the `overloaded` lines | at most 1 ms |
+| p99 of the `duration_ms` of the `overloaded` lines (from the counts per millisecond `[{ms, n}]`) | at most 1 ms |
 | Longest `duration_ms` of a `queue-timeout` line (counts per millisecond in `queue_timeout_ms_counts`) | at most 160 ms |
 
 The p99 of a 30 s run moved by −10.5 to +8.3 ms between paired runs on a quiet machine, both signs, while the p90 stayed within ±0.5 ms: ADM-32 judges the p90 (#453). Compare only the runs of one session.
 The callers' retries and fortio's warm-up add offers, and the tokens still cap the admitted rate (the bias is at most
-the burst, 3, per pod and run). Results of 2026-11-19 (quiet machine, `2026-11-19-mesh-admission.json`, rows above):
+the burst, 3, per pod and run). Results of 2026-11-19 (quiet machine, `2026-11-19-mesh-admission.json`, rows in *M5 runs (mesh-admission)* below):
 
 | Check | Result | Budget | Verdict |
 |---|---|---|---|
@@ -560,3 +535,34 @@ the burst, 3, per pod and run). Results of 2026-11-19 (quiet machine, `2026-11-1
 The two earlier runs of the day, before the method was fixed, are on #453: one in 64-connection bursts admitted 22 to
 23 rps per pod (the burst of 3 tokens is full again between bursts), and one before ABBA had p99 deltas of -10.5 to
 +8.3 ms.
+
+### M5 runs (mesh-admission)
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-19 | mesh-admission (no admission) | http1 | 50 | 49.89 | 59.18 | 67.91 | 69.99 | 76.68 | 0 | 0.057 | 0.02 | 18.3 | 15.2 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 50 | 49.87 | 59.01 | 67.84 | 69.97 | 73.35 | 0 | 0.053 | 0.019 | 18.8 | 15.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 50 | 49.9 | 59.02 | 68.09 | 74.24 | 77.32 | 0 | 0.057 | 0.02 | 19.1 | 15.6 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 50 | 49.89 | 59.93 | 67.46 | 69.16 | 69.33 | 0 | 0.054 | 0.019 | 19.2 | 15.7 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 100 | 99.78 | 59.06 | 65.38 | 66.83 | 66.98 | 0 | 0.108 | 0.037 | 19.5 | 15.7 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 100 | 99.78 | 58.66 | 65.87 | 67.63 | 67.8 | 0 | 0.108 | 0.038 | 19.6 | 15.9 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 100 | 99.79 | 58.82 | 67.11 | 69.16 | 69.36 | 0 | 0.108 | 0.038 | 19.6 | 15.9 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 100 | 99.79 | 58.73 | 67.67 | 69.93 | 74.16 | 0 | 0.109 | 0.038 | 19.6 | 16 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 200 | 199.57 | 59.26 | 67.84 | 69.86 | 72.77 | 0 | 0.217 | 0.075 | 19.6 | 16 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 200 | 199.54 | 60.29 | 68.46 | 78.01 | 122.74 | 0 | 0.213 | 0.075 | 20 | 16 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 200 | 199.56 | 59.98 | 68.03 | 69.84 | 71.6 | 0 | 0.221 | 0.078 | 20.1 | 16 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 200 | 199.57 | 59.16 | 67.85 | 69.92 | 77.9 | 0 | 0.216 | 0.075 | 20.2 | 16.1 |
+| 2026-11-19 | mesh-admission (admission 64/30, 2x) | http1 | 180 | 176.75 | 172.35 | 224.25 | 389.95 | 566.34 | 2638 | 0.241 | 0.064 | 23.1 | 16.1 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 50 | 49.89 | 64.48 | 69.43 | 76.47 | 77.79 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 50 | 49.88 | 64.24 | 69.17 | 75.31 | 77.43 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 50 | 49.87 | 64.28 | 69.41 | 78.94 | 80.54 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 50 | 49.89 | 64.21 | 68.99 | 71.04 | 72.72 | 0 | 0.066 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 100 | 99.79 | 64.34 | 69.23 | 76.9 | 79.2 | 0 | 0.128 | 0.045 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 100 | 99.7 | 64.2 | 69.38 | 80.08 | 88.89 | 0 | 0.13 | 0.045 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 100 | 99.76 | 64.19 | 69.11 | 73 | 74.53 | 0 | 0.129 | 0.045 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 100 | 99.78 | 64.19 | 69.05 | 72.77 | 74.94 | 0 | 0.125 | 0.045 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 200 | 199.53 | 64.18 | 69.07 | 76.39 | 81.46 | 0 | 0.255 | 0.089 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 200 | 199.55 | 64.41 | 69.21 | 75.46 | 77.46 | 0 | 0.26 | 0.09 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 200 | 199.53 | 64.29 | 69.16 | 76.84 | 79.78 | 0 | 0.256 | 0.09 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 200 | 199.52 | 64.27 | 69.13 | 74.95 | 77.39 | 0 | 0.254 | 0.09 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (admission 64/30, 2x) | h2c | 180 | 176.73 | 170.42 | 224.8 | 390.08 | 542.72 | 2637 | 0.257 | 0.077 | 23.2 | 16.7 |
