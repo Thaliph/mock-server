@@ -202,8 +202,8 @@ fn adm_03_a_full_queue_refuses_overloaded_and_stays_unchanged() {
     let c = a.counts(ms(0));
     assert_eq!((c.depth, c.queued, c.overloaded), (1, 1, 1));
     assert_eq!(resolved(&mut out, |o| a.release(pa, ms(0), o)), [(b, None)]);
-    assert_eq!(Refusal::Overloaded.as_str(), "overloaded");
-    assert_eq!(Refusal::QueueTimeout.as_str(), "queue-timeout");
+    assert_eq!(Refusal::Overloaded.reason().as_str(), "overloaded");
+    assert_eq!(Refusal::QueueTimeout.reason().as_str(), "queue-timeout");
 }
 
 #[test]

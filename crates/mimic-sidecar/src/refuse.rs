@@ -16,6 +16,7 @@ use hyper::header::HeaderValue;
 use hyper::service::service_fn;
 use hyper::{Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use mimic_core::mesh::reason::Reason;
 use mimic_core::proxy::{DETECT_LIMIT, Detection, detect};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -36,15 +37,18 @@ const H2_TIME: Duration = Duration::from_secs(5);
 /// The head of a refusal the inbound side writes itself (spec §4.1): the status line, then
 /// exactly `x-mimic-error`, `x-mimic-endpoint`, `x-mimic-origin`, `content-length: 0`, and
 /// `connection: close` when `close`.
-pub(crate) fn http1_head(error: &str, dst: SocketAddr, origin: &str, close: bool) -> String {
-    let close = if close { "connection: close\r\n" } else { "" };
+pub(crate) fn http1_head(error: Reason, dst: SocketAddr, origin: &str, close: bool) -> String {
+    let (error, close) = (
+        error.as_str(),
+        if close { "connection: close\r\n" } else { "" },
+    );
     format!(
         "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: {error}\r\nx-mimic-endpoint: {dst}\r\nx-mimic-origin: {origin}\r\ncontent-length: 0\r\n{close}\r\n"
     )
 }
 
 /// The same answer on h2: `:status` 503, the four fields in that order, an empty body.
-pub(crate) fn h2_response(error: &str, dst: SocketAddr, origin: &str) -> Response<Body> {
+pub(crate) fn h2_response(error: Reason, dst: SocketAddr, origin: &str) -> Response<Body> {
     let mut response = Response::new(
         Empty::<Bytes>::new()
             .map_err(|never| match never {})
@@ -54,7 +58,7 @@ pub(crate) fn h2_response(error: &str, dst: SocketAddr, origin: &str) -> Respons
     let endpoint = dst.to_string();
     let headers = response.headers_mut();
     for (name, value) in [
-        ("x-mimic-error", error),
+        ("x-mimic-error", error.as_str()),
         ("x-mimic-endpoint", endpoint.as_str()),
         ("x-mimic-origin", origin),
         ("content-length", "0"),
@@ -147,7 +151,7 @@ pub(crate) async fn answer(
         serve_h2(client, buf, dst, &origin, abort.as_mut()).await;
         return;
     }
-    let head = http1_head("connect-failed", dst, &origin, true);
+    let head = http1_head(Reason::ConnectFailed, dst, &origin, true);
     if client.write_all(head.as_bytes()).await.is_err() {
         return;
     }
@@ -168,7 +172,7 @@ async fn serve_h2(
     let service = service_fn(move |_| {
         signal.notify_one();
         std::future::ready(Ok::<_, Infallible>(h2_response(
-            "connect-failed",
+            Reason::ConnectFailed,
             endpoint,
             &origin,
         )))
@@ -198,20 +202,24 @@ async fn serve_h2(
 mod tests {
     use hyper::body::Body as _;
 
-    use super::{h2_response, http1_head};
+    use super::{Reason, h2_response, http1_head};
 
     #[test]
     fn adm_16_the_refusal_fields_are_exact_on_both_protocols() {
         let dst = "[::1]:8080".parse().unwrap();
         assert_eq!(
-            http1_head("queue-timeout", dst, "inbound; pod=p", true),
+            http1_head(Reason::QueueTimeout, dst, "inbound; pod=p", true),
             "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: queue-timeout\r\nx-mimic-endpoint: [::1]:8080\r\nx-mimic-origin: inbound; pod=p\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
         );
         assert_eq!(
-            http1_head("queue-timeout", dst, "inbound; pod=p", false),
+            http1_head(Reason::QueueTimeout, dst, "inbound; pod=p", false),
             "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: queue-timeout\r\nx-mimic-endpoint: [::1]:8080\r\nx-mimic-origin: inbound; pod=p\r\ncontent-length: 0\r\n\r\n"
         );
-        let response = h2_response("overloaded", "10.0.0.9:8080".parse().unwrap(), "inbound");
+        let response = h2_response(
+            Reason::Overloaded,
+            "10.0.0.9:8080".parse().unwrap(),
+            "inbound",
+        );
         assert_eq!(response.status(), 503);
         let fields: Vec<(&str, &str)> = response
             .headers()

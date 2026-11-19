@@ -325,7 +325,7 @@ async fn forward(
         Some(mesh) => match mesh.admitter().admit().await {
             Ok(slot) => Some(slot),
             Err(refusal) => {
-                let response = refuse::h2_response(refusal.as_str(), state.ctx.dst, &mesh.origin());
+                let response = refuse::h2_response(refusal.reason(), state.ctx.dst, &mesh.origin());
                 let request = RefusedRequest {
                     method: Some(req.method().as_str()),
                     path: Some(req.uri().path()),

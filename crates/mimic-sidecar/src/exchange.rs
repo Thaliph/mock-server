@@ -17,6 +17,7 @@ use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response, StatusCode};
 use mimic_core::mesh::admission::Refusal;
 use mimic_core::mesh::fault;
+use mimic_core::mesh::reason::Reason;
 use mimic_core::mesh::timeout::Kind;
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
 use mimic_core::proxy::http1::{CAPTURE_BODY_LIMIT, Captured, Event, RequestHead, Side};
@@ -259,7 +260,7 @@ pub(crate) struct Tracker {
     /// Set by the request when a copy has its body and is sent (spec §4.1 `mirrored`).
     mirrored: Arc<AtomicBool>,
     /// Mesh-routed: the `x-mimic-error` of an answer of the sidecar (spec §4.1 `reason`).
-    reason: Option<&'static str>,
+    reason: Option<Reason>,
     /// Mesh-routed: the fault injected (spec §4.1 `fault`) and the delay of a `delay`.
     fault: Option<&'static str>,
     fault_delay_ms: Option<u64>,
@@ -422,7 +423,7 @@ impl Tracker {
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
     /// logged like a response, and never handed to discovery; `reason` is the `x-mimic-error`
     /// it carries.
-    pub(crate) fn synthetic(mut self, status: u16, reason: &'static str) {
+    pub(crate) fn synthetic(mut self, status: u16, reason: Reason) {
         self.reason = Some(reason);
         self.answered_by_sidecar(status, Outcome::Ok);
     }
@@ -431,7 +432,7 @@ impl Tracker {
     /// `504`, logged with `result: timeout` and the timeout that expired.
     pub(crate) fn timed_out(mut self, kind: Kind) {
         self.timeout = Some(kind.label());
-        self.reason = Some("timeout");
+        self.reason = Some(Reason::Timeout);
         self.answered_by_sidecar(StatusCode::GATEWAY_TIMEOUT.as_u16(), Outcome::Timeout);
     }
 
@@ -872,7 +873,7 @@ pub(crate) fn admission_refused(
         rule: None,
         timeout: None,
         mirrored: false,
-        reason: Some(reason.as_str()),
+        reason: Some(reason.reason()),
         fault: None,
         fault_delay_ms: None,
     });
