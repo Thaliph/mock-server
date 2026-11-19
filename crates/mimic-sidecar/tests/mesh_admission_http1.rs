@@ -1438,3 +1438,58 @@ async fn adm_27_a_refusal_line_carries_no_header_value_query_or_body() {
         "a log line carries the query, a header or the body"
     );
 }
+
+// --- ADM-32: the admitted rate at twice the rps, in process -----------------------------
+
+/// Offers `2 × rps` to one pod for `secs` over `CONNS` keep-alive connections, each sending in
+/// turn; `spread` offsets the connections evenly in time (`fortio -uniform`), else they all
+/// send at the same instants. The requests the app received, and the time of the offers.
+async fn offered_twice(rps: u32, secs: u64, spread: bool) -> (usize, Duration) {
+    const CONNS: u32 = 16;
+    let (app, _state, f) = rig(contract(64, rps), 50).await;
+    let period = Duration::from_secs(1) * CONNS / (2 * rps);
+    let start = tokio::time::Instant::now() + ms(100);
+    let end = start + Duration::from_secs(secs);
+    let mut tasks = Vec::new();
+    for i in 0..CONNS {
+        let addr = f.addr;
+        let first = if spread {
+            start + period * i / CONNS
+        } else {
+            start
+        };
+        tasks.push(tokio::spawn(async move {
+            let mut c = common::mesh_pods::H1Client::connect(addr).await;
+            let mut ticks = tokio::time::interval_at(first, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                if tokio::time::Instant::now() >= end {
+                    return;
+                }
+                c.send(&get("/")).await;
+                let (head, _) = c.read().await.expect("an answer");
+                assert!(
+                    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.1 503"),
+                    "{head}"
+                );
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    (app.counts.requests(), end - start)
+}
+
+#[tokio::test]
+async fn adm_32_twice_the_rps_offered_to_one_pod_is_admitted_at_the_rps() {
+    let _logs = capture_logs();
+    let (admitted, took) = offered_twice(30, 5, true).await;
+    // The bucket starts full: its burst (3) is admitted on top of the rate.
+    let rate = (admitted - 3) as f64 / took.as_secs_f64();
+    assert!(
+        (rate - 30.0).abs() <= 1.5,
+        "{admitted} admitted in {took:?}: {rate:.2} rps"
+    );
+}

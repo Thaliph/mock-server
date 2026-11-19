@@ -303,6 +303,7 @@ adm_32_mesh_admission_setup_planned() {
   check "the over run comes last, at 180 rps" has "run 7/7 setup mesh-admission protocol http1 rate 180 rps (admission 64/30, 2x)"
   check "the over run asks for 180 rps" runs_with "-qps 180" 1
   check "the over run has 64 connections" runs_with "-c 64" 1
+  check "only the over run spreads its connections in time" runs_with "-uniform" 1
   check "only the over run and mesh-breaker allow the initial errors" runs_with "-allow-initial-errors" 3
   check "the over run allows the initial errors" has "(admission 64/30, 2x): fortio load -qps 180 -t 30s -c 64"
   check "the other runs have 32 connections" runs_with "-c 32" 6

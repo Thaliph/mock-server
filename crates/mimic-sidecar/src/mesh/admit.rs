@@ -287,13 +287,11 @@ mod tests {
             async move { admitter.admit().await.err() }
         });
         until("the second is queued", || admitter.counts().depth == 1).await;
-        let t1 = Instant::now();
-        let third = within(Duration::from_secs(2), admitter.admit()).await;
-        assert_eq!(third.err(), Some(Refusal::Overloaded));
+        // The queue is full: refused at the offer, without a wait.
+        let mut third = Box::pin(admitter.admit());
         assert!(
-            t1.elapsed() <= Duration::from_millis(5),
-            "{:?}",
-            t1.elapsed()
+            matches!(futures_now(third.as_mut()), Some(Err(Refusal::Overloaded))),
+            "refused at once"
         );
         let second = within(Duration::from_secs(2), second).await.unwrap();
         assert_eq!(second, Some(Refusal::QueueTimeout));
@@ -339,14 +337,12 @@ mod tests {
         let mut fut = Box::pin(admitter.admit());
         assert!(futures_now(fut.as_mut()).is_none(), "queued");
         assert_eq!(admitter.counts().depth, 1);
-        let t0 = Instant::now();
         drop(s1);
-        let s2 = within(Duration::from_secs(1), fut).await.expect("admitted");
-        assert!(
-            t0.elapsed() <= Duration::from_millis(10),
-            "{:?}",
-            t0.elapsed()
-        );
+        // Admitted by the release itself: ready at the next poll, without a timer.
+        let s2 = match futures_now(fut.as_mut()) {
+            Some(Ok(slot)) => slot,
+            other => panic!("not admitted by the release: {:?}", other.map(|r| r.err())),
+        };
         assert_eq!(admitter.counts().in_flight, 1);
         drop(s2);
         assert_eq!(admitter.counts().in_flight, 0);
