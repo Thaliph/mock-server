@@ -109,6 +109,19 @@ async fn adm_51_one_reason_in_the_header_the_access_line_and_the_label() {
             .unwrap_or_else(|| panic!("no access line for {path}: {entries:?}"));
         assert_eq!(entry["reason"], want.as_str(), "{entry}");
     }
+    state.admission_tick();
+    let scrape = f.metrics.encode();
+    for want in [Reason::Overloaded, Reason::QueueTimeout] {
+        assert_eq!(
+            metric(
+                &scrape,
+                "mimic_admission_requests_total{",
+                &[&format!("result=\"{}\"", want.as_str())]
+            ),
+            1.0,
+            "{scrape}"
+        );
+    }
 
     // no-endpoint: a Service port without endpoints.
     let state = mesh_state(&[cart(&[])], |_| {});

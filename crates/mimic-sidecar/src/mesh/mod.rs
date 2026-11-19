@@ -12,6 +12,7 @@ mod pool;
 pub mod replay;
 mod router;
 mod serve;
+mod signal;
 mod store;
 
 #[cfg(test)]
@@ -36,6 +37,7 @@ use prometheus_client::registry::Unit;
 
 use crate::discovery::Target;
 use router::Router;
+use signal::Signals;
 
 pub(crate) use admit::{Admitter, Slot};
 pub use follow::Follower;
@@ -61,6 +63,8 @@ const MIB: usize = 1024 * KIB;
 
 /// A held request lasts as long as the controller's `MIMIC_MESH_WATCH_TIMEOUT` (at most 10 m).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(11 * 60);
+/// The period of the admission signals (spec §4.1 "Signals").
+const SIGNALS_TICK: Duration = Duration::from_millis(100);
 
 /// The ports of server-first or never-HTTP protocols (spec §7.9).
 pub const DEFAULT_OPAQUE_PORTS: [u16; 10] = [25, 587, 3306, 4444, 5432, 6379, 9300, 11211, 22, 21];
@@ -413,6 +417,11 @@ struct ResultLabel {
     result: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct KindLabel {
+    kind: &'static str,
+}
+
 /// The view held.
 struct Held {
     view: Arc<View>,
@@ -454,6 +463,8 @@ struct Inner {
     seen: AtomicBool,
     /// The pod's admission contract, from the view held (spec §4.1 "Admission contract").
     admitter: Admitter,
+    /// `mimic_admission_*` (spec §4.1 "Signals").
+    signals: Signals,
 }
 
 /// The view held by the sidecar, shared between the client, the listeners and the probes.
@@ -506,6 +517,7 @@ impl MeshState {
             router: Router::new(config),
             seen: AtomicBool::new(false),
             admitter: Admitter::new(),
+            signals: Signals::default(),
         }))
     }
 
@@ -548,6 +560,7 @@ impl MeshState {
             self.0.replay.gauge().clone(),
         );
         self.0.router.metrics.register(registry);
+        registry.register_collector(Box::new(self.0.signals.clone()));
     }
 
     /// The buffer of a request that may be sent again (spec §7.9 "Retries", "Bodies").
@@ -675,7 +688,9 @@ impl MeshState {
         let table = Arc::new(Table::build_routed(&view, &self.0.router));
         let (services, endpoints) = (view.services.len(), view.endpoint_count());
         // Pulled or persisted alike; a view of `"mesh": false` has none (spec §4.1).
-        self.0.admitter.set_contract(view.admission);
+        let previous = self.0.admitter.set_contract(view.admission);
+        let _ = previous;
+        self.admission_tick();
         *self.0.table.write().unwrap_or_else(PoisonError::into_inner) = table;
         self.0
             .services
@@ -802,6 +817,12 @@ impl MeshState {
         &self.0.admitter
     }
 
+    /// One tick of the admission signals (spec §4.1 "Signals"): `run_age` calls it every
+    /// 100 ms, `install` at each view.
+    pub fn admission_tick(&self) {
+        self.0.signals.tick(&self.0.admitter);
+    }
+
     /// Test hook (#453): the admission counts now.
     #[doc(hidden)]
     pub fn admission_counts_for_test(&self) -> mimic_core::mesh::admission::Counts {
@@ -853,14 +874,24 @@ impl MeshState {
         }
     }
 
-    /// Ticks every second until `stop` completes. Once `MIMIC_MESH_STARTUP_WAIT` has passed
-    /// without a view, held or persisted, the contract is unknown: one warning (spec §4.1).
+    /// Ticks every second, and the admission signals every 100 ms, until `stop` completes.
+    /// Once `MIMIC_MESH_STARTUP_WAIT` has passed without a view, held or persisted, the
+    /// contract is unknown: one warning (spec §4.1).
     pub async fn run_age(self, stop: impl std::future::Future<Output = ()>) {
         let ticking = async {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
                 self.tick();
+            }
+        };
+        let signals = async {
+            let mut interval = tokio::time::interval(SIGNALS_TICK);
+            // A stalled runtime gives one longer step, not a burst of ticks.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                self.admission_tick();
             }
         };
         let unknown = async {
@@ -871,7 +902,7 @@ impl MeshState {
         };
         tokio::select! {
             () = stop => {}
-            ((), ()) = async { tokio::join!(unknown, ticking) } => {}
+            ((), (), ()) = async { tokio::join!(unknown, ticking, signals) } => {}
         }
     }
 

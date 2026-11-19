@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -19,15 +19,17 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::admission::Contract;
 use mimic_core::mesh::view::View;
+use mimic_runtime::config::Env;
 use mimic_sidecar::listener::{Direction, Shared};
-use mimic_sidecar::mesh::MeshState;
+use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 pub use super::Answer;
-use super::mesh_pods::{Counts, H1Client, view_services};
-use super::{Fixture, H2Sender, fixture_mesh_on, h2_send, until};
+use super::mesh_pods::{Counts, H1Client, meshed, view_services};
+use super::{Fixture, H2Sender, Logs, fixture_mesh_on, h2_send, until};
 
 /// The time any one answer may take before the test fails.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -457,4 +459,72 @@ pub async fn full_queue(f: &Fixture, app: &Http1App, state: &MeshState) -> (H1Cl
     })
     .await;
     (held, filler)
+}
+
+/// An app answering after `delay_ms`, and a meshed sidecar in front of it holding `view`.
+pub async fn rig(view: View, delay_ms: u64) -> (App, MeshState, Fixture) {
+    let app = App::h2c(delay_ms).await;
+    let state = meshed(Some("cart-7d9f-x2k"), |_| {});
+    state.hold(view, "\"1-a\"");
+    let f = inbound(app.addr, &state, |s| s).await;
+    (app, state, f)
+}
+
+/// Sends `/` on a clone of `sender` in a task.
+pub fn spawn_call(sender: &H2Sender, path: &'static str) -> JoinHandle<Answer> {
+    let mut sender = sender.clone();
+    tokio::spawn(async move { call(&mut sender, path, &[]).await })
+}
+
+/// A held slot: a `/` the app holds (its delay is set long before), sent first.
+pub async fn hold_slot(app: &App, sender: &H2Sender) -> JoinHandle<Answer> {
+    let before = app.counts.requests();
+    let held = spawn_call(sender, "/");
+    until("the app holds the first request", || {
+        app.counts.requests() > before && app.counts.in_flight() >= 1
+    })
+    .await;
+    held
+}
+
+/// The lines of `message` so far.
+pub async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
+    logs.settled().await;
+    logs.text()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == message)
+        .collect()
+}
+
+/// `<dir>/state/mesh.json` holding `view`, fetched now.
+pub fn persist(dir: &std::path::Path, view: &View) {
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(
+        dir.join("state").join("mesh.json"),
+        format!(
+            "{{\"fetchedAt\":{},\"view\":{}}}",
+            unix_now(),
+            view.to_json()
+        ),
+    )
+    .unwrap();
+}
+
+/// A meshed state of `MIMIC_MESH=on` with no controller, its state file in `dir`.
+pub fn from_env(dir: &std::path::Path, vars: &[(&str, &str)]) -> MeshState {
+    let env = Env::from_pairs(
+        [("MIMIC_MESH", "on"), ("MIMIC_POD_NAME", "cart-7d9f-x2k")]
+            .iter()
+            .chain(vars)
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    MeshState::new(&MeshConfig::from_env(&env, dir).unwrap())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
