@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::mesh_pods::{EchoPod, H1Client, Pod, cluster_ip, view_on};
+use common::mesh_pods::{
+    EchoPod, H1Client, Pod, cluster_ip, h1_request, h2_call, payload, retries, view_on,
+};
 use common::{capture_logs, closed_port, fixture_mesh};
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
@@ -50,14 +52,6 @@ fn attempts(metrics: &str, result: &str) -> f64 {
         metrics,
         "mimic_mesh_attempts_total{",
         &[&format!("result=\"{result}\"")],
-    )
-}
-
-fn retries(metrics: &str, reason: &str) -> f64 {
-    metric(
-        metrics,
-        "mimic_mesh_retries_total{",
-        &[&format!("reason=\"{reason}\"")],
     )
 }
 
@@ -272,51 +266,6 @@ async fn h2_goaway(requests: Arc<AtomicUsize>, last: u8) -> SocketAddr {
         }
     });
     addr
-}
-
-/// An `h2c` request through the sidecar: the status, the head and the body, or the error.
-async fn h2_call(
-    addr: SocketAddr,
-    method: &str,
-    body: Vec<u8>,
-) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(connection);
-    let request = Request::builder()
-        .method(method)
-        .uri("http://cart.shop.svc/p")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_err(|e| format!("{e:?}"))?
-        .to_bytes();
-    Ok((parts.status.as_u16(), parts.headers, body.to_vec()))
-}
-
-async fn h1_request(client: &mut H1Client, method: &str, body: &[u8]) -> (String, Vec<u8>) {
-    let mut request = format!(
-        "{method} /p HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(body);
-    client.send(&request).await;
-    client.read().await.expect("an answer")
-}
-
-fn payload(n: usize) -> Vec<u8> {
-    (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect()
 }
 
 fn lower(head: &str) -> String {

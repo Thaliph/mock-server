@@ -17,7 +17,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +112,14 @@ pub struct MeshConfig {
     pub mirror_timeout: Duration,
     /// A fixed seed for the random draws (tests); `None`: seeded from the system.
     pub seed: Option<u64>,
+    /// Tests only (ADM-29): a pod address dialled at another address, as the callee pod's own
+    /// redirection to its sidecar does in a cluster. In one network namespace a sidecar cannot
+    /// both be reached at the pod address and dial its app there, so a test that runs meshed
+    /// callers and callees in process names the apps as the pods and dials their sidecars.
+    /// Never read from the environment, the view or any API: only a test that builds a
+    /// `MeshConfig` in code fills it, and [`MeshConfig::from_env`] leaves it empty.
+    #[doc(hidden)]
+    pub redirect: BTreeMap<SocketAddr, SocketAddr>,
 }
 
 impl Default for MeshConfig {
@@ -137,6 +145,7 @@ impl Default for MeshConfig {
             mirror_max_in_flight_total: mirror::MAX_IN_FLIGHT_TOTAL,
             mirror_timeout: Duration::from_millis(mirror::TIMEOUT_MS),
             seed: None,
+            redirect: BTreeMap::new(),
         }
     }
 }
@@ -210,6 +219,8 @@ impl MeshConfig {
                 defaults.retry_buffer_total,
                 MIB..=64 * MIB,
             )?,
+            // Tests only, never from the environment (ADM-29).
+            redirect: BTreeMap::new(),
             ..defaults
         })
     }

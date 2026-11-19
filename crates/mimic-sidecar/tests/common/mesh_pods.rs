@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -32,7 +32,12 @@ pub struct Counts {
     pub delay_ms: Arc<AtomicU64>,
     /// When each request arrived, in order.
     pub arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    /// Every request the pod answered: its method and its whole body, in arrival order.
+    pub seen: Arc<std::sync::Mutex<Vec<Seen>>>,
 }
+
+/// A request as a fake pod read it: its method and its whole body.
+pub type Seen = (String, Vec<u8>);
 
 impl Counts {
     pub fn requests(&self) -> usize {
@@ -68,7 +73,7 @@ impl Drop for OpenGuard {
 async fn answer(
     name: String,
     counts: Counts,
-    _req: Request<hyper::body::Incoming>,
+    req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     counts
         .arrivals
@@ -78,6 +83,17 @@ async fn answer(
     counts.requests.fetch_add(1, Ordering::SeqCst);
     let now = counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     counts.max_in_flight.fetch_max(now, Ordering::SeqCst);
+    let (parts, body) = req.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|whole| whole.to_bytes().to_vec())
+        .unwrap_or_default();
+    counts
+        .seen
+        .lock()
+        .unwrap()
+        .push((parts.method.to_string(), body));
     let delay = counts.delay_ms.load(Ordering::SeqCst);
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -655,4 +671,91 @@ impl Blackhole {
         });
         counts
     }
+}
+
+/// An `h2c` connection to `addr` that sends `Full` bodies.
+pub async fn h2_connect(addr: SocketAddr) -> hyper::client::conn::http2::SendRequest<Full<Bytes>> {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    sender
+}
+
+/// `method /p` with `body` on `sender`: the status, the head and the body, or the error.
+pub async fn h2_send(
+    sender: &mut hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+    method: &str,
+    body: Vec<u8>,
+) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
+    let request = Request::builder()
+        .method(method)
+        .uri("http://cart.shop.svc/p")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let (parts, body) = response.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .to_bytes();
+    Ok((parts.status.as_u16(), parts.headers, body.to_vec()))
+}
+
+/// An `h2c` request through the sidecar, on a new connection: the status, the head and the
+/// body, or the error.
+pub async fn h2_call(
+    addr: SocketAddr,
+    method: &str,
+    body: Vec<u8>,
+) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
+    let mut sender = h2_connect(addr).await;
+    h2_send(&mut sender, method, body).await
+}
+
+/// `method /p` with `body` on `client`: the head and the body of the answer.
+pub async fn h1_request(client: &mut H1Client, method: &str, body: &[u8]) -> (String, Vec<u8>) {
+    let mut request = format!(
+        "{method} /p HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    client.send(&request).await;
+    client.read().await.expect("an answer")
+}
+
+/// `n` bytes that are not all alike.
+pub fn payload(n: usize) -> Vec<u8> {
+    (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect()
+}
+
+/// `mimic_mesh_retries_total` of `reason`, every backend.
+pub fn retries(metrics: &str, reason: &str) -> f64 {
+    super::metric(
+        metrics,
+        "mimic_mesh_retries_total{",
+        &[&format!("reason=\"{reason}\"")],
+    )
+}
+
+/// Not HTTP, not TLS, not the HTTP/2 preface; includes `NUL` bytes.
+pub const BINARY: &[u8] = b"\x00\x01binary\xff\x00protocol-bytes";
+
+/// Sends `bytes` on a new connection to `addr` and reads them back.
+pub async fn echoed(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(bytes).await.unwrap();
+    let mut got = vec![0u8; bytes.len()];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut got))
+        .await
+        .expect("an echo in time")
+        .expect("an echo");
+    got
 }

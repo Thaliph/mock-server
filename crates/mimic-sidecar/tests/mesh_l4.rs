@@ -9,14 +9,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::faults::no_series;
-use common::mesh_pods::{Blackhole, EchoPod, Svc, cluster_ip, view_on, view_services};
+use common::mesh_pods::{
+    BINARY, Blackhole, EchoPod, Svc, cluster_ip, echoed, view_on, view_services,
+};
 use common::{capture_logs, closed_port, fixture_mesh};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-
-/// Not HTTP, not TLS, not the HTTP/2 preface; includes `NUL` bytes.
-const BINARY: &[u8] = b"\x00\x01binary\xff\x00protocol-bytes";
 
 fn state_for(
     cluster: SocketAddr,
@@ -40,18 +39,6 @@ fn counter(metrics: &str, prefix: &str) -> f64 {
         .filter(|l| l.starts_with(prefix))
         .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
         .sum()
-}
-
-/// Sends `bytes` and reads them back.
-async fn echoed(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
-    let mut c = TcpStream::connect(addr).await.unwrap();
-    c.write_all(bytes).await.unwrap();
-    let mut got = vec![0u8; bytes.len()];
-    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut got))
-        .await
-        .expect("an echo in time")
-        .expect("an echo");
-    got
 }
 
 /// A TLS ClientHello offering TLS 1.1 at most, with this SNI.
