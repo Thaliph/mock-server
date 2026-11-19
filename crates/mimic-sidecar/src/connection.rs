@@ -990,6 +990,7 @@ impl Conn<'_> {
                     self.mock.clone(),
                     watch,
                     self.strip(),
+                    self.shared.detect_stall(),
                     Some(proxy.overhead_histogram(direction)),
                     |event| tracker.event(event),
                     self.shared.stopped(),
@@ -1000,12 +1001,32 @@ impl Conn<'_> {
                 if let Some(e) = &relayed.error {
                     tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
                 }
-                if let Some(refusal) = relayed.refused {
-                    // A load request the marker check refused (spec §4.1): nothing of it
-                    // reached the destination, whose connection is closed.
-                    drop(upstream);
-                    http1::refuse(&mut client, refusal).await;
-                    return;
+                match relayed.refused {
+                    Some(http1::Refused::Load(refusal)) => {
+                        // A load request the marker check refused (spec §4.1): nothing of it
+                        // reached the destination, whose connection is closed.
+                        drop(upstream);
+                        http1::refuse(&mut client, refusal).await;
+                        return;
+                    }
+                    Some(http1::Refused::Admission(refusal)) => {
+                        // Refused by the admission (spec §4.1 "Admission contract"): written by
+                        // this side, after the earlier answers; nothing of it reached the app.
+                        let origin = self
+                            .strip()
+                            .map_or_else(|| "inbound".to_string(), |mesh| mesh.origin());
+                        refuse::admission_http1(
+                            &mut client,
+                            &mut upstream,
+                            dst,
+                            refusal.as_str(),
+                            &origin,
+                            abort.as_mut(),
+                        )
+                        .await;
+                        return;
+                    }
+                    None => {}
                 }
                 if let Some(mock) = &self.mock {
                     if relayed.outcome == access::Outcome::MockClosed {

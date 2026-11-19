@@ -151,6 +151,33 @@ async fn adm_15_http1_refusals_have_the_fields_and_the_app_gets_no_byte() {
     assert!((ms(150)..=ms(400)).contains(&took), "{took:?}");
     assert!(!app.got("/r2") && !app.got("/r3"), "{}", app.raw_text());
     assert_eq!(&app.per_conn()[1..], [0, 0]);
+
+    // A body still coming when the answer is written is read and dropped: a FIN, no reset.
+    let mut d = connect(&f, &app).await;
+    d.write_all(b"POST /r4 HTTP/1.1\r\nHost: a\r\ncontent-length: 30000\r\n\r\n")
+        .await
+        .unwrap();
+    let (mut reader, mut writer) = d.into_split();
+    let body = tokio::spawn(async move {
+        for _ in 0..3 {
+            if writer.write_all(&[b'x'; 10_000]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(ms(60)).await;
+        }
+        let _ = writer.shutdown().await;
+    });
+    let mut got = Vec::new();
+    tokio::time::timeout(TIMEOUT, reader.read_to_end(&mut got))
+        .await
+        .expect("the end in time")
+        .expect("a FIN, not a reset");
+    assert_eq!(
+        String::from_utf8(got).unwrap(),
+        refusal("queue-timeout", app.addr, ORIGIN)
+    );
+    body.await.unwrap();
+    assert!(!app.got("/r4"));
 }
 
 #[tokio::test]
@@ -868,18 +895,29 @@ async fn adm_21_a_refusal_comes_after_the_whole_earlier_response() {
 #[tokio::test]
 async fn adm_30_on_shutdown_a_queued_request_is_decided_within_its_150_ms() {
     let _logs = capture_logs();
-    // The slot is held past the queue time: the queued one is refused.
-    let (app, state, f) = rig(contract(1, 1000), 1000).await;
+    // The slot is held past the queue time: the queued one is refused. B is a second request
+    // on a kept connection, which looks idle to the codec while it is held.
+    let (app, state, f) = rig(contract(1, 1000), 0).await;
+    let mut b = connect(&f, &app).await;
+    b.write_all(&get("/b1")).await.unwrap();
+    let mut got = Vec::new();
+    read_until(&mut b, &mut got, b"\r\n\r\nok").await;
+    app.counts.delay_ms.store(1000, Ordering::SeqCst);
     let mut a = hold_slot(&f, &app).await;
     let started = Instant::now();
-    let b = spawn_refused(&f, &app, "/r2");
+    let written = Instant::now();
+    b.write_all(&get("/r2")).await.unwrap();
     until("B is queued", || {
         state.admission_counts_for_test().depth == 1
     })
     .await;
     f.shared.shutdown();
-    let (b, took) = b.await.unwrap();
-    assert_eq!(b, refusal("queue-timeout", app.addr, ORIGIN));
+    let b = read_all(&mut b).await.expect("a FIN after the answer");
+    let took = written.elapsed();
+    assert_eq!(
+        String::from_utf8(b).unwrap(),
+        refusal("queue-timeout", app.addr, ORIGIN)
+    );
     assert!((ms(150)..=ms(400)).contains(&took), "{took:?}");
     let got = read_all(&mut a).await.expect("a FIN after the answer");
     assert_eq!(got, OK);

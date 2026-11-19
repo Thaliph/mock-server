@@ -92,6 +92,26 @@ pub(crate) async fn drain(
     }
 }
 
+/// Answers an HTTP/1 request the admission refused (spec §4.1): the head with
+/// `connection: close`, then the client's FIN and drain, together with a FIN and a short drain
+/// to the app, which got no byte of the request.
+pub(crate) async fn admission_http1(
+    client: &mut Stream,
+    upstream: &mut Stream,
+    dst: SocketAddr,
+    error: &str,
+    origin: &str,
+    abort: impl Future<Output = ()>,
+) {
+    let head = http1_head(error, dst, origin, true);
+    let written = client.write_all(head.as_bytes()).await.is_ok() && client.flush().await.is_ok();
+    if written {
+        tokio::join!(drain(client, abort), crate::http1::close_upstream(upstream));
+    } else {
+        crate::http1::close_upstream(upstream).await;
+    }
+}
+
 /// Answers `client` if it speaks cleartext HTTP/1 (once its head is whole) or `h2c`; anything
 /// else is closed without a byte, as before. `stall` bounds the wait for the caller's bytes.
 pub(crate) async fn answer(

@@ -239,7 +239,8 @@ pub fn refusal_fields(error: &str, app: SocketAddr, origin: &str) -> Vec<(String
 /// `200` (`content-length: 2`) after the delay; `/chunked` sends 3 chunks 400 ms apart;
 /// `/sse` sends one event and stays open; `/close` closes without an answer; `/cd` answers a
 /// close-delimited body after 300 ms, then closes; `/ws` with `Upgrade` answers `101`, then
-/// echoes; `/ws-no` answers `200` after 300 ms; `CONNECT` answers `200`, then echoes.
+/// echoes; `/ws-no` answers `200` after 300 ms; `CONNECT` answers `200`, then echoes. A
+/// connection that never carried a byte stays open 500 ms after the caller's FIN.
 pub struct Http1App {
     pub addr: SocketAddr,
     pub counts: Counts,
@@ -391,6 +392,15 @@ impl Http1Conn {
     }
 
     async fn run(mut self) {
+        self.serve().await;
+        // A connection that never carried a byte is kept open a while after the caller's FIN,
+        // as an app waiting for its first request may do.
+        if self.per_conn.lock().unwrap()[self.index] == 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    async fn serve(&mut self) {
         while let Some(head) = self.request().await {
             self.counts.arrivals.lock().unwrap().push(Instant::now());
             self.counts.requests.fetch_add(1, Ordering::SeqCst);
