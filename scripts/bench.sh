@@ -244,7 +244,10 @@ fortio_args() {
     # More connections than maxRequests: the warm-up requests (one per connection) are already answered breaker-open.
     mesh-breaker/*) FORTIO_ARGS+=(-allow-initial-errors "$url") ;;
     # Twice the contract: the warm-up requests (one per connection) may be refused already.
-    mesh-admission/adm-over) FORTIO_ARGS+=(-allow-initial-errors "$url") ;;
+    # -uniform spreads the connections in time: started together, they send in bursts, and the
+    # bucket (rps / 10 tokens) fills and loses tokens between them, so less than the rps is
+    # admitted although twice it is offered (#553).
+    mesh-admission/adm-over) FORTIO_ARGS+=(-allow-initial-errors -uniform "$url") ;;
     mesh-admission/*) FORTIO_ARGS+=("$url") ;;
     *) FORTIO_ARGS+=("http://fortio-server:8080/") ;;
   esac
@@ -1379,6 +1382,7 @@ run_one() {
 # write_results <setup>: the JSON file of a setup and one table row per run in the README (BEN-07).
 write_results() {
   local setup=$1 file="$OUT_DIR/$TODAY-$1.json" mesh=null
+  mkdir -p "$OUT_DIR"
   if [[ -f $WORK/$setup.mesh.json ]]; then mesh=$(cat "$WORK/$setup.mesh.json"); fi
   jq -s --arg date "$TODAY" --arg setup "$setup" --argjson machine "$MACHINE" \
     --arg duration "$DURATION" --argjson connections "$(setup_connections "$setup")" --argjson mesh "$mesh" \
