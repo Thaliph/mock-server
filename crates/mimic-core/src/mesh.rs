@@ -16,6 +16,7 @@ pub mod retry;
 pub mod route;
 pub mod strip;
 pub mod timeout;
+pub mod utilization;
 pub mod view;
 
 #[cfg(test)]
@@ -64,3 +65,5 @@ mod tests_routes_view;
 mod tests_strip;
 #[cfg(test)]
 mod tests_timeout;
+#[cfg(test)]
+mod tests_utilization;
