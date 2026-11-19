@@ -552,7 +552,10 @@ mod results_tests {
         );
         let sum = summary(&plan2(), &[pod(3), pod(4)], 12_345);
         let text = serde_json::to_string(&sum).unwrap_or_default();
-        assert!(!text.contains("mimicErrors"), "{text}");
+        assert!(
+            !text.contains("mimicErrors"),
+            "an empty mimicErrors written"
+        );
         let stats = serde_json::to_string(&Stats::default()).unwrap_or_default();
         assert!(!stats.contains("mimicErrors"), "{stats}");
         assert_eq!(
