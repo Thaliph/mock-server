@@ -21,6 +21,25 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Admission signalling (#454, M5). New sidecar metrics: `mimic_admission_requests_total{result}` (`admitted`,
+  `queued`, `overloaded`, `queue-timeout`, `cancelled`; demand is `admitted + overloaded + queue-timeout`) and
+  `mimic_admission_in_flight_seconds_total`, from the first contract applied; the gauges `mimic_admission_in_flight`,
+  `mimic_admission_queue_depth`, `mimic_admission_limit{kind}` and `mimic_admission_utilization`, only while a
+  contract is in force (absent without one, never 0). The utilisation is
+  `max(avg(in flight) / concurrency, avg(demand) / rps)` over a 15 s exponentially weighted average, refused demand
+  included and not capped at 1, the signal #455 will scale on. The metrics are taken from the admission counts on
+  one 100 ms timer, never on the request path. One INFO `admission contract changed` per change of the contract in
+  force, with `concurrency`, `rps`, their `previous_*` values and the view's `etag`. The `x-mimic-error` reasons are
+  one table, shared by the answer, the access line's `reason` and the metric labels; the attempt outcomes keep their
+  M2 spelling (`queue_timeout`). `mimic_load_inbound_total` gains `refused_admission`, and `forwarded` counts only
+  what reached the app. Load tests no longer stop `Unverified` at an inbound refusal of the target's sidecar
+  (`503` `overloaded`, `queue-timeout` or `connect-failed`, bound to the target's pod and address): it is counted in
+  a new `mimicErrors` map of the results, in total and per endpoint, and in `mimic_load_requests_total{result}`. It
+  counts in `requests` and `rps`, not in `statuses` nor the latency, and never verifies a target. Dashboards:
+  `mimic-sidecar` gains the rows *Mesh* and *Admission*, `mimic-mock-load` the panel "Admission by result". No new
+  `MIMIC_*` variable, RBAC rule or chart value. See Admission metrics in the wiki page Monitoring and Finding and
+  setting the contract in the wiki page Load test.
+
 - Admission contract in the inbound sidecar (#453, M5): `admission` (`concurrency` 1 to 100 000, `rps` 1 to
   1 000 000, both required) on a `MimicConfig` that targets a Deployment, carried into the view and enforced **per
   pod** by each pod's inbound sidecar, without a restart. A request is admitted while fewer than `concurrency` are in
@@ -34,7 +53,7 @@ All notable changes to mimic are documented in this file. The format follows
   callers without a sidecar get it as it is. Each refusal has an inbound access line with `reason` and counts in
   `mimic_http_requests_total` and `mimic_discovery_exchanges_total{result="synthetic"}`; one WARN
   `admission contract unknown` when a new pod has no view after `MIMIC_MESH_STARTUP_WAIT`. Without a contract nothing
-  changes. The admission metrics and dashboards are #454. See Admission contract in the wiki page Mesh.
+  changes. See Admission contract in the wiki page Mesh.
 
 - Fault injection in the sidecar (#452, M4): `faults` on a `MimicConfig` that targets a Service (at most 16, each
   with an optional `match`, one Gateway API `HTTPRouteMatch`, and `abort` (`percent`, `status` 200 to 599) and/or

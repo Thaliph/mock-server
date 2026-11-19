@@ -2624,7 +2624,11 @@ no `MimicLoadTest` and creates no Job).
     name>` (from the targets answer), and exactly one `x-mimic-endpoint` equal to the
     `<ip>:<port>` the generator dialled (field names in any case). It is counted under its
     reason (Results, below) and the run goes on. The pure `mimic-core` `load::answer` decides
-    it. An answer that carries `x-mimic-load: ok` is the app's, counted by its status class
+    it. **A refusal never verifies a target** (PM decision of 2026-11-19 on #454): only an
+    `x-mimic-load: ok` answer proves the pod is in mock. On a pooled connection, which already
+    had an `ok` answer, a refusal keeps the connection; on a new connection the generator drops
+    the connection and the next request to that target is a probe again, so a target that only
+    refuses never receives unprobed load (ADM-59). An answer that carries `x-mimic-load: ok` is the app's, counted by its status class
     whatever its other fields (the sidecar replaces any `x-mimic-load` of the app, and from M2
     removes its `x-mimic-*` fields). In the closed model a refused worker sends its next
     request at once, as after any answer (§11.1).
