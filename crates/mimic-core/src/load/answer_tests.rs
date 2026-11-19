@@ -6,6 +6,9 @@ use super::answer::{Answer, Expected, classify};
 use super::summary::MimicError;
 use crate::mesh::reason::Reason;
 
+/// Owned fields of an answer head, in order.
+type Fields = Vec<(Vec<u8>, Vec<u8>)>;
+
 const TRUSTED: [&str; 3] = ["overloaded", "queue-timeout", "connect-failed"];
 
 fn target() -> Expected<'static> {
@@ -20,7 +23,7 @@ fn inbound(reason: &str) -> Answer {
 }
 
 /// The good refusal of `reason` by the target, as owned fields.
-fn good(reason: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn good(reason: &str) -> Fields {
     [
         ("x-mimic-error", reason),
         ("x-mimic-origin", "inbound; pod=p-1"),
@@ -41,7 +44,7 @@ fn run(status: u16, fields: &[(Vec<u8>, Vec<u8>)], expected: &Expected<'_>) -> A
 }
 
 /// `fields` with the value of `name` replaced (removed when `None`).
-fn with(fields: &[(Vec<u8>, Vec<u8>)], name: &str, value: Option<&str>) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn with(fields: &[(Vec<u8>, Vec<u8>)], name: &str, value: Option<&str>) -> Fields {
     fields
         .iter()
         .filter_map(|(n, v)| match (n == name.as_bytes(), value) {
@@ -52,7 +55,7 @@ fn with(fields: &[(Vec<u8>, Vec<u8>)], name: &str, value: Option<&str>) -> Vec<(
         .collect()
 }
 
-fn plus(fields: &[(Vec<u8>, Vec<u8>)], name: &str, value: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn plus(fields: &[(Vec<u8>, Vec<u8>)], name: &str, value: &[u8]) -> Fields {
     let mut out = fields.to_vec();
     out.push((name.as_bytes().to_vec(), value.to_vec()));
     out
@@ -100,7 +103,7 @@ fn adm_57_a_bound_inbound_refusal_is_counted_under_its_reason() {
 #[test]
 fn adm_57_any_change_of_the_binding_is_unverified() {
     let base = good("overloaded");
-    let mut cases: Vec<(String, u16, Vec<(Vec<u8>, Vec<u8>)>)> = Vec::new();
+    let mut cases: Vec<(String, u16, Fields)> = Vec::new();
     for origin in [
         "inbound; pod=p-2",
         "inbound",
@@ -252,7 +255,7 @@ fn adm_57_load_marker_refusals_keep_their_outcomes() {
 /// One edit of the good refusal: (field index 0..3, name or value, kind, position, mask).
 type Edit = (usize, bool, u8, prop::sample::Index, u8);
 
-fn edited(edit: &Edit) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
+fn edited(edit: &Edit) -> (Fields, bool) {
     let (field, name, kind, at, mask) = edit;
     let mut fields = good("queue-timeout");
     let target = if *name {

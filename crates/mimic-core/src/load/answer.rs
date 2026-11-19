@@ -64,6 +64,66 @@ pub fn classify<'a>(
     fields: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
     expected: &Expected<'_>,
 ) -> Answer {
-    let _ = (status, fields.into_iter().count(), expected);
-    Answer::Unverified
+    let mut marker = None;
+    let (mut error, mut origin, mut endpoint) = (Seen::None, Seen::None, Seen::None);
+    for (name, value) in fields {
+        if name.eq_ignore_ascii_case(MARKER) {
+            marker = marker.or(Some(value));
+        } else if name.eq_ignore_ascii_case(ERROR) {
+            error.add(value);
+        } else if name.eq_ignore_ascii_case(ORIGIN) {
+            origin.add(value);
+        } else if name.eq_ignore_ascii_case(ENDPOINT) {
+            endpoint.add(value);
+        }
+    }
+    if let Some(value) = marker {
+        return marked(value);
+    }
+    inbound(status, (error, origin, endpoint), expected).map_or(Answer::Unverified, Answer::Inbound)
+}
+
+/// The answer of the first `x-mimic-load` value: as `HeaderValue::to_str`, a byte outside
+/// visible ASCII and tab reads as no value.
+fn marked(value: &[u8]) -> Answer {
+    if !value
+        .iter()
+        .all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
+    {
+        return Answer::Unverified;
+    }
+    let value = value.trim_ascii();
+    if value == b"ok" {
+        return Answer::App;
+    }
+    let Some(rest) = value.strip_prefix(b"refused") else {
+        return Answer::Unverified;
+    };
+    let reason = rest
+        .split(|&b| b == b';')
+        .find_map(|part| part.trim_ascii().strip_prefix(b"reason="))
+        .unwrap_or_default();
+    if reason.trim_ascii() == b"mode" {
+        Answer::ModeLeft
+    } else {
+        Answer::Unverified
+    }
+}
+
+/// The trusted refusal: `503`, exactly one of each field, a trusted reason, the target's pod
+/// and the address dialled, compared exactly.
+fn inbound(
+    status: u16,
+    (error, origin, endpoint): (Seen<'_>, Seen<'_>, Seen<'_>),
+    expected: &Expected<'_>,
+) -> Option<MimicError> {
+    if status != 503 {
+        return None;
+    }
+    let (error, origin, endpoint) = (error.one()?, origin.one()?, endpoint.one()?);
+    let refusal = MimicError::new(Reason::parse(error)?)?;
+    if origin.strip_prefix(INBOUND_POD) != Some(expected.pod.as_bytes()) {
+        return None;
+    }
+    (endpoint == expected.addr.to_string().as_bytes()).then_some(refusal)
 }

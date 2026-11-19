@@ -523,7 +523,7 @@ mod results_tests {
         );
         assert_eq!(
             summary(&plan, &[a.clone(), b.clone()], 10_000),
-            summary(&plan, &[ab.clone()], 10_000)
+            summary(&plan, std::slice::from_ref(&ab), 10_000)
         );
         assert_eq!(merged(&ab, &c), merged(&a, &merged(&b, &c)));
         let both: u64 = a.endpoints[0].mimic_errors.values().sum::<u64>()

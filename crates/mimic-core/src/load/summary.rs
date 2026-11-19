@@ -41,8 +41,11 @@ pub struct MimicError(Reason);
 impl MimicError {
     /// The key of a trusted inbound refusal; none for any other reason.
     pub fn new(reason: Reason) -> Option<MimicError> {
-        let _ = reason;
-        None
+        if Reason::trusted_inbound().contains(&reason) {
+            Some(MimicError(reason))
+        } else {
+            None
+        }
     }
 
     pub const fn reason(self) -> Reason {
@@ -141,7 +144,8 @@ impl Stats {
     /// A trusted refusal of the target's inbound admission: a request, counted under its
     /// reason only (no status, no latency).
     pub fn refusal(&mut self, error: MimicError) {
-        let _ = error;
+        self.requests = self.requests.saturating_add(1);
+        bump(&mut self.mimic_errors, error, 1);
     }
 
     /// Sends that were due with the concurrency in flight (not requests).
@@ -157,6 +161,9 @@ impl Stats {
         }
         for (kind, n) in &other.errors {
             bump(&mut self.errors, *kind, *n);
+        }
+        for (error, n) in &other.mimic_errors {
+            bump(&mut self.mimic_errors, *error, *n);
         }
         self.latency.merge(&other.latency);
     }
@@ -255,7 +262,7 @@ fn row(stats: &Stats, elapsed_ms: u64) -> Row {
         missed: stats.missed,
         statuses: stats.statuses.clone(),
         errors: stats.errors.clone(),
-        mimic_errors: BTreeMap::new(),
+        mimic_errors: stats.mimic_errors.clone(),
         rps,
         latency_micros: Latency {
             p50: stats.latency.percentile(50),
