@@ -21,7 +21,6 @@ pub struct Averages {
 
 /// The averages of the contract in force, and the tick they were last moved at.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct Active {
     contract: Contract,
     at: Duration,
@@ -41,8 +40,48 @@ impl Utilization {
     /// One tick: `now` is the admission clock, `counts` the cumulative counts at `now` and
     /// `contract` the one in force. A tick not after the previous one changes nothing; a
     /// contract that starts begins at 0 and takes its first sample at the next tick.
-    pub fn tick(&mut self, _now: Duration, _contract: Option<Contract>, _counts: Counts) {
-        let _ = &self.0;
+    pub fn tick(&mut self, now: Duration, contract: Option<Contract>, counts: Counts) {
+        let Some(contract) = contract else {
+            self.0 = None;
+            return;
+        };
+        let Some(active) = self.0.as_mut() else {
+            self.0 = Some(Active {
+                contract,
+                at: now,
+                last: counts,
+                avg: Averages {
+                    in_flight: 0.0,
+                    demand: 0.0,
+                },
+            });
+            return;
+        };
+        if now <= active.at {
+            return;
+        }
+        let dt = (now - active.at).as_secs_f64();
+        let alpha = -f64::exp_m1(-dt / TIME_CONSTANT.as_secs_f64());
+        let last = &active.last;
+        let in_flight = counts.in_flight_ns.saturating_sub(last.in_flight_ns) as f64 / (dt * 1e9);
+        // `queued` and `cancelled` are not demand: a queued offer ends in one of the others.
+        let offers = [
+            counts
+                .admitted_at_once
+                .saturating_sub(last.admitted_at_once),
+            counts
+                .admitted_from_queue
+                .saturating_sub(last.admitted_from_queue),
+            counts.overloaded.saturating_sub(last.overloaded),
+            counts.queue_timeout.saturating_sub(last.queue_timeout),
+        ];
+        let demand = offers.iter().map(|&n| n as f64).sum::<f64>() / dt;
+        let avg = &mut active.avg;
+        avg.in_flight += alpha * (in_flight - avg.in_flight);
+        avg.demand += alpha * (demand - avg.demand);
+        active.contract = contract;
+        active.at = now;
+        active.last = counts;
     }
 
     /// The utilisation while a contract is in force: finite and at least 0, the in-flight
