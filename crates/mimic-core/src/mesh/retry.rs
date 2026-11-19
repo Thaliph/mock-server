@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::lb::Endpoints;
+use super::reason::Reason;
 
 /// What one try came to; the `result` label of `mimic_mesh_attempts_total` and, for a retry,
 /// the `reason` label of `mimic_mesh_retries_total`.
@@ -47,6 +48,17 @@ pub enum Refusal {
     QueueTimeout,
     /// `connect-failed` written by the inbound sidecar of the pod (`x-mimic-origin`).
     AppRefused,
+}
+
+impl Refusal {
+    /// The `x-mimic-error` of the refusal: an app refusal is a `connect-failed`.
+    pub const fn reason(self) -> Reason {
+        match self {
+            Refusal::Overloaded => Reason::Overloaded,
+            Refusal::QueueTimeout => Reason::QueueTimeout,
+            Refusal::AppRefused => Reason::ConnectFailed,
+        }
+    }
 }
 
 /// A failure of one try, as the sidecar observed it.
@@ -178,10 +190,10 @@ pub fn trusted(status: u16, fields: &[(&[u8], &[u8])], pod: Option<SocketAddr>) 
     if bound != pod {
         return None;
     }
-    match error? {
-        b"overloaded" => Some(Refusal::Overloaded),
-        b"queue-timeout" => Some(Refusal::QueueTimeout),
-        b"connect-failed" => match origins[..] {
+    match Reason::parse(error?)? {
+        Reason::Overloaded => Some(Refusal::Overloaded),
+        Reason::QueueTimeout => Some(Refusal::QueueTimeout),
+        Reason::ConnectFailed => match origins[..] {
             [one] if origin(one) => Some(Refusal::AppRefused),
             _ => None,
         },

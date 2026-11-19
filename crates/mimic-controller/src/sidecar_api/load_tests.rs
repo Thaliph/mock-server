@@ -608,6 +608,46 @@ async fn ldt_08_results_are_stored_cumulatively_per_pod() {
 }
 
 #[tokio::test]
+async fn adm_60_a_post_with_an_unknown_mimic_errors_key_is_400_and_changes_nothing() {
+    let s = setup(10_000).await;
+    s.admit(PLAN).await;
+    let token = s.load_token(0);
+    let pod = s.pod(0);
+    let with = |mimic: Value| {
+        let mut body: Value = serde_json::from_slice(&post_body(&pod, false, 1)).unwrap();
+        body["results"]["endpoints"][0]["mimicErrors"] = mimic;
+        serde_json::to_vec(&body).unwrap()
+    };
+    let answer = post(&s, &token, with(json!({"overloaded": 1}))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.bytes)
+    );
+    let store = &s.api.store;
+    let first = store.load_posts(&s.ns, DEPLOYMENT, &s.uid).await.unwrap()["0"].clone();
+    assert_eq!(
+        serde_json::to_value(&first.results).unwrap()["endpoints"][0]["mimicErrors"],
+        json!({"overloaded": 1})
+    );
+    for mimic in [
+        json!({"breaker-open": 1}),
+        json!({"overloaded": -1}),
+        json!({"overloaded": 1.5}),
+    ] {
+        let answer = post(&s, &token, with(mimic.clone())).await;
+        assert_eq!(answer.status, 400, "{mimic}");
+        assert!(
+            !String::from_utf8_lossy(&answer.bytes).contains("breaker-open"),
+            "the key in the answer"
+        );
+    }
+    let now = store.load_posts(&s.ns, DEPLOYMENT, &s.uid).await.unwrap();
+    assert_eq!(now["0"], first);
+}
+
+#[tokio::test]
 async fn ldt_08_a_results_body_is_bounded_and_checked() {
     let s = setup(10_000).await;
     s.admit(PLAN).await;

@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use super::histogram::Histogram;
 use super::plan::Plan;
+use crate::mesh::reason::Reason;
 
 /// Status class of a response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -31,6 +32,70 @@ pub enum ErrorKind {
     Unverified,
 }
 
+/// A key of `mimicErrors`: one of [`Reason::trusted_inbound`], ordered and written as its
+/// `x-mimic-error` value, so that a map reads `connect-failed`, `overloaded`, `queue-timeout`
+/// (spec §7.8 "Results").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MimicError(Reason);
+
+impl MimicError {
+    /// The key of a trusted inbound refusal; none for any other reason.
+    pub fn new(reason: Reason) -> Option<MimicError> {
+        if Reason::trusted_inbound().contains(&reason) {
+            Some(MimicError(reason))
+        } else {
+            None
+        }
+    }
+
+    pub const fn reason(self) -> Reason {
+        self.0
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0.as_str()
+    }
+}
+
+impl Ord for MimicError {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for MimicError {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Serialize for MimicError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MimicError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<MimicError, D::Error> {
+        struct Key;
+        impl de::Visitor<'_> for Key {
+            type Value = MimicError;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a mimicErrors key")
+            }
+
+            // The message never quotes the value: it comes from a post.
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<MimicError, E> {
+                Reason::parse(v.as_bytes())
+                    .and_then(MimicError::new)
+                    .ok_or_else(|| E::custom("unknown mimicErrors key"))
+            }
+        }
+        deserializer.deserialize_str(Key)
+    }
+}
+
 fn bump<K: Ord>(map: &mut BTreeMap<K, u64>, key: K, n: u64) {
     let c = map.entry(key).or_default();
     *c = c.saturating_add(n);
@@ -44,6 +109,13 @@ pub struct Stats {
     pub missed: u64,
     pub statuses: BTreeMap<Class, u64>,
     pub errors: BTreeMap<ErrorKind, u64>,
+    /// Trusted inbound refusals, by reason; left out when there is none (an F11 document).
+    #[serde(
+        rename = "mimicErrors",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub mimic_errors: BTreeMap<MimicError, u64>,
     pub latency: Histogram,
 }
 
@@ -69,6 +141,13 @@ impl Stats {
         bump(&mut self.errors, kind, 1);
     }
 
+    /// A trusted refusal of the target's inbound admission: a request, counted under its
+    /// reason only (no status, no latency).
+    pub fn refusal(&mut self, error: MimicError) {
+        self.requests = self.requests.saturating_add(1);
+        bump(&mut self.mimic_errors, error, 1);
+    }
+
     /// Sends that were due with the concurrency in flight (not requests).
     pub fn missed(&mut self, n: u64) {
         self.missed = self.missed.saturating_add(n);
@@ -82,6 +161,9 @@ impl Stats {
         }
         for (kind, n) in &other.errors {
             bump(&mut self.errors, *kind, *n);
+        }
+        for (error, n) in &other.mimic_errors {
+            bump(&mut self.mimic_errors, *error, *n);
         }
         self.latency.merge(&other.latency);
     }
@@ -121,6 +203,8 @@ pub struct Row {
     pub missed: u64,
     pub statuses: BTreeMap<Class, u64>,
     pub errors: BTreeMap<ErrorKind, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mimic_errors: BTreeMap<MimicError, u64>,
     pub rps: u64,
     pub latency_micros: Latency,
 }
@@ -178,6 +262,7 @@ fn row(stats: &Stats, elapsed_ms: u64) -> Row {
         missed: stats.missed,
         statuses: stats.statuses.clone(),
         errors: stats.errors.clone(),
+        mimic_errors: stats.mimic_errors.clone(),
         rps,
         latency_micros: Latency {
             p50: stats.latency.percentile(50),

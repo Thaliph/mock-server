@@ -110,6 +110,24 @@ impl Refusal {
     }
 }
 
+/// What became of a load request whose ticket passed (spec §7.8 "Sidecar").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Passed {
+    /// Admitted by the contract, or no contract: passed on to the app.
+    Forwarded,
+    /// Refused `overloaded` or `queue-timeout` by the admission contract.
+    RefusedAdmission,
+}
+
+impl Passed {
+    fn result(self) -> &'static str {
+        match self {
+            Passed::Forwarded => "forwarded",
+            Passed::RefusedAdmission => "refused_admission",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct ResultLabel {
     result: &'static str,
@@ -152,9 +170,11 @@ impl Marker {
                 result: refusal.result(),
             });
         }
-        let _ = results.get_or_create(&ResultLabel {
-            result: "forwarded",
-        });
+        for passed in [Passed::Forwarded, Passed::RefusedAdmission] {
+            let _ = results.get_or_create(&ResultLabel {
+                result: passed.result(),
+            });
+        }
         metrics.registry_mut().register(
             "load_inbound",
             "Inbound requests carrying mimic-load-run, by result",
@@ -171,8 +191,9 @@ impl Marker {
         }))
     }
 
-    /// Judges the `mimic-load-run` headers of a request, counts the result and, for a refusal,
-    /// writes the warning of its reason once per mode period. `Ok` is the run's uid.
+    /// Judges the `mimic-load-run` headers of a request and, for a refusal, counts it and writes
+    /// the warning of its reason once per mode period. `Ok` is the run's uid: a pass is counted
+    /// later, with [`Marker::passed`], once its admission is decided.
     pub fn admit(&self, headers: &HeaderMap) -> Result<String, Refusal> {
         let values: Vec<&[u8]> = headers
             .get_all(REQUEST_HEADER)
@@ -185,15 +206,26 @@ impl Marker {
     /// [`Marker::admit`] for the values of the `mimic-load-run` headers of a request head.
     pub fn admit_values(&self, values: &[&[u8]]) -> Result<String, Refusal> {
         let decided = self.decide(values);
-        let result = match decided {
-            Ok(_) => "forwarded",
-            Err(refusal) => refusal.result(),
-        };
-        self.0.results.get_or_create(&ResultLabel { result }).inc();
         if let Err(refusal) = decided {
+            self.0
+                .results
+                .get_or_create(&ResultLabel {
+                    result: refusal.result(),
+                })
+                .inc();
             self.warn(refusal);
         }
         decided
+    }
+
+    /// Counts one ticket that passed, exactly once per request.
+    pub(crate) fn passed(&self, end: Passed) {
+        self.0
+            .results
+            .get_or_create(&ResultLabel {
+                result: end.result(),
+            })
+            .inc();
     }
 
     /// Whether `headers` carry the marker at all.

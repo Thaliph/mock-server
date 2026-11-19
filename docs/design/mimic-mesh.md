@@ -580,7 +580,7 @@ label carries a path, a header value or a caller-controlled string.
 | `mimic_mesh_view_age_seconds`, `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge | — |
 | `mimic_mesh_view_pulls_total` | counter | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
 | `mimic_mesh_stripped_headers_total` | counter, inbound `x-mimic-*` fields removed from app responses | — |
-| `mimic_admission_requests_total` | counter, every request seen, refused ones included | `result` (`admitted`, `queued`, `overloaded`, `queue-timeout`) |
+| `mimic_admission_requests_total` | counter, every request seen, refused ones included (`queued` counts the offers that waited, which also end in one of the others; `cancelled` added by #454) | `result` (`admitted`, `queued`, `overloaded`, `queue-timeout`, `cancelled`) |
 | `mimic_admission_in_flight_seconds_total` | counter, integral of `in_flight` over time | — |
 | `mimic_admission_in_flight`, `mimic_admission_queue_depth` | gauge | — |
 | `mimic_admission_limit` | gauge | `kind` (`concurrency`, `rps`) |

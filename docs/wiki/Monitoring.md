@@ -116,6 +116,58 @@ A retry rate to watch: `rate(mimic_mesh_retries_total[5m])` by `reason`; `mimic_
 with `reason="exhausted"` rising means requests ran out of tries; `mimic_mesh_retry_budget_exhausted_total`
 rising means the budget refused retries (a Service failing for most of its requests).
 
+## Admission metrics
+
+The sidecar of a pod with an [admission contract](Mesh#admission-contract) exposes these (M5, #454). With
+`MIMIC_MESH=off` none exists, and before the first contract applied none exists either. No label but `result` and
+`kind`, both fixed lists.
+
+| Metric (sidecar) | Type | Labels |
+|---|---|---|
+| `mimic_admission_requests_total` | counter, "Requests offered to the admission contract, by result". Each offer counts once, when it ends, in one of `admitted` (at once or from the queue), `overloaded`, `queue-timeout` and `cancelled` (its client left while it was queued); `queued` counts the offers that had to wait, which also end in one of the other four. The five series exist from the first contract applied, at 0, and stay after it is removed | `result` (`admitted`, `queued`, `overloaded`, `queue-timeout`, `cancelled`) |
+| `mimic_admission_in_flight_seconds_total` | counter, "Integral of the admitted requests in flight over time, in seconds": its `rate()` is the mean in flight. Exists from the first contract applied | none |
+| `mimic_admission_in_flight` | gauge, "Admitted requests in flight"; only while a contract is in force | none |
+| `mimic_admission_queue_depth` | gauge, "Requests waiting in the admission queue"; only while a contract is in force | none |
+| `mimic_admission_limit` | gauge, "Admission contract in force, by kind"; only while a contract is in force | `kind` (`concurrency`, `rps`) |
+| `mimic_admission_utilization` | gauge, "Share of the admission contract used, smoothed over 15 s, refused demand included"; not capped at 1; only while a contract is in force | none |
+
+**Demand** is `admitted` + `overloaded` + `queue-timeout`: a request whose client left while it was queued is not
+demand. The refusal values of `result` are the `x-mimic-error` values of the refusals and the `reason` of their
+access lines, the same strings. On the caller's side the retries of these refusals keep their M2 spelling in
+`mimic_mesh_attempts_total{result}` and `mimic_mesh_retries_total{reason}`: `overloaded` and `queue_timeout`
+(`_` for `-`).
+
+**What the utilisation means.** Every 100 ms the sidecar takes two samples from the admission counts: the mean
+requests in flight and the demand rate (offers that ended admitted, `overloaded` or `queue-timeout`, per second).
+Each moves an average with a 15 s time constant (an exponentially weighted moving average that follows the real
+time between two ticks), and
+
+```text
+mimic_admission_utilization = max(avg(in flight) / concurrency, avg(demand) / rps)
+```
+
+with the contract in force. So:
+
+- `0.7` is 70 % of the contract in use, on its tighter limit.
+- **Above 1 is refused demand**: more requests were offered than `rps` admits. It is not capped: at twice the
+  contract's `rps` it tends to 2. The in-flight term never exceeds 1, since in flight never exceeds `concurrency`.
+- It follows a change with the 15 s constant: a load that stops leaves about 72 % (e^(−1/3)) of the value after
+  5 s.
+- **Absent without a contract**, not 0: the four gauges exist only while a contract is in force, so a pod without
+  one has no utilisation series (an HPA reading it sees no metric rather than 0). The averages start at 0 when a
+  contract starts, are kept when its values change (and divided by the new values), and are dropped when it is
+  removed. The two counters stay.
+
+Useful queries: `max by (pod) (mimic_admission_utilization)` per pod;
+`sum by (result) (rate(mimic_admission_requests_total{result=~"overloaded|queue-timeout"}[5m]))` the refusals;
+`rate(mimic_admission_in_flight_seconds_total[5m])` the mean in flight of a pod, against
+`mimic_admission_limit{kind="concurrency"}`.
+
+The sidecar also writes one INFO `admission contract changed` each time the contract in force changes (set, given
+new values, or removed, also when it comes from the persisted view at start), with `concurrency` and `rps` of the
+new contract (absent when it was removed), `previous_concurrency` and `previous_rps` (absent when there was none)
+and the view's `etag`. A view that keeps the same contract writes no line, and no line is written per refusal.
+
 ## Dashboards
 
 Five dashboards ship with the chart in `deploy/helm/mimic/dashboards/`: `mimic-controller`, `mimic-sidecar`
@@ -123,6 +175,28 @@ Five dashboards ship with the chart in `deploy/helm/mimic/dashboards/`: `mimic-c
 `monitoring.grafana.enabled`, or `monitoring.dashboards.enabled` for your own Grafana, the chart renders one
 ConfigMap per file, labelled `grafana_dashboard: "1"`; `monitoring.dashboards.annotations` is added to each
 (for example `grafana_folder: Mimic`). They are tagged `mimic` and read the metrics listed above.
+
+The `mimic-sidecar` dashboard (variables `namespace` and `deployment`) has two rows for the mesh:
+
+| Row | Panel | Query |
+|---|---|---|
+| Mesh | Calls by Service and status class | `sum by (service, status_class) (rate(mimic_mesh_requests_total[…]))` |
+| Mesh | Call latency p50, p99 by Service | `histogram_quantile` over `mimic_mesh_request_duration_seconds_bucket` by `service` |
+| Mesh | Answers of the sidecar by reason | `sum by (reason) (rate(mimic_mesh_requests_total{reason!="none"}[…]))` |
+| Mesh | Attempts by backend and result | `sum by (backend, result) (rate(mimic_mesh_attempts_total[…]))` |
+| Mesh | Retries by reason, budget exhausted | `mimic_mesh_retries_total` by `reason`; `mimic_mesh_retry_budget_exhausted_total` by `backend` |
+| Mesh | Ejections, ejected endpoints (most per pod) | `mimic_mesh_ejections_total` by `backend`; `max by (backend) (mimic_mesh_ejected_endpoints)` |
+| Admission | Utilisation per pod | `max by (pod) (mimic_admission_utilization)`, thresholds orange at 0.7 and red at 1 (above 1 is refused demand) |
+| Admission | Requests by result | `sum by (result) (rate(mimic_admission_requests_total[…]))` |
+| Admission | Refusals by reason | the same, `result=~"overloaded\|queue-timeout"` |
+| Admission | In flight (busiest pod), limit | `max(mimic_admission_in_flight)`; `max(mimic_admission_limit{kind="concurrency"})` as a dashed red `limit` |
+| Admission | Mean in flight per pod | `sum by (pod) (rate(mimic_admission_in_flight_seconds_total[…]))` |
+| Admission | Queue depth (busiest pod) | `max(mimic_admission_queue_depth)` |
+
+The `mimic-mock-load` dashboard has, in its *Load (sidecar)* row, the panel "Admission by result"
+(`sum by (result) (rate(mimic_admission_requests_total[…]))`): a load test above the contract shows its
+refusals there, next to "Load requests received by result" (`mimic_load_inbound_total`, where they are
+`refused_admission`). A pod without a contract shows no admission data.
 
 ## Network and an external datasource
 
@@ -151,3 +225,12 @@ monitoring:
   (an accepted limit, see [Security](Security#accepted-limits)). It does not scrape the kubelet or cAdvisor, which need `nodes/proxy`: use the `process_*` series.
 - The Prometheus data are lost on a pod restart. Grafana's database is in an emptyDir as well.
 - Alerting, long-term storage and ingress are out of scope.
+- **The admission metrics lag by up to 100 ms and miss the last tick at exit.** They are taken from the admission
+  counts every 100 ms, so a scrape can miss the latest 100 ms of requests, and the requests of the last 100 ms
+  before the process exits are never exported. The access lines and `mimic_http_requests_total` count every
+  refusal at once.
+- **Callers drive the utilisation.** `mimic_admission_utilization` counts refused demand and is not capped, by
+  design (the autoscaling of #455 scales on it). Any client that can reach a pod IP, meshed or not, and a namespace
+  writer that lowers the contract, raise it; an HPA built on it can then be driven up to its `maxReplicas`.
+  NetworkPolicy bounds who can reach the pods, `maxReplicas` bounds the cost, and the contract is the namespace's
+  own configuration. The app can move only its own pod's signal, by answering slowly or by calling itself.

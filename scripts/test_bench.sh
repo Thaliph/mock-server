@@ -333,12 +333,115 @@ adm_32_mesh_admission_setup_planned() {
   outdir=""
 }
 
+# --- ADM-63: the refusal durations as counts per millisecond, and the M5 runs table -----------------------------------
+# refused <command...>: the command fails (its stderr dropped). not_in <text> <file>: the file lacks the text.
+refused() { ! "$@" 2>/dev/null; }
+not_in() { ! grep -qF -- "$1" "$2"; }
+access() { printf '{"target":"access","direction":"%s","reason":"%s","duration_ms":%s}\n' "$1" "$2" "$3"; }
+refusal_counts='{"overloaded":[{"ms":0,"n":2},{"ms":1,"n":1},{"ms":3,"n":1}],"queue-timeout":[{"ms":150,"n":2},{"ms":152,"n":1}]}'
+
+adm_63_refusal_durations_are_counts_per_millisecond() {
+  local got
+  {
+    access inbound overloaded 3
+    access inbound queue-timeout 152
+    access inbound overloaded 0
+    echo 'not json'
+    echo 42
+    access outbound overloaded 99
+    echo '{"target":"access","direction":"inbound","status":200,"duration_ms":7}'
+    access inbound connect-failed 4
+    echo '{"target":"mesh","direction":"inbound","reason":"overloaded","duration_ms":8}'
+    access inbound queue-timeout 150
+    access inbound overloaded 1
+    echo '{"target":"access","direction":"inbound","reason":"overloaded","duration_ms":"5"}'
+    echo '{"target":"access","direction":"inbound","reason":"overloaded"}'
+    access inbound overloaded 0
+    access inbound queue-timeout 150
+  } > "$tmp/refusals.log"
+  got=$(jq -n -R -c -f "$root/scripts/bench/admission-refusals.jq" < "$tmp/refusals.log")
+  check "the counts per millisecond of the fixture" [ "$got" == "$refusal_counts" ]
+  got=$(jq -n -R -c -f "$root/scripts/bench/admission-refusals.jq" < /dev/null)
+  check "no line gives both keys, empty" [ "$got" == '{"overloaded":[],"queue-timeout":[]}' ]
+  check "bench.sh runs the program file with -n -R" grep -qF -- "jq -n -R -c -f \"\$JQ_DIR/admission-refusals.jq\"" "$bench"
+  check "bench.sh keeps no inline copy" not_in 'map(select(.reason == "overloaded")' "$bench"
+}
+
+# over_run <pods JSON>: one adm-over run of the JSONL of mesh-admission, with these pods.
+over_run() {
+  jq -n -c --argjson pods "$1" '{protocol: "http1", rate: 180, actual_qps: 176, fortio: {ActualDuration: 30e9},
+    admission: {variant: "adm-over", contract: {concurrency: 64, rps: 30}, pods: $pods}}'
+}
+summary_of() {
+  jq -n -c -f "$root/scripts/bench/admission-summary.jq" --argjson p90 0.5 --argjson refusal 1 --argjson queue 160 \
+    --argjson pct 5 --argjson rps 30 --slurpfile runs "$1" | jq -c '.over[0]
+      | {overloaded_lines, overloaded_p99_ms, queue_timeout_lines, queue_timeout_max_ms, queue_timeout_ms_counts, within_budget}'
+}
+
+adm_63_the_verdict_reads_the_counts() {
+  local got
+  over_run "[{\"pod\": \"a\", \"requests\": 1000, \"ok\": 900, \"refusals\": $refusal_counts}]" > "$tmp/one.jsonl"
+  got=$(summary_of "$tmp/one.jsonl")
+  check "the verdict of the fixture's counts" [ "$got" == '{"overloaded_lines":4,"overloaded_p99_ms":3,"queue_timeout_lines":3,"queue_timeout_max_ms":152,"queue_timeout_ms_counts":[{"ms":150,"n":2},{"ms":152,"n":1}],"within_budget":false}' ]
+  over_run '[{"pod": "a", "requests": 1000, "ok": 900, "refusals": {"overloaded": [{"ms": 0, "n": 200}], "queue-timeout": [{"ms": 150, "n": 3}]}},
+    {"pod": "b", "requests": 1000, "ok": 900, "refusals": {"overloaded": [{"ms": 5, "n": 1}], "queue-timeout": [{"ms": 152, "n": 1}]}}]' \
+    > "$tmp/two.jsonl"
+  got=$(summary_of "$tmp/two.jsonl")
+  check "the counts of two pods merged before the percentile" [ "$got" == '{"overloaded_lines":201,"overloaded_p99_ms":0,"queue_timeout_lines":4,"queue_timeout_max_ms":152,"queue_timeout_ms_counts":[{"ms":150,"n":3},{"ms":152,"n":1}],"within_budget":true}' ]
+  check "bench.sh runs the program file" grep -qF -- "-f \"\$JQ_DIR/admission-summary.jq\"" "$bench"
+  check "bench.sh keeps no def p99" not_in "def p99:" "$bench"
+}
+
+# m5_table_ok <README>: the M5 runs have their own table, the last of the file (BEN-07 appends below it).
+m5_table_ok() {
+  awk '
+    function cells(line,   n) { n = gsub(/\|/, "|", line); return n - 1 }
+    { lines[NR] = $0 }
+    /^### M5 runs \(mesh-admission\)$/ { heading++; at = NR }
+    /^#/ { last_hash = $0 }
+    /^## / { last_h2 = $0 }
+    /^## M4/ { m4 = 1 } /^## M5/ { m4 = 0 }
+    m4 && /mesh-admission/ { bad = bad " mesh-admission in M4 at " NR }
+    /^\| [0-9-]+ \| mesh-admission/ { rows++; if (!at) bad = bad " row before the heading at " NR }
+    /^\|---/ { if (cells($0) != cells(lines[NR - 1])) bad = bad " delimiter of " cells($0) " cells at " NR }
+    NF { last = $0 }
+    END {
+      if (heading != 1) bad = bad " " heading + 0 " headings"
+      if (last_hash != "### M5 runs (mesh-admission)") bad = bad " last heading " last_hash
+      if (last_h2 !~ /^## M5/) bad = bad " last ## " last_h2
+      for (i = at + 1; i <= NR && lines[i] !~ /^\|/; i++) ;
+      if (lines[i] != header) bad = bad " table header at " i
+      if (cells(lines[i + 1]) != 14 || lines[i + 1] !~ /^\|---/) bad = bad " table delimiter at " i + 1
+      if (rows < 26) bad = bad " " rows + 0 " rows"
+      if (last !~ /^\| /) bad = bad " last line " last
+      if (bad != "") { print bad > "/dev/stderr"; exit 1 }
+    }' header="$(sed -n '112p' "$1")" "$1" || return 1
+  [[ $(sed -n '112p' "$1") == "| Date | Setup | Protocol |"* ]] || return 1
+  [[ $(tail -c1 "$1" | od -An -c | tr -d ' ') == '\n' ]]
+}
+
+adm_63_m5_runs_have_their_own_table_at_the_end() {
+  local readme="$root/docs/bench/README.md"
+  check "the M5 runs table of the README" m5_table_ok "$readme"
+  # The check refuses the faults it is for: a row left in M4, text after the table, a 13-cell delimiter, no final newline.
+  awk '/^## M5/ && !done { print "| 2026-11-19 | mesh-admission (no admission) | http1 | 50 |"; done = 1 } { print }' "$readme" > "$tmp/r1.md"
+  check "a row in the M4 table is refused" refused m5_table_ok "$tmp/r1.md"
+  { cat "$readme"; printf '\nSome text.\n'; } > "$tmp/r2.md"
+  check "text after the table is refused" refused m5_table_ok "$tmp/r2.md"
+  sed 's/^|---|---|---|---|---|---|---|---|---|---|---|---|---|---|$/|---|---|---|---|---|---|---|---|---|---|---|---|---|/' "$readme" > "$tmp/r3.md"
+  check "a 13-cell delimiter is refused" refused m5_table_ok "$tmp/r3.md"
+  head -c -1 "$readme" > "$tmp/r4.md"
+  check "no final newline is refused" refused m5_table_ok "$tmp/r4.md"
+}
+
 for name in ben_01_arguments_only_dry_run ben_02_invalid_configuration_refused \
   ben_03_rate_cap_and_sequential_runs ben_04_defaults_are_the_matrix \
   ben_05_images_pinned_by_digest ben_06_lock_held_refused_stale_reclaimed \
   ben_07_outputs_named_and_dry_run_writes_nothing ben_08_namespace_cleanup_trap_planned \
   ben_09_machine_description_fields_no_host_identity ben_10_mesh_refuse_setup_planned \
-  ben_11_16_mesh_setups_plan ben_12_mesh_eject_and_breaker_planned adm_32_mesh_admission_setup_planned; do
+  ben_11_16_mesh_setups_plan ben_12_mesh_eject_and_breaker_planned adm_32_mesh_admission_setup_planned \
+  adm_63_refusal_durations_are_counts_per_millisecond adm_63_the_verdict_reads_the_counts \
+  adm_63_m5_runs_have_their_own_table_at_the_end; do
   lock="$tmp/locks-$name"
   mkdir -p "$lock"
   outdir=""

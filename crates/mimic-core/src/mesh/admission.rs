@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::reason::Reason;
+
 /// Largest `admission.concurrency` (the smallest is 1).
 pub const MAX_CONCURRENCY: u32 = 100_000;
 /// Largest `admission.rps` (the smallest is 1).
@@ -76,10 +78,10 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    pub fn as_str(self) -> &'static str {
+    pub const fn reason(self) -> Reason {
         match self {
-            Refusal::Overloaded => "overloaded",
-            Refusal::QueueTimeout => "queue-timeout",
+            Refusal::Overloaded => Reason::Overloaded,
+            Refusal::QueueTimeout => Reason::QueueTimeout,
         }
     }
 }

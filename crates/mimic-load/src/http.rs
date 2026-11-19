@@ -8,6 +8,7 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::client::conn::http1;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper_util::rt::TokioIo;
+use mimic_core::load::answer::{Answer, Expected, classify};
 use mimic_core::load::request::Request;
 use mimic_core::load::summary::ErrorKind;
 use serde::Deserialize;
@@ -21,44 +22,13 @@ pub const PROBE_PORT: u16 = 15100;
 /// Time allowed to the whole probe.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_BODY_MAX: usize = 4096;
-const MARKER_HEADER: &str = "x-mimic-load";
-
-/// What the target's `x-mimic-load` header says of a response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Marker {
-    Ok,
-    /// `refused; reason=<reason>`.
-    Refused(String),
-    /// Absent, or anything else.
-    Missing,
-}
-
-impl Marker {
-    pub fn parse(value: Option<&str>) -> Marker {
-        let Some(value) = value.map(str::trim) else {
-            return Marker::Missing;
-        };
-        if value == "ok" {
-            return Marker::Ok;
-        }
-        match value.strip_prefix("refused") {
-            Some(rest) => {
-                let reason = rest
-                    .split(';')
-                    .filter_map(|part| part.trim().strip_prefix("reason="))
-                    .next()
-                    .unwrap_or_default();
-                Marker::Refused(reason.trim().to_string())
-            }
-            None => Marker::Missing,
-        }
-    }
-}
 
 /// A kept-alive connection to one target port. Its driver task ends with it.
 pub struct Conn {
     sender: http1::SendRequest<Full<Bytes>>,
     driver: JoinHandle<()>,
+    /// The `ip:port` dialled: a trusted refusal names it (spec §7.8 "Generator").
+    addr: SocketAddr,
 }
 
 impl Drop for Conn {
@@ -112,7 +82,7 @@ pub enum Outcome {
         status: u16,
         /// From the first byte written to the response head.
         micros: u64,
-        marker: Marker,
+        answer: Answer,
         /// The body was read to its end and the connection is open.
         reusable: bool,
     },
@@ -140,7 +110,11 @@ impl Conn {
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok(Conn { sender, driver })
+        Ok(Conn {
+            sender,
+            driver,
+            addr,
+        })
     }
 
     /// The connection is still usable for another request.
@@ -148,8 +122,9 @@ impl Conn {
         !self.sender.is_closed()
     }
 
-    /// Sends `request` and reads the response, within `timeout` as a whole.
-    pub async fn send(&mut self, request: &Prepared, timeout: Duration) -> Outcome {
+    /// Sends `request` and reads the response, within `timeout` as a whole. The head is
+    /// classified against the target's `pod` and the address dialled before the body is read.
+    pub async fn send(&mut self, request: &Prepared, timeout: Duration, pod: &str) -> Outcome {
         let Some(built) = request.build() else {
             return Outcome::Error(ErrorKind::Protocol);
         };
@@ -158,12 +133,15 @@ impl Conn {
             let response = self.sender.send_request(built).await?;
             let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
             let status = response.status().as_u16();
-            let marker = Marker::parse(
-                response
-                    .headers()
-                    .get(MARKER_HEADER)
-                    .and_then(|v| v.to_str().ok()),
-            );
+            let expected = Expected {
+                pod,
+                addr: self.addr,
+            };
+            let fields = response
+                .headers()
+                .iter()
+                .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()));
+            let answer = classify(status, fields, &expected);
             let mut body = response.into_body();
             // The body is read to its end and dropped, frame by frame.
             let mut complete = true;
@@ -173,15 +151,15 @@ impl Conn {
                     break;
                 }
             }
-            Ok::<_, hyper::Error>((status, micros, marker, complete))
+            Ok::<_, hyper::Error>((status, micros, answer, complete))
         };
         match tokio::time::timeout(timeout, exchange).await {
             Err(_) => Outcome::Error(ErrorKind::Timeout),
             Ok(Err(error)) => Outcome::Error(kind_of(&error)),
-            Ok(Ok((status, micros, marker, complete))) => Outcome::Response {
+            Ok(Ok((status, micros, answer, complete))) => Outcome::Response {
                 status,
                 micros,
-                marker,
+                answer,
                 reusable: complete && !self.sender.is_closed(),
             },
         }
@@ -301,25 +279,6 @@ mod tests {
             name: "t".into(),
             uid: "abc".into(),
         }
-    }
-
-    #[test]
-    fn the_marker_header_is_read_strictly() {
-        assert_eq!(Marker::parse(Some("ok")), Marker::Ok);
-        assert_eq!(
-            Marker::parse(Some("refused; reason=mode")),
-            Marker::Refused("mode".into())
-        );
-        assert_eq!(
-            Marker::parse(Some("refused; reason=ticket")),
-            Marker::Refused("ticket".into())
-        );
-        assert_eq!(
-            Marker::parse(Some("refused")),
-            Marker::Refused(String::new())
-        );
-        assert_eq!(Marker::parse(Some("okay")), Marker::Missing);
-        assert_eq!(Marker::parse(None), Marker::Missing);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mimic_core::discovery::redact;
+use mimic_core::mesh::reason::Reason;
 
 use crate::listener::Direction;
 
@@ -87,7 +88,7 @@ pub struct Exchange {
     /// Routed requests only (spec §7.9 "Mirrors"): a copy was sent to a mirror.
     pub mirrored: bool,
     /// Mesh-routed requests the sidecar answered itself (spec §4.1): the `x-mimic-error` it wrote.
-    pub reason: Option<&'static str>,
+    pub reason: Option<Reason>,
     /// Mesh-routed requests a fault of the drawn backend's policy was injected into (spec §7.9
     /// "Fault injection"): `abort` or `delay`, and the delay of a `delay`.
     pub fault: Option<&'static str>,
@@ -160,7 +161,7 @@ pub fn exchange(e: &Exchange) {
         rule = e.rule,
         timeout = e.timeout,
         mirrored = e.mirrored.then_some(true),
-        reason = e.reason,
+        reason = e.reason.map(Reason::as_str),
         fault = e.fault,
         fault_delay_ms = e.fault_delay_ms,
         "http exchange"
