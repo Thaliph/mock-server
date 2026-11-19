@@ -18,8 +18,9 @@
 | M4 | [Outlier detection and circuit breaker](m4-outlier-breaker.md) | #451 | `CBR-01` to `CBR-36` (§12.27) | delivered |
 | M4 | [Fault injection](m4-faults.md) | #452 | `FLT-01` to `FLT-32` (§12.28) | delivered with #452 |
 | M5 | [The admission contract in the inbound sidecar](m5-admission.md) | #453 | `ADM-01` to `ADM-34` (§12.29) | delivered with #453 |
+| M5 | [Signalling: metrics, dashboards, load tests counting refusals](m5-admission.md#signalling-454) | #454 | `ADM-50` to `ADM-66` (§12.29) | in progress |
 
-The signalling (#454) and autoscaling (#455) of M5 and the north-south gateway (M6) are not started. Mesh
+The autoscaling (#455) of M5 and the north-south gateway (M6) are not started. Mesh
 traffic management beyond these milestones is v2.
 
 ## One request through the mesh, and which milestone added each step
