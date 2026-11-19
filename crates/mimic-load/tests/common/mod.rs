@@ -594,7 +594,7 @@ async fn request_answer(state: &TargetState, req: Request<Incoming>) -> Response
     }
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
     let inbound = state.inbound.lock().unwrap().clone();
-    if let Some(inbound) = inbound.filter(|i| n % i.every == 0) {
+    if let Some(inbound) = inbound.filter(|i| n.is_multiple_of(i.every)) {
         *state
             .refused
             .lock()

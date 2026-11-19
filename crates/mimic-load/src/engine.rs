@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mimic_core::load::answer::Answer;
 use mimic_core::load::plan::Plan;
 use mimic_core::load::request::{Context, Error as RequestError, request};
 use mimic_core::load::schedule::{Pacer, workers};
@@ -20,7 +21,7 @@ use tokio::time::sleep;
 
 use crate::api::{Api, ApiError, PodParams, Post};
 use crate::config::Config;
-use crate::http::{Conn, Marker, Outcome, Prepared, probe};
+use crate::http::{Conn, Outcome, Prepared, probe};
 use crate::metrics::LoadMetrics;
 
 /// Intervals without an answer of the load API after which the generator stops.
@@ -316,9 +317,18 @@ impl Shared {
             .result(&self.labels[endpoint], kind_label(kind));
     }
 
-    fn record_response(&self, endpoint: usize, status: u16, micros: u64, marker: Marker) {
-        match marker {
-            Marker::Ok => {
+    /// One answer of a target. A trusted inbound refusal counts under its reason and the run
+    /// goes on; it verifies nothing: only an `ok` answer or a probe does (`verified` says
+    /// whether the connection was verified by an `ok` answer before).
+    fn record_response(
+        &self,
+        endpoint: usize,
+        (status, micros): (u16, u64),
+        answer: Answer,
+        verified: bool,
+    ) {
+        match answer {
+            Answer::App => {
                 if let Some(stats) = lock(&self.results).endpoints.get_mut(endpoint) {
                     stats.response(status, micros);
                 }
@@ -327,12 +337,21 @@ impl Shared {
                 self.metrics.duration(&self.labels[endpoint], micros);
                 self.touch_verified();
             }
-            Marker::Refused(reason) if reason == "mode" => {
+            Answer::Inbound(error) => {
+                if let Some(stats) = lock(&self.results).endpoints.get_mut(endpoint) {
+                    stats.refusal(error);
+                }
+                self.metrics.result(&self.labels[endpoint], error.as_str());
+                if verified {
+                    self.touch_verified();
+                }
+            }
+            Answer::ModeLeft => {
                 self.record_error(endpoint, ErrorKind::Refused);
                 self.halt(Reason::ModeLeft);
             }
             // Another deployment or pod, a bad ticket, or a pod that is not a mimic sidecar.
-            Marker::Refused(_) | Marker::Missing => {
+            Answer::Unverified => {
                 self.record_error(endpoint, ErrorKind::Unverified);
                 self.halt(Reason::Unverified);
             }
@@ -410,7 +429,7 @@ impl Shared {
                 }
             };
             let outcome = tokio::select! {
-                outcome = conn.send(&prepared, timeout) => outcome,
+                outcome = conn.send(&prepared, timeout, &pod) => outcome,
                 () = self.stopped() => return Flow::Sent,
             };
             match outcome {
@@ -423,12 +442,18 @@ impl Shared {
                 Outcome::Response {
                     status,
                     micros,
-                    marker,
+                    answer,
                     reusable,
                 } => {
-                    let accepted = marker == Marker::Ok;
-                    self.record_response(endpoint, status, micros, marker);
-                    if reusable && accepted {
+                    // A pooled connection got an `ok` answer before. A refusal on a new one
+                    // verifies nothing: the connection is dropped, the next request probes.
+                    let keep = match answer {
+                        Answer::App => true,
+                        Answer::Inbound(_) => pooled,
+                        Answer::ModeLeft | Answer::Unverified => false,
+                    };
+                    self.record_response(endpoint, (status, micros), answer, pooled);
+                    if reusable && keep {
                         self.release(ip, port, conn);
                     }
                     return Flow::Sent;
