@@ -486,7 +486,9 @@ SETUPS=mesh-admission scripts/bench.sh --dry-run            # the plan, nothing 
   about 67 per pod). The two runs are back to back, with the pause between them.
 - Then one run per protocol under `admission: {concurrency: 64, rps: 30}` per pod (`adm-over`), at twice the rps
   of the 3 pods: 180 rps, with 64 connections so that the refusals (up to 150 ms in the queue) do not slow the load,
-  and fortio's `-allow-initial-errors`.
+  fortio's `-allow-initial-errors`, and `-uniform`. Without `-uniform` the 64 connections send together, in bursts
+  3 times a second, and each pod's bucket (`rps / 10` = 3 tokens) is full between them: the tokens it cannot hold
+  are lost, and the first run (2026-11-19, #553) admitted 22.2 to 23.0 rps per pod instead of 30.
 - Each change of the contract waits, up to 60 s, until the config is `Accepted` and every backend sidecar
   pulled a view after it (`mimic_mesh_view_pulls_total{result="ok"}`), then 2 s.
 - For each `adm-over` run, the script records per backend pod the deltas of its inbound requests

@@ -243,7 +243,8 @@ would see without mimic, except for the limits listed at the end of this section
   and gains `x-mimic-load: ok`; interim `1xx` responses are untouched. A refused request is
   answered by the sidecar (`599`, `content-length: 0`, `connection: close`) once the answers to
   the earlier requests of the connection were written, the connection to the app is closed
-  without a byte and the client connection is closed after the answer. The following are
+  without a byte and the client connection is closed after the answer and the bounded drain of
+  "Refused app connections" (64 KiB, 1 s). The following are
   forwarded unchanged and are not load requests: a head that reaches 64 KiB without its end,
   a head the codec cannot frame (a header line without a colon, a name that is not a token such
   as `mimic-load-run : t`, `obs-fold`), a head not complete after 30 s without a byte (the
@@ -5262,6 +5263,11 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   before the app can answer `100 Continue`. Bytes are not changed. A refused request's body,
   up to 64 KiB within 1 s, is read and discarded. The requests pipelined behind it wait for
   that read.
+- (M5, #453) **A load test stops at the first admission refusal.** A refusal has no
+  `x-mimic-load` field (ADM-26), and the generator reads an answer without `x-mimic-load: ok` as
+  `Unverified` (§7.8 "Generator"). A load test against a pod whose contract it exceeds stops
+  `Unverified` at the first refusal, until #454 makes the generator count `x-mimic-error`. A
+  contract is checked with a client that is not a load test.
 - (M5, #453) **The refusal names the pod.** `x-mimic-endpoint` and `x-mimic-origin` give the pod
   address the caller dialled and the pod name, as the `connect-failed` answer of #518 does. A
   caller that reached the pod already knows its address. The pod name is not a secret

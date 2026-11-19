@@ -180,6 +180,9 @@ credential field. Placeholders are public constants, not secrets.
   discovery.
 - The first refusal or unverified answer ends the run (`Aborted`, `ModeLeft` or `Unverified`), and so does the
   deployment leaving mock. The controller then deletes the Job.
+- An admission refusal of the mesh (`503` `overloaded` or `queue-timeout`, [Mesh](Mesh)) has no `x-mimic-load`
+  field: a load test that exceeds a pod's admission contract stops `Unverified` at the first one, until #454
+  counts them. Check a contract with a client that is not a load test (see "Sizing a contract" in [Mesh](Mesh)).
 
 ## Results
 

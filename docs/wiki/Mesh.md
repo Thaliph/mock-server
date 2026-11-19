@@ -978,11 +978,15 @@ mock.
    {concurrency: …, rps: …}`). Count the long-lived responses the app serves (SSE, gRPC streams): each holds a slot
    for its whole life.
 
-3. **Check it with a second run above the contract.** Run the test again with a `concurrency` (or a `rate`) about
-   twice the contract. The refusals show in the `5xx` of `statuses` (counting them by reason in the results comes
-   with #454). The app never has more than `concurrency` requests in flight and an admitted request waits at most
-   150 ms in the queue, so the latency of the admitted requests should stay close to that of step 1 at that
-   concurrency instead of collapsing. On the pod,
+3. **Check it above the contract with a client that is not a load test.** A load test stops at the first refusal:
+   a refusal has no `x-mimic-load` field, so the generator ends the run `Unverified` (load tests count refusals from
+   #454). From a pod, send about twice the contract to one pod's IP (or through the Service, still at one
+   replica) with fortio or hey instead, for example
+   `fortio load -qps <2 × rps> -c <2 × concurrency> -uniform -t 30s http://<pod ip>:<port>/` (`-uniform` spreads
+   the connections in time; started together, they send in bursts). Or keep the load test at or
+   below the contract and read the refusals from the access lines. The app never has more than `concurrency`
+   requests in flight and an admitted request waits at most 150 ms in the queue, so the latency of the admitted
+   requests should stay close to that of step 1 at that concurrency instead of collapsing. On the pod,
    `kubectl -n shop logs deploy/cart -c mimic-sidecar | jq -c 'select(.reason == "overloaded" or .reason == "queue-timeout") | {path, status, reason, duration_ms}'`
    shows them.
 
