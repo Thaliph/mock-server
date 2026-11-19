@@ -8,8 +8,9 @@ use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Direction, Exchange, Limits as ReportLimits, Report};
 use mimic_core::load::job::job_name;
-use mimic_core::load::summary::{EndpointRow, PodResults, Stats, Summary};
+use mimic_core::load::summary::{EndpointRow, MimicError, PodResults, Stats, Summary};
 use mimic_core::load::ticket;
+use mimic_core::mesh::reason::Reason;
 use mimic_runtime::metrics::Metrics;
 use p256::ecdsa::signature::Verifier;
 use p256::pkcs8::DecodePublicKey;
@@ -422,6 +423,19 @@ impl Fx {
         for _ in 0..requests {
             stats.response(200, 1500);
         }
+        self.post_stats(test, index, final_post, reason, stats)
+            .await;
+    }
+
+    /// The post of the pod `index` with these results for the plan's one endpoint.
+    async fn post_stats(
+        &self,
+        test: &Test,
+        index: u64,
+        final_post: bool,
+        reason: Option<&str>,
+        stats: Stats,
+    ) {
         let post = StoredPost {
             final_post,
             reason: reason.map(str::to_string),
@@ -819,6 +833,62 @@ async fn ldt_09_posts_of_two_pods_merge_into_the_status_and_the_run_completes() 
             .encode()
             .contains("load_runs_total{phase=\"Succeeded\",reason=\"Completed\"} 1")
     );
+}
+
+#[tokio::test]
+async fn adm_60_posts_with_mimic_errors_merge_into_the_status_and_the_stored_summary() {
+    let f = fx(None, |c| c.status_interval = Duration::from_secs(1)).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let mut test = f.test(&ns, "t1", "pay", t0);
+    test.spec.concurrency = 200;
+    f.rec.tests.apply(test.clone());
+    f.pass(t0 + 1000).await;
+    let stats = |ok: u64, refusals: &[(Reason, u64)]| {
+        let mut s = Stats::default();
+        for _ in 0..ok {
+            s.response(200, 1500);
+        }
+        for (reason, n) in refusals {
+            for _ in 0..*n {
+                s.refusal(MimicError::new(*reason).unwrap());
+            }
+        }
+        s
+    };
+    let a = stats(5, &[(Reason::Overloaded, 3)]);
+    let b = stats(7, &[(Reason::QueueTimeout, 2), (Reason::ConnectFailed, 1)]);
+    f.post_stats(&test, 0, false, None, a.clone()).await;
+    f.post_stats(&test, 1, false, None, b.clone()).await;
+    f.pass(t0 + 10_000).await;
+    let status = f.status(&test);
+    let merged = json!({"connect-failed": 1, "overloaded": 3, "queue-timeout": 2});
+    for row in [
+        &status["results"]["total"],
+        &status["results"]["endpoints"][0],
+    ] {
+        assert_eq!(
+            (&row["requests"], &row["statuses"], &row["mimicErrors"]),
+            (&json!(18), &json!({"2xx": 12}), &merged),
+            "{row}"
+        );
+    }
+    f.post_stats(&test, 0, true, Some("Completed"), a).await;
+    f.post_stats(&test, 1, true, Some("Completed"), b).await;
+    f.pass(t0 + 14_000).await;
+    assert_eq!(f.status(&test)["phase"], "Succeeded");
+    let mut conn = f.conn().await;
+    let key = format!("mimic:v1:{{{ns}/pay}}:load:{}", test.uid);
+    let stored: String = redis::cmd("HGET")
+        .arg(&key)
+        .arg("summary")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let row =
+        r#""errors":{},"mimicErrors":{"connect-failed":1,"overloaded":3,"queue-timeout":2},"rps""#;
+    assert_eq!(stored.matches(row).count(), 2, "{stored}");
 }
 
 #[tokio::test]
