@@ -95,7 +95,10 @@ fn check(tier: &Tier, answers: &[Got]) {
             200 => {
                 ok += 1;
                 let body = String::from_utf8_lossy(body);
-                assert!(["p0", "p1", "p2"].contains(&body.as_ref()), "{body}");
+                assert!(
+                    ["p0", "p1", "p2"].contains(&body.as_ref()),
+                    "the body names no backend pod"
+                );
             }
             503 => {
                 assert!(
