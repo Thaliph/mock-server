@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end checks of the load test on kind (LDT-06, LDT-17, LDT-16, LDT-19 E; spec §7.8, §11, §12.12).
+# End-to-end checks of the load test on kind (LDT-06, LDT-17, LDT-16, LDT-19 E, ADM-61; spec §7.8, §11, §12.12, §12.29).
 # Idempotent: reuses the cluster if it exists and upgrades the release mimic in place. It
 # shares the cluster and the release with scripts/e2e.sh: never run the two at the same time.
 #
 #   scripts/e2e-load.sh            LDT-06 and LDT-17 on a cluster of its own (builds and installs)
-#   scripts/e2e-load.sh --suite    LDT-16 and LDT-19 (E), called by scripts/e2e.sh after its F10 section: it needs
+#   scripts/e2e-load.sh --suite    LDT-16, LDT-19 (E) and ADM-61, called by scripts/e2e.sh after its F10 section: it needs
 #                                  the MCK-19 setup of e2e.sh (front in mck-19, users in disc-22, the provider in
 #                                  mck-19-provider, all in mock or discovery) and the cluster and images of that run
 #
@@ -46,6 +46,8 @@ BUILT=0
 UI_PF=""
 CHROME=""
 WORK=$(mktemp -d)
+# Set while the objects of ADM-61 may exist: cleanup() deletes them (a failed or killed --suite).
+ADM_61_CLEANUP=""
 
 # found <grep args>: 0 on a match, 1 on none; an error of grep stops the script.
 found() {
@@ -69,6 +71,10 @@ cleanup() {
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   [[ -z $UI_PF ]] || kill "$UI_PF" 2>/dev/null || true
   [[ -z $CHROME ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
+  if [[ -n $ADM_61_CLEANUP ]]; then
+    kubectl -n mck-19 delete mimicloadtest adm61 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    kubectl -n mck-19 delete mimicconfig front-admission --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   rm -rf "$WORK"
   [[ $KEEP_CLUSTER == 1 ]] || kind delete cluster --name "$CLUSTER"
 }
@@ -166,8 +172,8 @@ front_in_mock() {
   kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.mode}' 2>/dev/null \
     | jq -e '.mode == "mock" and .otherPods == 0' >/dev/null 2>&1
 }
-# run_create <ns> <name> <deployment> <credentials YAML or empty>: a run of the shape of LDT-16 (8 in flight, 50 rps,
-# 60 s, rampUp 10 s).
+# run_create <ns> <name> <deployment> <credentials YAML or empty> [<duration> <concurrency> <rate> <rampUp>]: a run, by
+# default of the shape of LDT-16 (60 s, 8 in flight, 50 rps, rampUp 10 s).
 run_create() {
   kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
@@ -175,10 +181,10 @@ kind: MimicLoadTest
 metadata: {name: $2, namespace: $1}
 spec:
   deployment: $3
-  duration: 60s
-  concurrency: 8
-  rate: 50
-  rampUp: 10s
+  duration: ${5:-60s}
+  concurrency: ${6:-8}
+  rate: ${7:-50}
+  rampUp: ${8:-10s}
 $4
 YAML
 }
@@ -352,6 +358,154 @@ ldt_19_check() {
   ui_forward_stop
 }
 
+# --- ADM-61: a load test of front against its admission contract (spec §12.29) ----------------------------------------
+# front_pods: the names of the Running pods of front that are not being deleted, one per line.
+front_pods() {
+  kubectl -n mck-19 get pods -l app=front -o json \
+    | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name'
+}
+# front_metrics <pod>: the Prometheus text of the pod's sidecar, read over loopback (not captured) through the app container's
+# Python, as e2e.sh's tcp_count. Non-zero on any failure.
+front_metrics() {
+  kubectl -n mck-19 exec "$1" -c app -- python3 -c \
+    'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode())'
+}
+# series <file> <series>: the value of the exact series (name and labels, or a bare name), empty when absent. Never a prefix match.
+series() { awk -v s="$2" '$1 == s { print $2; exit }' "$1"; }
+# adm_61_valid <file>: the scrape is the sidecar's (an empty or cut body is not one).
+adm_61_valid() { found -F -e 'mimic_build_info{component="sidecar"' "$1"; }
+# adm_61_contract <pod>: the pod's sidecar holds the contract 1/5 (limit gauges, compared as numbers).
+adm_61_contract() {
+  local f="$WORK/adm61-$1.prom"
+  front_metrics "$1" > "$f" || return 1
+  adm_61_valid "$f" || return 1
+  awk -v c="$(series "$f" 'mimic_admission_limit{kind="concurrency"}')" -v r="$(series "$f" 'mimic_admission_limit{kind="rps"}')" \
+    'BEGIN { exit !(c != "" && r != "" && c + 0 == 1 && r + 0 == 5) }'
+}
+# adm_61_all_contract: every pod of front holds the contract.
+adm_61_all_contract() {
+  local p
+  for p in "${adm_61_pods[@]}"; do adm_61_contract "$p" || return 1; done
+}
+# adm_61_round <dir>: one valid scrape of every pod of front in <dir>, one file per pod; non-zero when one fails.
+adm_61_round() {
+  local p
+  rm -rf "$1"
+  mkdir -p "$1"
+  for p in "${adm_61_pods[@]}"; do
+    front_metrics "$p" > "$1/$p.prom" 2>/dev/null || return 1
+    adm_61_valid "$1/$p.prom" || return 1
+  done
+}
+# adm_61_gone <pod>: a valid scrape of the pod holds no line of mimic_admission_utilization (no sample, no # HELP).
+adm_61_gone() {
+  local f="$WORK/adm61-$1.prom"
+  front_metrics "$1" > "$f" || return 1
+  adm_61_valid "$f" || return 1
+  ! found -F -e mimic_admission_utilization "$f"
+}
+adm_61_all_gone() {
+  local p
+  for p in "${adm_61_pods[@]}"; do adm_61_gone "$p" || return 1; done
+}
+# adm_61_accepted: the Accepted condition of the MimicConfig is True.
+adm_61_accepted() {
+  [[ $(kubectl -n mck-19 get mimicconfig front-admission -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}') == True ]]
+}
+# adm_61_total: the numbers of the run's results total (LDT-04: names and numbers only).
+adm_61_total() { jq -c '.status.results.total | {requests, statuses, errors, mimicErrors}' "$WORK/adm61.json" 2>/dev/null; }
+
+# adm_61_check: ADM-61. front, in mock with the contract 1/5, gets 40 rps from 16 in flight for 30 s: the run completes with
+# mimicErrors, the sidecars count the admitted and the refused load and show a utilisation above 1, and the gauges go
+# with the config. Runs A, B and D on front have ended; run C (users, Pending) does not interact.
+adm_61_pods=()
+adm_61_check() {
+  local p t_run started rounds=0 end refused max admitted
+  kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}' >/dev/null \
+    || fail "adm_61: cannot switch front to mock"
+  wait_for 150 front_in_mock || fail "adm_61: front did not converge to mock within 150 s"
+  sleep 10
+  front_pods > "$WORK/adm61-pods.txt" || fail "adm_61: cannot list the pods of front"
+  mapfile -t adm_61_pods < "$WORK/adm61-pods.txt"
+  (( ${#adm_61_pods[@]} == 3 )) || fail "adm_61: front has ${#adm_61_pods[@]} running pods, not 3"
+
+  ADM_61_CLEANUP=1
+  kubectl apply -f - >/dev/null <<YAML || fail "adm_61: the MimicConfig front-admission was rejected"
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: front-admission, namespace: mck-19}
+spec:
+  targetRefs: [{group: apps, kind: Deployment, name: front}]
+  admission: {concurrency: 1, rps: 5}
+YAML
+  wait_for 30 adm_61_accepted || fail "adm_61: the MimicConfig front-admission is not Accepted: True within 30 s"
+  if ! wait_for 60 adm_61_all_contract; then
+    for p in "${adm_61_pods[@]}"; do
+      adm_61_contract "$p" 2>/dev/null && continue
+      fail "adm_61: the sidecar of $p holds no contract 1/5 60 s after the config: $(awk '/^mimic_admission_/ { printf "%s;", $0 }' \
+        "$WORK/adm61-$p.prom" 2>/dev/null || true)"
+    done
+  fi
+
+  log "adm_61: a run of 40 rps, 16 in flight, 30 s against front's contract 1/5"
+  run_create mck-19 adm61 front "" 30s 16 40 0s
+  wait_for 240 run_is mck-19 adm61 'Running/*' || fail "adm_61: the run did not start: $(run_status mck-19 adm61)"
+  t_run=$SECONDS
+  end=$((SECONDS + 240))
+  # A round of the 3 pods every 2 s while the run runs; a round started 20 s or more after Running, and still within it,
+  # becomes the last. After the end the gauge decays (e^(-t/15)), so no round is taken then.
+  while run_is mck-19 adm61 'Running/*' && (( SECONDS < end )); do
+    started=$SECONDS
+    if adm_61_round "$WORK/adm61-round" && (( started - t_run >= 20 )) && run_is mck-19 adm61 'Running/*'; then
+      rm -rf "$WORK/adm61-last"
+      mv "$WORK/adm61-round" "$WORK/adm61-last"
+      rounds=$((rounds + 1))
+    fi
+    sleep 2
+  done
+  if ! wait_for 240 run_is mck-19 adm61 'Succeeded/Completed'; then
+    kubectl -n mck-19 get mimicloadtest adm61 -o json > "$WORK/adm61.json" 2>/dev/null || true
+    fail "adm_61: the run ended $(run_status mck-19 adm61), not Succeeded/Completed: $(adm_61_total)"
+  fi
+  kubectl -n mck-19 get mimicloadtest adm61 -o json > "$WORK/adm61.json" || fail "adm_61: cannot read the run"
+  jq -e '.status.results.total
+    | (.mimicErrors.overloaded // 0) > 0 and (.statuses["2xx"] // 0) > 0
+      and .requests == ([.statuses[]] + [.errors[]] + [(.mimicErrors // {})[]] | add)' "$WORK/adm61.json" >/dev/null \
+    || fail "adm_61: the results total has no overloaded or no 2xx, or its sums do not add up: $(adm_61_total)"
+
+  # The counters, scraped once after the end: every pod admitted load, and the pods refused some of it.
+  adm_61_round "$WORK/adm61-end" || fail "adm_61: a scrape of the pods of front failed after the run"
+  refused=0
+  for p in "${adm_61_pods[@]}"; do
+    admitted=$(series "$WORK/adm61-end/$p.prom" 'mimic_admission_requests_total{result="admitted"}')
+    awk -v a="$admitted" 'BEGIN { exit !(a != "" && a + 0 > 0) }' \
+      || fail "adm_61: the sidecar of $p counted no admitted request (admitted '${admitted}')"
+    refused=$(awk -v t="$refused" -v v="$(series "$WORK/adm61-end/$p.prom" 'mimic_load_inbound_total{result="refused_admission"}')" \
+      'BEGIN { print t + v }')
+  done
+  awk -v r="$refused" 'BEGIN { exit !(r + 0 > 0) }' || fail "adm_61: the sidecars of front counted no refused_admission load request"
+
+  (( rounds > 0 )) || fail "adm_61: no scrape while the run was Running"
+  max=$(for p in "${adm_61_pods[@]}"; do series "$WORK/adm61-last/$p.prom" mimic_admission_utilization; done \
+    | awk 'NF { v = $1 + 0; if (!seen || v > m) { m = v; seen = 1 } } END { print (seen ? m : "none") }')
+  awk -v m="$max" 'BEGIN { exit !(m != "none" && m + 0 > 1) }' \
+    || fail "adm_61: the utilisation of front's sidecars at the end of the run is $max, not above 1"
+
+  log "adm_61: deleting the run and the config removes the gauges"
+  kubectl -n mck-19 delete mimicloadtest adm61 --wait=false >/dev/null || fail "adm_61: cannot delete the run"
+  kubectl -n mck-19 delete mimicconfig front-admission --wait=false >/dev/null || fail "adm_61: cannot delete the MimicConfig"
+  wait_for 60 absent mimicloadtest adm61 -n mck-19 || fail "adm_61: the run is there 60 s after its delete"
+  wait_for 60 absent mimicconfig front-admission -n mck-19 || fail "adm_61: the MimicConfig is there 60 s after its delete"
+  ADM_61_CLEANUP=""
+  if ! wait_for 60 adm_61_all_gone; then
+    for p in "${adm_61_pods[@]}"; do
+      adm_61_gone "$p" 2>/dev/null && continue
+      fail "adm_61: the sidecar of $p still shows mimic_admission_utilization, or answers no valid scrape, 60 s after the config was deleted"
+    done
+  fi
+  log "adm_61: passed: $(adm_61_total), refused_admission $refused, max utilisation $max"
+}
+
 # suite_main: LDT-16 and LDT-19 (E) on the cluster of scripts/e2e.sh.
 suite_main() {
   local clusters repo mimic_ref users1 prov1 users2 prov2 sent missing job_a job_b job_c creds
@@ -515,6 +669,9 @@ suite_main() {
   log "ldt_16: no canary of the credentials Secret in a log line of the cluster"
   sweep_logs
 
+  log "adm_61: a load test of front under the admission contract 1/5 completes with mimicErrors"
+  adm_61_check
+
   log "ldt_16: run C ends Failed/NotMock at its start timeout, without a Job or NetworkPolicy"
   wait_for 420 run_is disc-22 ldt16-c 'Failed/NotMock' \
     || fail "ldt_16: run C ended $(run_status disc-22 ldt16-c), not Failed/NotMock"
@@ -534,7 +691,7 @@ suite_main() {
 
 if (( SUITE == 1 )); then
   suite_main
-  log "e2e-load --suite passed (LDT-16, LDT-19 E)"
+  log "e2e-load --suite passed (LDT-16, LDT-19 E, ADM-61)"
   exit 0
 fi
 
