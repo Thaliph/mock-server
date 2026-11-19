@@ -91,7 +91,7 @@ ADMISSION_OVER_CONCURRENCY=64                             # a queue of 7 places
 ADMISSION_RPS=30                                          # per pod, the "over" runs
 ADMISSION_OVER_RATE=$((2 * MESH_PODS * ADMISSION_RPS))    # 180 rps, under the 200 cap
 ADMISSION_OVER_CONNECTIONS=64                             # refusals wait up to 150 ms (BEN-03 cap)
-ADMISSION_P99_BUDGET_MS=0.5 ADMISSION_REFUSAL_BUDGET_MS=1 ADMISSION_QUEUE_BUDGET_MS=160 ADMISSION_RATE_PERCENT=5
+ADMISSION_P90_BUDGET_MS=0.5 ADMISSION_REFUSAL_BUDGET_MS=1 ADMISSION_QUEUE_BUDGET_MS=160 ADMISSION_RATE_PERCENT=5
 PROPAGATION_BUDGET_MS=2000  # EndpointSlice change to the sidecar's view applied, p99 (design §14, M1)
 SYNTHETIC_SERVICES=100      # the synthetic view of the RSS measurement (BEN-15)
 SYNTHETIC_ENDPOINTS=10      # endpoints of each synthetic Service
@@ -312,7 +312,7 @@ if ((DRY_RUN)); then
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
       mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $(eject_bound) requests per ejection of the caller sidecar ($EJECT_PER_EJECTION consecutive failures + $CONNECTIONS connections - 1)" ;;
       mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the p99 of the access duration_ms of the breaker-open lines must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
-      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $ADMISSION_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract and under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod in ABBA order, $ADMISSION_CONNECTIONS connections, every request's latency logged: per protocol, the median over the rates of the p99 under the contract over the p99 without it (each the mean of its two runs) must be at most +$ADMISSION_P99_BUDGET_MS ms, with no error under it; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
+      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $ADMISSION_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract and under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod in ABBA order, $ADMISSION_CONNECTIONS connections, every request's latency logged: per protocol, the median over the rates of the p90 under the contract over the p90 without it (each the mean of its two runs) must be at most +$ADMISSION_P90_BUDGET_MS ms, with no error under it; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -1261,7 +1261,7 @@ exact_latencies() {
 # over fortio's ActualDuration), the duration_ms of the overloaded lines (p99) and of the queue-timeout lines (the
 # largest, and every value counted so that one outlier shows). Each verdict, and the whole one, is within_budget.
 admission_summary() {
-  jq -n --argjson p99 "$ADMISSION_P99_BUDGET_MS" --argjson refusal "$ADMISSION_REFUSAL_BUDGET_MS" \
+  jq -n --argjson p90 "$ADMISSION_P90_BUDGET_MS" --argjson refusal "$ADMISSION_REFUSAL_BUDGET_MS" \
     --argjson queue "$ADMISSION_QUEUE_BUDGET_MS" --argjson pct "$ADMISSION_RATE_PERCENT" --argjson rps "$ADMISSION_RPS" \
     --slurpfile runs "$WORK/mesh-admission.jsonl" '
     def r2: (. * 100 | round) / 100;
@@ -1283,10 +1283,12 @@ admission_summary() {
            delta_p90_ms: (($u | map(.p90) | mean) - ($o | map(.p90) | mean) | r3),
            delta_p99_ms: (($u | map(.p99) | mean) - ($o | map(.p99) | mean) | r3),
            errors_under: ($under | map(.errors) | add)})) as $pairs
-    # The verdict: per protocol, the median over the rates of the p99 deltas, and no error under the contract.
+    # The verdict (ADM-32): per protocol, the median over the rates of the p90 deltas, and no error under the contract;
+    # the p50 and p99 deltas are recorded only (the p99 of a 30 s run is noise at this budget, #453).
     | ($pairs | group_by(.protocol) | map({protocol: .[0].protocol, rates: map(.rate),
+        median_delta_p90_ms: (map(.delta_p90_ms) | median | r3),
         median_delta_p99_ms: (map(.delta_p99_ms) | median | r3), errors_under: (map(.errors_under) | add)}
-        | . + {within_budget: (.median_delta_p99_ms <= $p99 and .errors_under == 0)})) as $medians
+        | . + {within_budget: (.median_delta_p90_ms <= $p90 and .errors_under == 0)})) as $medians
     | ($runs | map(select(.admission.variant == "adm-over")) | map(
         (.fortio.ActualDuration / 1e9) as $secs
         | [.admission.pods[].refusals.overloaded[]] as $overloaded
@@ -1301,12 +1303,12 @@ admission_summary() {
            within_budget: (.actual_qps >= 0.95 * .rate and ($pods | length) > 0 and ($pods | all(.within_budget))
              and ($overloaded | length) >= 1 and ($timeouts | length) >= 1
              and ($overloaded | p99) <= $refusal and ($timeouts | max) <= $queue)})) as $over
-    | {budgets: {added_p99_ms: $p99, refusal_p99_ms: $refusal, queue_timeout_max_ms: $queue, rate_percent: $pct},
+    | {budgets: {added_p90_ms: $p90, refusal_p99_ms: $refusal, queue_timeout_max_ms: $queue, rate_percent: $pct},
        pairs: $pairs, pair_medians: $medians, over: $over,
        within_budget: (($medians | length) > 0 and ($over | length) > 0 and (($medians + $over) | all(.within_budget)))}' \
     >"$WORK/mesh-admission.extra.json"
-  jq -r --argjson budget "$ADMISSION_P99_BUDGET_MS" '(.pairs[] | "mesh-admission pair \(.protocol) \(.rate) rps: p99 \(.p99_off_ms) ms without, \(.p99_under_ms) ms under the contract (\(.delta_p99_ms) ms; p50 \(.delta_p50_ms), p90 \(.delta_p90_ms)), \(.errors_under) errors"),
-    (.pair_medians[] | "mesh-admission \(.protocol): median p99 delta \(.median_delta_p99_ms) ms over the rates \(.rates | join(" ")), budget +\($budget) ms"),
+  jq -r --argjson budget "$ADMISSION_P90_BUDGET_MS" '(.pairs[] | "mesh-admission pair \(.protocol) \(.rate) rps: p99 \(.p99_off_ms) ms without, \(.p99_under_ms) ms under the contract (\(.delta_p99_ms) ms; p50 \(.delta_p50_ms), p90 \(.delta_p90_ms)), \(.errors_under) errors"),
+    (.pair_medians[] | "mesh-admission \(.protocol): median p90 delta \(.median_delta_p90_ms) ms (p99 \(.median_delta_p99_ms), recorded) over the rates \(.rates | join(" ")), budget +\($budget) ms"),
     (.over[] | "mesh-admission over \(.protocol) \(.rate) rps: \(.actual_qps) qps sent, admitted \([.pods[].admitted_rps] | join(" ")) rps per pod, overloaded p99 \(.overloaded_p99_ms) ms (\(.overloaded_lines) lines), queue-timeout max \(.queue_timeout_max_ms) ms (\(.queue_timeout_lines) lines)")' \
     "$WORK/mesh-admission.extra.json"
 }
@@ -1487,7 +1489,7 @@ for setup in "${ORDERED_SETUPS[@]}"; do
       >"$WORK/$setup.mesh.json.tmp"
     mv "$WORK/$setup.mesh.json.tmp" "$WORK/$setup.mesh.json"
     if [[ $(jq -r '.within_budget' "$WORK/$setup.extra.json") != true ]]; then
-      echo "FAIL mesh-admission: a pair is over +$ADMISSION_P99_BUDGET_MS ms of p99 or has errors under the contract, or an over run sent under 95 % of $ADMISSION_OVER_RATE rps, admitted a pod outside $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps, or wrote refusals over $ADMISSION_REFUSAL_BUDGET_MS ms (overloaded p99) or $ADMISSION_QUEUE_BUDGET_MS ms (queue-timeout) (within_budget false in the results)" >&2
+      echo "FAIL mesh-admission: the median p90 delta is over +$ADMISSION_P90_BUDGET_MS ms or has errors under the contract, or an over run sent under 95 % of $ADMISSION_OVER_RATE rps, admitted a pod outside $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps, or wrote refusals over $ADMISSION_REFUSAL_BUDGET_MS ms (overloaded p99) or $ADMISSION_QUEUE_BUDGET_MS ms (queue-timeout) (within_budget false in the results)" >&2
       FAILED_SETUPS+=("$setup")
     fi
   fi

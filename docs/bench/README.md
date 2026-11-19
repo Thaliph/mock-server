@@ -509,12 +509,12 @@ setups (exit 1 once the file is written):
 
 | Check | Budget |
 |---|---|
-| Per protocol, the median over the rates of the added p99 under the contract (`pair_medians[]`, from `pairs[].delta_p99_ms`), and no error under it | at most +0.5 ms |
+| Per protocol, the median over the rates of the added p90 under the contract (`pair_medians[].median_delta_p90_ms`, from `pairs[].delta_p90_ms`), and no error under it; the p50 and p99 deltas are recorded only | at most +0.5 ms |
 | Load sent in an `adm-over` run (`over[].actual_qps`) | at least 95 % of 180 rps |
 | Admitted rate per pod (`2xx` delta over fortio's `ActualDuration`) | within 5 % of 30 rps per pod |
 | p99 of the `duration_ms` of the `overloaded` lines | at most 1 ms |
 | Longest `duration_ms` of a `queue-timeout` line (counts per millisecond in `queue_timeout_ms_counts`) | at most 160 ms |
 
-A p99 delta of 0.5 ms on a 50 ms backend is close to the noise of the machine: compare only the runs of one session.
+The p99 of a 30 s run moved by −10.5 to +8.3 ms between paired runs on a quiet machine, both signs, while the p90 stayed within ±0.5 ms: ADM-32 judges the p90 (#453). Compare only the runs of one session.
 The callers' retries and fortio's warm-up add offers, and the tokens still cap the admitted rate (the bias is at most
 the burst, 3, per pod and run). The results of the first run go here with the report on #453.
