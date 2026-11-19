@@ -610,6 +610,8 @@ pub(crate) struct Router {
     pub(crate) metrics: MeshMetrics,
     /// `MIMIC_MESH_CONNECT_TIMEOUT`.
     pub(crate) connect_timeout: Duration,
+    /// Tests only (`MeshConfig.redirect`): pod addresses dialled at another address.
+    redirect: Arc<BTreeMap<SocketAddr, SocketAddr>>,
     /// How long a pod whose connect failed is avoided.
     avoid: Duration,
     /// The retries and budget of each Service of the view held, by `<namespace>/<name>`.
@@ -621,6 +623,7 @@ pub(crate) struct Router {
 }
 
 impl Router {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         idle_timeout: Duration,
         max_labels: usize,
@@ -629,15 +632,17 @@ impl Router {
         avoid: Duration,
         refusal_delay: Duration,
         mirrors: MirrorConfig,
+        redirect: BTreeMap<SocketAddr, SocketAddr>,
     ) -> Router {
         let seed = seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX));
+        let redirect = Arc::new(redirect);
         Router {
             started: Instant::now(),
             seed: AtomicU64::new(seed),
             first_seed: seed,
             backends: RwLock::new(BTreeMap::new()),
-            pools: Pools::new(idle_timeout),
-            mirror_pools: Pools::new(idle_timeout),
+            pools: Pools::with_redirect(idle_timeout, redirect.clone()),
+            mirror_pools: Pools::with_redirect(idle_timeout, redirect.clone()),
             mirror_slots: Arc::new(Slots {
                 max_port: mirrors.max_in_flight,
                 max_total: mirrors.max_in_flight_total,
@@ -646,11 +651,18 @@ impl Router {
             mirror_timeout: mirrors.timeout,
             metrics: MeshMetrics::new(max_labels),
             connect_timeout,
+            redirect,
             avoid,
             services: Mutex::new(BTreeMap::new()),
             refusal_delay,
             timers: Arc::default(),
         }
+    }
+
+    /// Where a pod is dialled: its address, or its test redirect. Only the connect uses it;
+    /// the choice, the labels, the binding of refusals and the access line keep the pod.
+    pub(crate) fn dialled(&self, pod: SocketAddr) -> SocketAddr {
+        self.redirect.get(&pod).copied().unwrap_or(pod)
     }
 
     /// What each mirror of a rule does (spec §7.9 "Mirrors"): `candidates` are drawn or not,

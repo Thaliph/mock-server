@@ -79,7 +79,7 @@ fn field(head: &str, name: &str) -> Option<String> {
 
 /// Even requests are `POST /p` with 1 KiB, odd ones `GET /p` without a body.
 fn request(n: usize) -> (&'static str, Vec<u8>) {
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         ("POST", payload(1024))
     } else {
         ("GET", Vec::new())

@@ -135,7 +135,13 @@ impl MeshState {
                     (cluster, CLUSTER_CONNECT_TIMEOUT)
                 }
             };
-            let connected = match dial(upstream, timeout).await {
+            // A test redirect changes where the pod is dialled, never how it is named.
+            let dialled = if pick.is_some() {
+                router.dialled(upstream)
+            } else {
+                upstream
+            };
+            let connected = match dial(dialled, timeout).await {
                 Ok(stream) => finish(stream, timeout).await,
                 Err(e) => Err(e),
             };

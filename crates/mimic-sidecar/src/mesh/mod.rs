@@ -515,6 +515,7 @@ impl MeshState {
                     max_in_flight_total: config.mirror_max_in_flight_total,
                     timeout: config.mirror_timeout,
                 },
+                config.redirect.clone(),
             ),
             seen: AtomicBool::new(false),
             admitter: Admitter::new(),
