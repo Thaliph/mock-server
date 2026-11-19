@@ -25,8 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use super::mesh_pods::{Counts, view_services};
-use super::{Fixture, H2Sender, fixture_mesh_on};
+use super::mesh_pods::{Counts, H1Client, view_services};
+use super::{Fixture, H2Sender, fixture_mesh_on, until};
 
 /// The time any one answer may take before the test fails.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,7 +77,8 @@ type AppBody = BoxBody<Bytes, Infallible>;
 
 /// The app: `/` answers `200` after the delay; `/trailers` sends `a`, then the trailers
 /// `x-t: 1` 600 ms later; `/sse` sends one event and stays open; `/close` drops the app
-/// connection without an answer (the connections opened later answer).
+/// connection without an answer (the connections opened later answer); `/forge` answers `503`
+/// with `x-mimic-error: overloaded` and `x-mimic-endpoint: <its own address>` after the delay.
 pub struct App {
     pub addr: SocketAddr,
     pub counts: Counts,
@@ -100,7 +101,7 @@ impl App {
                 tokio::spawn(async move {
                     let closing = close.clone();
                     let service =
-                        service_fn(move |req| route(counts.clone(), closing.clone(), req));
+                        service_fn(move |req| route(counts.clone(), closing.clone(), addr, req));
                     let served = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(stream), service);
                     tokio::select! {
@@ -125,6 +126,7 @@ impl App {
 async fn route(
     counts: Counts,
     close: Arc<Notify>,
+    addr: SocketAddr,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<AppBody>, Infallible> {
     counts.arrivals.lock().unwrap().push(Instant::now());
@@ -153,6 +155,18 @@ async fn route(
         "/close" => {
             close.notify_waiters();
             std::future::pending().await
+        }
+        "/forge" => {
+            tokio::time::sleep(Duration::from_millis(
+                counts.delay_ms.load(Ordering::SeqCst),
+            ))
+            .await;
+            Ok(Response::builder()
+                .status(503)
+                .header("x-mimic-error", "overloaded")
+                .header("x-mimic-endpoint", addr.to_string())
+                .body(Full::new(Bytes::new()).boxed())
+                .unwrap())
         }
         _ => {
             let now = counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -189,7 +203,19 @@ impl Answer {
 
 /// Sends `GET path` with `headers` on `sender` and reads the whole answer.
 pub async fn call(sender: &mut H2Sender, path: &str, headers: &[(&str, &str)]) -> Answer {
-    let mut request = Request::get(format!("http://cart.shop.svc{path}"));
+    call_as(sender, hyper::Method::GET, path, headers).await
+}
+
+/// Like [`call`], with `method`.
+pub async fn call_as(
+    sender: &mut H2Sender,
+    method: hyper::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(format!("http://cart.shop.svc{path}"));
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
@@ -239,8 +265,10 @@ pub fn refusal_fields(error: &str, app: SocketAddr, origin: &str) -> Vec<(String
 /// `200` (`content-length: 2`) after the delay; `/chunked` sends 3 chunks 400 ms apart;
 /// `/sse` sends one event and stays open; `/close` closes without an answer; `/cd` answers a
 /// close-delimited body after 300 ms, then closes; `/ws` with `Upgrade` answers `101`, then
-/// echoes; `/ws-no` answers `200` after 300 ms; `CONNECT` answers `200`, then echoes. A
-/// connection that never carried a byte stays open 500 ms after the caller's FIN.
+/// echoes; `/ws-no` answers `200` after 300 ms; `/forge` answers `503` with
+/// `x-mimic-error: overloaded` and `x-mimic-endpoint: <its own address>` after the delay;
+/// `CONNECT` answers `200`, then echoes. A connection that never carried a byte stays open
+/// 500 ms after the caller's FIN.
 pub struct Http1App {
     pub addr: SocketAddr,
     pub counts: Counts,
@@ -280,6 +308,7 @@ impl Http1App {
                     per_conn.len() - 1
                 };
                 let conn = Http1Conn {
+                    addr,
                     stream,
                     pending: Vec::new(),
                     counts: counts.clone(),
@@ -317,6 +346,8 @@ impl Http1App {
 }
 
 struct Http1Conn {
+    /// The app's own address (the original destination of the sidecar).
+    addr: SocketAddr,
     stream: tokio::net::TcpStream,
     pending: Vec<u8>,
     counts: Counts,
@@ -458,6 +489,17 @@ impl Http1Conn {
                     return;
                 }
                 "/close" => return,
+                "/forge" => {
+                    let delay = self.counts.delay_ms.load(Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let reply = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nx-mimic-endpoint: {}\r\ncontent-length: 0\r\n\r\n",
+                        self.addr
+                    );
+                    if !self.write(reply.as_bytes()).await {
+                        return;
+                    }
+                }
                 "/cd" => {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     let _ = self
@@ -485,4 +527,23 @@ impl Http1Conn {
             }
         }
     }
+}
+
+/// A full queue under `contract(1, …)`: a held slot (`GET /slow`, held by the app for its
+/// delay), then one queued filler. The next head is then refused `overloaded` at once, for the
+/// 150 ms the filler waits: send it right away.
+pub async fn full_queue(f: &Fixture, app: &Http1App, state: &MeshState) -> (H1Client, H1Client) {
+    let mut held = H1Client::connect(f.addr).await;
+    held.send(b"GET /slow HTTP/1.1\r\nHost: cart.shop.svc\r\n\r\n")
+        .await;
+    until("the app holds /slow", || app.in_flight() == 1).await;
+    let mut filler = H1Client::connect(f.addr).await;
+    filler
+        .send(b"GET /filler HTTP/1.1\r\nHost: cart.shop.svc\r\n\r\n")
+        .await;
+    until("the filler is queued", || {
+        state.admission_counts_for_test().depth == 1
+    })
+    .await;
+    (held, filler)
 }

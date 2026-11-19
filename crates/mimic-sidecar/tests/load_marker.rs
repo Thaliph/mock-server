@@ -1259,13 +1259,15 @@ async fn adm_26_http1_the_marker_is_checked_before_admission() {
     let answer = read_answer(&mut y, &mut Vec::new()).await;
     assert_admission_refused(&answer, "queue-timeout", "plain");
     assert!(written.elapsed() >= Duration::from_millis(150));
-    assert_eq!(answer.header("connection"), vec!["close"]);
+    // A refused `GET` keeps its connection (ADM-20): no `connection` field.
+    assert!(answer.header("connection").is_empty(), "plain");
 
     // (2) A valid ticket is queued and refused like any request.
     let mut z = TcpStream::connect(rig.addr).await.unwrap();
     z.write_all(&get(Some(&valid(&root)))).await.unwrap();
     let answer = read_answer(&mut z, &mut Vec::new()).await;
     assert_admission_refused(&answer, "queue-timeout", "valid ticket");
+    assert!(answer.header("connection").is_empty(), "valid ticket");
     assert!(!app.got("/pay"), "{}", app.raw_text());
 
     // (3) With the slot free, a valid ticket is admitted and marked.

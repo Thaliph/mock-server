@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use mimic_core::mesh::admission::Refusal as AdmissionRefusal;
 use mimic_core::mesh::strip::strip;
-use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD, Side as FrameSide};
+use mimic_core::proxy::http1::{
+    Codec, Event, HEAD_LIMIT, HeldRequest, READ_AHEAD, Side as FrameSide,
+};
 use prometheus_client::metrics::histogram::Histogram;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -34,6 +36,10 @@ use crate::opaque::{Side, abort, failed};
 use crate::transport::Stream;
 
 const CHUNK: usize = 16 * 1024;
+/// Body bytes a refused request may declare and still keep its connection (spec §4.1).
+const KEEP_BODY: u64 = 65_536;
+/// How long the body of a refused request on a kept connection may take, from its answer.
+const KEEP_DRAIN: Duration = Duration::from_secs(1);
 /// Values of [`Relay::closed_first`].
 const NONE: u8 = 0;
 const CLIENT: u8 = 1;
@@ -206,6 +212,12 @@ fn held_head(held: &[u8]) -> HeldHead {
     } else {
         HeldHead::Open
     }
+}
+
+/// Body bytes to drop when the connection is kept after a refusal; `None`: `connection: close`.
+fn kept(request: &HeldRequest) -> Option<u64> {
+    let _ = (request, KEEP_BODY, KEEP_DRAIN);
+    None
 }
 
 /// The final responses to requests that `events` complete: a `Response` that answers a request
@@ -1287,6 +1299,73 @@ mod tests {
         }
         assert_eq!(held_head(&big), HeldHead::Unjudged);
         assert_eq!(held_head(&big[..HEAD_LIMIT - 1]), HeldHead::Open);
+    }
+
+    #[test]
+    fn adm_20_kept_only_for_http11_without_close_expect_or_a_body_over_64_kib() {
+        use mimic_core::proxy::http1::{RequestBody, RequestFraming, RequestHead, Version};
+        let held = |version, body, close, expect, framed: bool| HeldRequest {
+            head: Some(RequestHead {
+                method: "POST".into(),
+                path: "/".into(),
+                uri_authority: None,
+                host: Some("a".into()),
+                version,
+                upgrade: false,
+                connect: false,
+            }),
+            framing: framed.then_some(RequestFraming {
+                end: 30,
+                body,
+                close,
+                expect,
+            }),
+        };
+        let v11 = Version::Http11;
+        assert_eq!(
+            kept(&held(v11, RequestBody::None, false, false, true)),
+            Some(0)
+        );
+        assert_eq!(
+            kept(&held(v11, RequestBody::Length(1024), false, false, true)),
+            Some(1024)
+        );
+        assert_eq!(
+            kept(&held(v11, RequestBody::Length(65_536), false, false, true)),
+            Some(65_536)
+        );
+        for (name, request) in [
+            (
+                "65537",
+                held(v11, RequestBody::Length(65_537), false, false, true),
+            ),
+            (
+                "chunked",
+                held(v11, RequestBody::Chunked, false, false, true),
+            ),
+            (
+                "http/1.0",
+                held(Version::Http10, RequestBody::None, false, false, true),
+            ),
+            ("close", held(v11, RequestBody::None, true, false, true)),
+            (
+                "expect",
+                held(v11, RequestBody::Length(10), false, true, true),
+            ),
+            (
+                "not framed",
+                held(v11, RequestBody::None, false, false, false),
+            ),
+            (
+                "no head",
+                HeldRequest {
+                    head: None,
+                    framing: None,
+                },
+            ),
+        ] {
+            assert_eq!(kept(&request), None, "{name}");
+        }
     }
 
     #[test]

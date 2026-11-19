@@ -1,4 +1,4 @@
-//! ADM-16 to ADM-18, ADM-24 and ADM-28 on `h2c`: the inbound side of a meshed sidecar admits
+//! ADM-16 to ADM-18, ADM-24, ADM-25, ADM-27 and ADM-28 on `h2c`: the inbound side of a meshed sidecar admits
 //! each stream under the contract of its view (spec §4.1 "Admission contract"). An inbound
 //! sidecar in process in front of an `h2c` app that counts.
 
@@ -9,10 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::admission::{
-    ANSWER_TIMEOUT, Answer, App, call, contract, inbound, meshed, no_contract, refusal_fields,
+    ANSWER_TIMEOUT, Answer, App, call, call_as, contract, inbound, meshed, no_contract,
+    refusal_fields,
 };
 use common::faults::no_series;
-use common::{Fixture, H2Sender, Logs, capture_logs, h2_client, until};
+use common::{
+    Fixture, H2Sender, Logs, capture_logs, counted, fixture_mesh_on, h2_client, metric, until,
+};
 use http_body_util::BodyExt;
 use hyper::Request;
 use mimic_runtime::config::Env;
@@ -531,4 +534,137 @@ async fn adm_28_a_persisted_or_timely_view_writes_no_warning() {
     other.hold(no_contract(), "\"1-a\"");
     tokio::time::sleep_until((t0 + Duration::from_millis(900)).into()).await;
     assert!(lines(&logs, "admission contract unknown").await.is_empty());
+}
+
+#[tokio::test]
+async fn adm_25_h2c_forged_fields_are_stripped_and_own_refusals_keep_theirs() {
+    let _logs = capture_logs();
+    let (app, _state, f) = rig(contract(1, 1000), 400).await;
+    let mut client = h2_client(f.addr).await;
+    let a = spawn_call(&client, "/forge");
+    until("the app has /forge", || app.counts.requests() == 1).await;
+    let b = call(&mut client, "/", &[]).await;
+    assert_refused(&b, "queue-timeout", app.addr);
+    let a = a.await.unwrap();
+    assert_eq!(a.status, 503, "{a:?}");
+    assert!(
+        a.headers.iter().all(|(n, _)| !n.starts_with("x-mimic-")),
+        "{a:?}"
+    );
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(&scrape, "mimic_mesh_stripped_headers_total", &[]),
+        2.0,
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn adm_27_h2c_each_refusal_writes_one_line_counts_5xx_and_synthetic() {
+    use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
+    use mimic_sidecar::listener::Direction;
+    let logs = capture_logs();
+    let app = App::h2c(400).await;
+    let state = meshed(Some("cart-7d9f-x2k"), |_| {});
+    state.hold(contract(1, 1000), "\"1-a\"");
+    let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
+    let addr = app.addr;
+    let f = fixture_mesh_on(
+        Direction::Inbound,
+        std::sync::Arc::new(move |_| Ok(addr)),
+        &state,
+        Some(&discovery),
+        |s| s,
+    )
+    .await;
+    let mut client = h2_client(f.addr).await;
+    let a = hold_slot(&app, &client).await;
+    logs.settled().await;
+    let before = logs.text().len();
+    let b = spawn_call(&client, "/b?q=1");
+    until("B is queued", || {
+        state.admission_counts_for_test().depth == 1
+    })
+    .await;
+    let c = call_as(&mut client, hyper::Method::POST, "/c", &[]).await;
+    assert_refused(&c, "overloaded", app.addr);
+    let b = b.await.unwrap();
+    assert_refused(&b, "queue-timeout", app.addr);
+    logs.settled().await;
+    let between: Vec<serde_json::Value> = logs.text()[before..]
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["level"] == "WARN" || v["level"] == "INFO")
+        .filter(|v| v["target"] != "access" && v["target"] != "sync")
+        .collect();
+    assert!(between.is_empty(), "{between:?}");
+    assert_eq!(a.await.unwrap().status, 200);
+
+    let lines = logs.access_exactly(3).await;
+    let line = |path: &str| {
+        lines
+            .iter()
+            .find(|l| l["path"] == path)
+            .unwrap_or_else(|| panic!("no line for {path}: {lines:?}"))
+    };
+    let b = line("/b");
+    assert_eq!(
+        (&b["status"], &b["reason"], &b["method"], &b["protocol"]),
+        (
+            &serde_json::json!(503),
+            &serde_json::json!("queue-timeout"),
+            &serde_json::json!("GET"),
+            &serde_json::json!("h2")
+        ),
+        "{b}"
+    );
+    assert_eq!(
+        (&b["direction"], &b["result"], &b["authority"]),
+        (
+            &serde_json::json!("inbound"),
+            &serde_json::json!("ok"),
+            &serde_json::json!("cart.shop.svc:80")
+        ),
+        "{b}"
+    );
+    assert!(b["duration_ms"].as_u64().unwrap() >= 150, "{b}");
+    assert!(b.get("upstream").is_none(), "{b}");
+    let c = line("/c");
+    assert_eq!(
+        (&c["status"], &c["reason"], &c["method"]),
+        (
+            &serde_json::json!(503),
+            &serde_json::json!("overloaded"),
+            &serde_json::json!("POST")
+        ),
+        "{c}"
+    );
+    assert!(c["duration_ms"].as_u64().unwrap() <= 50, "{c}");
+    let a = line("/");
+    assert_eq!(a["status"], 200, "{a}");
+    assert!(a.get("reason").is_none(), "{a}");
+
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(
+            &scrape,
+            "mimic_http_requests_total{",
+            &["direction=\"inbound\"", "status_class=\"5xx\""]
+        ),
+        2.0,
+        "{scrape}"
+    );
+    counted(
+        &f.metrics,
+        "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"synthetic\"} 2",
+    )
+    .await;
+    counted(
+        &f.metrics,
+        "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"recorded\"} 1",
+    )
+    .await;
+    let report = discovery.report();
+    let templates: Vec<String> = report.endpoints().into_iter().map(|e| e.template).collect();
+    assert_eq!(templates, ["/"]);
 }

@@ -1003,3 +1003,303 @@ fn ldt_11_one_request_at_a_time_stops_at_the_end_of_each_request() {
     let mut c = Codec::new();
     assert_eq!(c.client_bytes_limited(&all).0, all.len());
 }
+
+/// What a fresh codec says of `bytes`: whether it frames a request (a `Request` and no
+/// `Unframed`), and its events.
+fn codec_frames(bytes: &[u8]) -> bool {
+    let mut codec = Codec::new().one_request_at_a_time();
+    let (_, events) = codec.client_bytes_limited(bytes);
+    events.iter().any(|e| matches!(e, Event::Request(_)))
+        && !events.iter().any(|e| matches!(e, Event::Unframed(_)))
+}
+
+/// The `RequestEnd` events of a fresh codec fed `head` and then `body` in a second call.
+fn ends_after(head: &[u8], body: &[u8]) -> (Vec<u64>, Vec<u64>) {
+    let mut codec = Codec::new().one_request_at_a_time();
+    let first = request_ends(&codec.client_bytes(head));
+    let second = request_ends(&codec.client_bytes(body));
+    (first, second)
+}
+
+#[test]
+fn adm_20_held_request_frames_a_head_as_the_codec_does() {
+    use RequestBody as B;
+    use Version::{Http10 as V10, Http11 as V11};
+    // (name, bytes, the body when framed, the version of the head, close, expect)
+    let cases: Vec<(
+        &str,
+        &[u8],
+        Option<RequestBody>,
+        Option<Version>,
+        bool,
+        bool,
+    )> = vec![
+        (
+            "get",
+            b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "head",
+            b"HEAD /a HTTP/1.1\r\nHost: a\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "cl 0",
+            b"POST /a HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "cl 1024",
+            b"POST /a HTTP/1.1\r\nContent-Length: 1024\r\n\r\n",
+            Some(B::Length(1024)),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "cl 65536",
+            b"POST /a HTTP/1.1\r\ncontent-length: 65536\r\n\r\n",
+            Some(B::Length(65536)),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "chunked",
+            b"POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            Some(B::Chunked),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "gzip, chunked",
+            b"POST /a HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            Some(B::Chunked),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "chunked, gzip",
+            b"POST /a HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+            None,
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "cl and te",
+            b"POST /a HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+            None,
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "two lengths",
+            b"POST /a HTTP/1.1\r\nContent-Length: 5, 6\r\n\r\n",
+            None,
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "te on 1.0",
+            b"POST /a HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+            None,
+            Some(V10),
+            false,
+            false,
+        ),
+        (
+            "obs-fold first",
+            b"GET /a HTTP/1.1\r\n x: folded\r\n\r\n",
+            None,
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "obs-fold after a framing field",
+            b"POST /a HTTP/1.1\r\nContent-Length: 1\r\n 2\r\n\r\n",
+            None,
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "obs-fold elsewhere",
+            b"GET /a HTTP/1.1\r\nX-A: 1\r\n continued\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "close in a list",
+            b"GET /a HTTP/1.1\r\nConnection: Keep-Alive, CLOSE\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            true,
+            false,
+        ),
+        (
+            "close alone",
+            b"GET /a HTTP/1.1\r\nconnection: close\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            true,
+            false,
+        ),
+        (
+            "keep-alive",
+            b"GET /a HTTP/1.1\r\nConnection: keep-alive\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "expect",
+            b"POST /a HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n",
+            Some(B::Length(10)),
+            Some(V11),
+            false,
+            true,
+        ),
+        (
+            "leading blank lines",
+            b"\r\n\r\nGET /a HTTP/1.1\r\nHost: a\r\n\r\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "bare lf",
+            b"\nGET /a HTTP/1.1\nHost: a\n\n",
+            Some(B::None),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "http/1.0",
+            b"GET /a HTTP/1.0\r\nHost: a\r\n\r\n",
+            Some(B::None),
+            Some(V10),
+            false,
+            false,
+        ),
+        (
+            "body after",
+            b"POST /a HTTP/1.1\r\nContent-Length: 4\r\n\r\nbodyGET /n HTTP/1.1\r\n\r\n",
+            Some(B::Length(4)),
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "incomplete head",
+            b"GET /a HTTP/1.1\r\nHost: a\r\n",
+            None,
+            Some(V11),
+            false,
+            false,
+        ),
+        (
+            "incomplete line",
+            b"GET /a HTTP/1.1",
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            "bad start line",
+            b"BAD\r\nHost: a\r\n\r\n",
+            None,
+            None,
+            false,
+            false,
+        ),
+    ];
+    for (name, bytes, body, version, close, expect) in cases {
+        let held = held_request(bytes);
+        assert_eq!(held.head.as_ref().map(|h| h.version), version, "{name}");
+        assert_eq!(
+            held.framing.is_some(),
+            codec_frames(bytes),
+            "{name}: as the codec"
+        );
+        assert_eq!(held.framing.as_ref().map(|f| f.body), body, "{name}");
+        let Some(framing) = held.framing else {
+            continue;
+        };
+        assert_eq!((framing.close, framing.expect), (close, expect), "{name}");
+        let end = framing.end;
+        // `end` is where the codec's head ends: one byte less is not a request yet.
+        assert!(codec_frames(&bytes[..end]), "{name}: end");
+        assert!(!codec_frames(&bytes[..end - 1]), "{name}: end - 1");
+        match framing.body {
+            B::None => assert_eq!(ends_after(&bytes[..end], b""), (vec![0], vec![]), "{name}"),
+            B::Length(n) => {
+                let n = usize::try_from(n).unwrap();
+                let short = ends_after(&bytes[..end], &vec![b'x'; n - 1]);
+                assert_eq!(short, (vec![], vec![]), "{name}: n - 1 bytes");
+                let whole = ends_after(&bytes[..end], &vec![b'x'; n]);
+                assert_eq!(whole, (vec![], vec![n as u64]), "{name}: n bytes");
+            }
+            B::Chunked => {
+                assert_eq!(
+                    ends_after(&bytes[..end], b"0\r\n\r\n"),
+                    (vec![], vec![0]),
+                    "{name}"
+                );
+            }
+        }
+        // The head is the codec's own, host included.
+        let mut codec = Codec::new();
+        assert_eq!(
+            held.head,
+            Some(req(&codec.client_bytes(&bytes[..end]))),
+            "{name}"
+        );
+    }
+    // An unframed head is read as the codec names it in its `Unframed` event.
+    let held = held_request(
+        b"POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    assert_eq!(
+        held.head
+            .as_ref()
+            .map(|h| (h.path.as_str(), h.host.as_deref())),
+        Some(("/u", Some("a")))
+    );
+    let held = held_request(b"GET /i HTTP/1.1\r\nHost: a\r\n");
+    assert_eq!(
+        held.head
+            .as_ref()
+            .map(|h| (h.path.as_str(), h.host.as_deref())),
+        Some(("/i", None))
+    );
+    // The codec's limits: a head of 64 KiB without its end is not framed.
+    let mut big = b"GET /b HTTP/1.1\r\n".to_vec();
+    while big.len() <= HEAD_LIMIT {
+        big.extend_from_slice(b"x-pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    big.extend_from_slice(b"\r\n");
+    assert_eq!(held_request(&big).framing, None);
+    assert!(!codec_frames(&big));
+}

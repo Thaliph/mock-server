@@ -149,6 +149,47 @@ pub enum Captured {
     ResponseBody(Vec<u8>),
 }
 
+/// How the body of a request held whole is framed (see [`held_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBody {
+    None,
+    Length(u64),
+    Chunked,
+}
+
+/// A whole request head the codec frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestFraming {
+    /// Bytes of the head: leading blank lines and its blank line included.
+    pub end: usize,
+    pub body: RequestBody,
+    /// A `Connection` field holds the token `close` (any case, any list position).
+    pub close: bool,
+    /// An `Expect` field, any value.
+    pub expect: bool,
+}
+
+/// What [`held_request`] read of the request head at the start of some bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRequest {
+    /// The request line read as the codec reads it (with `host` once the head is whole); `None`
+    /// when no complete request line parses.
+    pub head: Option<RequestHead>,
+    /// `Some` only for a whole head that [`Codec::client_bytes`] would frame.
+    pub framing: Option<RequestFraming>,
+}
+
+/// Reads at most one head at the start of `held`, with the codec's own rules (limits, line
+/// syntax, framing); the bytes after its blank line are not read. A relay that holds a head
+/// and answers it itself decides from this where the request ends.
+pub fn held_request(held: &[u8]) -> HeldRequest {
+    let _ = held;
+    HeldRequest {
+        head: None,
+        framing: None,
+    }
+}
+
 /// What a head says about its body and its upgrade, before the direction-specific rules.
 struct Fields {
     content_lengths: Vec<u64>,
