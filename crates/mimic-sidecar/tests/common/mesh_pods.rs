@@ -8,12 +8,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::view::{Limits, View};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
+
+use super::{Answer, h2_client, h2_send};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -26,13 +28,44 @@ pub struct Counts {
     pub open: Arc<AtomicUsize>,
     /// Requests being served now.
     pub in_flight: Arc<AtomicUsize>,
+    /// The most requests served at once.
+    pub max_in_flight: Arc<AtomicUsize>,
     /// How long each request is held before it is answered, in milliseconds.
     pub delay_ms: Arc<AtomicU64>,
     /// When each request arrived, in order.
     pub arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    /// Every request the pod answered: its method and its whole body, in arrival order.
+    pub seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+}
+
+/// A request as a fake pod read it: its method and its whole body.
+pub type Seen = (String, Vec<u8>);
+
+/// A request being served: counted in `in_flight`, and in `max_in_flight`, until dropped.
+pub struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Counts {
+    /// A request starts being served.
+    pub fn enter(&self) -> InFlight {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        InFlight(self.in_flight.clone())
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
     }
@@ -66,7 +99,7 @@ impl Drop for OpenGuard {
 async fn answer(
     name: String,
     counts: Counts,
-    _req: Request<hyper::body::Incoming>,
+    req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     counts
         .arrivals
@@ -74,12 +107,23 @@ async fn answer(
         .unwrap()
         .push(std::time::Instant::now());
     counts.requests.fetch_add(1, Ordering::SeqCst);
-    counts.in_flight.fetch_add(1, Ordering::SeqCst);
+    let in_flight = counts.enter();
+    let (parts, body) = req.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|whole| whole.to_bytes().to_vec())
+        .unwrap_or_default();
+    counts
+        .seen
+        .lock()
+        .unwrap()
+        .push((parts.method.to_string(), body));
     let delay = counts.delay_ms.load(Ordering::SeqCst);
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
-    counts.in_flight.fetch_sub(1, Ordering::SeqCst);
+    drop(in_flight);
     Ok(Response::builder()
         .header("x-pod", name.as_str())
         .body(Full::new(Bytes::from(name)))
@@ -384,16 +428,22 @@ pub fn view_services(services: &[Svc]) -> View {
     View::from_json(&text, &Limits::default()).unwrap()
 }
 
-/// A meshed state of seed 21 holding the view of `services` (etag `"1-a"`), with `configure`
-/// applied to its config first.
-pub fn mesh_state(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
+/// A meshed state (`MIMIC_MESH=on`, seed 21) of the pod `pod`, holding no view, with
+/// `configure` applied to its config first: the one builder of the tests' mesh states.
+pub fn meshed(pod: Option<&str>, configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
     let mut config = MeshConfig {
         enabled: true,
         seed: Some(21),
+        pod: pod.map(str::to_string),
         ..MeshConfig::default()
     };
     configure(&mut config);
-    let state = MeshState::new(&config);
+    MeshState::new(&config)
+}
+
+/// [`meshed`], holding the view of `services` (etag `"1-a"`).
+pub fn mesh_state(services: &[Svc], configure: impl FnOnce(&mut MeshConfig)) -> MeshState {
+    let state = meshed(None, configure);
     state.hold(view_services(services), "\"1-a\"");
     state
 }
@@ -652,4 +702,51 @@ impl Blackhole {
         });
         counts
     }
+}
+
+/// An `h2c` request `method /p` with `body` through the sidecar, on a new connection: the
+/// answer, or the error.
+pub async fn h2_call(addr: SocketAddr, method: &str, body: Vec<u8>) -> Result<Answer, String> {
+    h2_send(&mut h2_client(addr).await, method, "/p", &[], body).await
+}
+
+/// `method /p` with `body` on `client`: the head and the body of the answer.
+pub async fn h1_request(client: &mut H1Client, method: &str, body: &[u8]) -> (String, Vec<u8>) {
+    let mut request = format!(
+        "{method} /p HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    client.send(&request).await;
+    client.read().await.expect("an answer")
+}
+
+/// `n` bytes that are not all alike.
+pub fn payload(n: usize) -> Vec<u8> {
+    (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect()
+}
+
+/// `mimic_mesh_retries_total` of `reason`, every backend.
+pub fn retries(metrics: &str, reason: &str) -> f64 {
+    super::metric(
+        metrics,
+        "mimic_mesh_retries_total{",
+        &[&format!("reason=\"{reason}\"")],
+    )
+}
+
+/// Not HTTP, not TLS, not the HTTP/2 preface; includes `NUL` bytes.
+pub const BINARY: &[u8] = b"\x00\x01binary\xff\x00protocol-bytes";
+
+/// Sends `bytes` on a new connection to `addr` and reads them back.
+pub async fn echoed(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
+    let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+    c.write_all(bytes).await.unwrap();
+    let mut got = vec![0u8; bytes.len()];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut got))
+        .await
+        .expect("an echo in time")
+        .expect("an echo");
+    got
 }

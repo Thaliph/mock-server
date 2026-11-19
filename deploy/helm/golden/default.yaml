@@ -630,6 +630,24 @@ spec:
                     x-kubernetes-validations:
                       - rule: "has(self.delay) || has(self.abort)"
                         message: "faults[] needs a delay or an abort"
+                admission:
+                  description: >-
+                    Admission contract of each pod of the Deployment (spec §4.1 "Admission contract"): at most
+                    `concurrency` requests in flight and `rps` per second, a queue of a tenth of `concurrency` for
+                    150 ms, the rest answered 503. Absent: no admission control. Deployment targets only.
+                  type: object
+                  required: [concurrency, rps]
+                  properties:
+                    concurrency:
+                      description: Requests in flight per pod, 1 to 100000.
+                      type: integer
+                      minimum: 1
+                      maximum: 100000
+                    rps:
+                      description: Requests per second per pod, 1 to 1000000.
+                      type: integer
+                      minimum: 1
+                      maximum: 1000000
               x-kubernetes-validations:
                 - rule: "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')"
                   message: "destinations fit a Deployment target only"
@@ -647,6 +665,8 @@ spec:
                   message: "circuitBreaker fits a Service target only"
                 - rule: "!has(self.faults) || self.targetRefs.exists(t, t.kind == 'Service')"
                   message: "faults fit a Service target only"
+                - rule: "!has(self.admission) || self.targetRefs.exists(t, t.kind == 'Deployment')"
+                  message: "admission fits a Deployment target only"
 
 ---
 # Source: mimic/templates/rbac.yaml

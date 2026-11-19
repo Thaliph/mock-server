@@ -6,11 +6,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod admission;
 pub mod faults;
 pub mod mesh_pods;
 pub mod mock_rig;
+pub mod prx_corpus;
 pub mod tls_rig;
 
+use http_body_util::Full;
+use hyper::body::Bytes;
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::listener::{Direction, OriginalDst, Shared, TunnelMetrics, spawn_listener};
 use mimic_sidecar::red::ProxyMetrics;
@@ -129,7 +133,20 @@ pub async fn fixture_mesh_dst(
     state: &mimic_sidecar::mesh::MeshState,
     discovery: Option<&mimic_sidecar::discovery::Discovery>,
 ) -> Fixture {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    fixture_mesh_on(Direction::Outbound, original_dst, state, discovery, |s| s).await
+}
+
+/// Like [`fixture_mesh_dst`], on the side `direction`, with `configure` applied to the shared
+/// state before the listener starts.
+pub async fn fixture_mesh_on(
+    direction: Direction,
+    original_dst: OriginalDst,
+    state: &mimic_sidecar::mesh::MeshState,
+    discovery: Option<&mimic_sidecar::discovery::Discovery>,
+    configure: impl FnOnce(Shared) -> Shared,
+) -> Fixture {
+    // The sidecar's own bind (backlog 1024): bursts of connections are not reset.
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
@@ -142,8 +159,8 @@ pub async fn fixture_mesh_dst(
         discovery.register(&mut metrics);
         shared = shared.with_discovery(discovery.tap());
     }
-    let shared = Arc::new(shared);
-    spawn_listener(listener, Direction::Outbound, shared.clone());
+    let shared = Arc::new(configure(shared));
+    spawn_listener(listener, direction, shared.clone());
     Fixture {
         addr,
         shared,
@@ -310,19 +327,99 @@ pub fn median(mut values: Vec<u64>) -> u64 {
     values[values.len() / 2]
 }
 
-pub type H2Sender =
-    hyper::client::conn::http2::SendRequest<http_body_util::Empty<hyper::body::Bytes>>;
+pub type H2Sender = hyper::client::conn::http2::SendRequest<Full<Bytes>>;
 
 /// An `h2c` client over one connection.
 pub async fn h2_client(addr: SocketAddr) -> H2Sender {
     let stream = TcpStream::connect(addr).await.unwrap();
     let (sender, connection) =
         hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .handshake::<_, http_body_util::Empty<hyper::body::Bytes>>(
-                hyper_util::rt::TokioIo::new(stream),
-            )
+            .handshake::<_, Full<Bytes>>(hyper_util::rt::TokioIo::new(stream))
             .await
             .unwrap();
     tokio::spawn(connection);
     sender
+}
+
+/// One answer as the client saw it.
+#[derive(Debug)]
+pub struct Answer {
+    pub status: u16,
+    /// Every field, sorted.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// From just before the request was sent to the end of the body.
+    pub elapsed: Duration,
+}
+
+impl Answer {
+    /// The first value of the field `name`.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.header("x-mimic-error")
+    }
+}
+
+/// Sends `method path` (on `cart.shop.svc`) with `headers` and `body` on `sender` and reads the
+/// whole answer, or the error; at most 10 s.
+pub async fn h2_send(
+    sender: &mut H2Sender,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Result<Answer, String> {
+    use http_body_util::BodyExt;
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(format!("http://cart.shop.svc{path}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request.body(Full::new(Bytes::from(body))).unwrap();
+    let start = std::time::Instant::now();
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), async {
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let (head, body) = response.into_parts();
+        let body = body.collect().await.map_err(|e| format!("{e:?}"))?;
+        Ok::<_, String>((head, body.to_bytes().to_vec()))
+    })
+    .await
+    .map_err(|_| "no answer in time".to_string())??;
+    let mut headers: Vec<(String, String)> = head
+        .headers
+        .iter()
+        .map(|(n, v)| {
+            (
+                n.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    Ok(Answer {
+        status: head.status.as_u16(),
+        headers,
+        body,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// Reads to the end of the connection (at most 10 s): a reset is an error, a FIN gives the
+/// bytes.
+pub async fn read_all(c: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out))
+        .await
+        .expect("the end of the connection in time")?;
+    Ok(out)
 }

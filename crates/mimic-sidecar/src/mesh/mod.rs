@@ -3,6 +3,7 @@
 //! the view, the persisted last view, the classification of outbound connections, and the
 //! balancing of the in-scope cleartext HTTP ones over the pods of the view (spec §7.9).
 
+mod admit;
 mod dial;
 mod follow;
 mod gate;
@@ -16,7 +17,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,7 @@ use prometheus_client::registry::Unit;
 use crate::discovery::Target;
 use router::Router;
 
+pub(crate) use admit::{Admitter, Slot};
 pub use follow::Follower;
 pub use replay::{Replay, ReplayBudget};
 pub(crate) use router::Backend;
@@ -110,6 +112,14 @@ pub struct MeshConfig {
     pub mirror_timeout: Duration,
     /// A fixed seed for the random draws (tests); `None`: seeded from the system.
     pub seed: Option<u64>,
+    /// Tests only (ADM-29): a pod address dialled at another address, as the callee pod's own
+    /// redirection to its sidecar does in a cluster. In one network namespace a sidecar cannot
+    /// both be reached at the pod address and dial its app there, so a test that runs meshed
+    /// callers and callees in process names the apps as the pods and dials their sidecars.
+    /// Never read from the environment, the view or any API: only a test that builds a
+    /// `MeshConfig` in code fills it, and [`MeshConfig::from_env`] leaves it empty.
+    #[doc(hidden)]
+    pub redirect: BTreeMap<SocketAddr, SocketAddr>,
 }
 
 impl Default for MeshConfig {
@@ -135,6 +145,7 @@ impl Default for MeshConfig {
             mirror_max_in_flight_total: mirror::MAX_IN_FLIGHT_TOTAL,
             mirror_timeout: Duration::from_millis(mirror::TIMEOUT_MS),
             seed: None,
+            redirect: BTreeMap::new(),
         }
     }
 }
@@ -208,6 +219,8 @@ impl MeshConfig {
                 defaults.retry_buffer_total,
                 MIB..=64 * MIB,
             )?,
+            // Tests only, never from the environment (ADM-29).
+            redirect: BTreeMap::new(),
             ..defaults
         })
     }
@@ -439,6 +452,8 @@ struct Inner {
     pod: Option<String>,
     /// Set once a view is held: readiness stays.
     seen: AtomicBool,
+    /// The pod's admission contract, from the view held (spec §4.1 "Admission contract").
+    admitter: Admitter,
 }
 
 /// The view held by the sidecar, shared between the client, the listeners and the probes.
@@ -488,20 +503,9 @@ impl MeshState {
             pod: config.pod.clone().filter(|pod| {
                 mimic_core::mesh::retry::origin(format!("inbound; pod={pod}").as_bytes())
             }),
-            router: Router::new(
-                config.pool_idle_timeout,
-                config.max_endpoint_labels,
-                config.seed,
-                config.connect_timeout,
-                config.avoid_failed_for,
-                config.refusal_delay,
-                router::MirrorConfig {
-                    max_in_flight: config.mirror_max_in_flight,
-                    max_in_flight_total: config.mirror_max_in_flight_total,
-                    timeout: config.mirror_timeout,
-                },
-            ),
+            router: Router::new(config),
             seen: AtomicBool::new(false),
+            admitter: Admitter::new(),
         }))
     }
 
@@ -670,6 +674,8 @@ impl MeshState {
         self.0.router.apply(&view);
         let table = Arc::new(Table::build_routed(&view, &self.0.router));
         let (services, endpoints) = (view.services.len(), view.endpoint_count());
+        // Pulled or persisted alike; a view of `"mesh": false` has none (spec §4.1).
+        self.0.admitter.set_contract(view.admission);
         *self.0.table.write().unwrap_or_else(PoisonError::into_inner) = table;
         self.0
             .services
@@ -779,10 +785,27 @@ impl MeshState {
     /// the `x-mimic-origin` value to write, and the count.
     pub(crate) fn inbound_refusal(&self) -> String {
         self.0.router.metrics.inbound_refusal();
+        self.origin()
+    }
+
+    /// The `x-mimic-origin` value of an answer the inbound side writes itself (spec §4.1); it
+    /// counts nothing.
+    pub(crate) fn origin(&self) -> String {
         match &self.0.pod {
             Some(pod) => format!("inbound; pod={pod}"),
             None => "inbound".to_string(),
         }
+    }
+
+    /// The admission state of the pod's inbound requests (spec §4.1 "Admission contract").
+    pub(crate) fn admitter(&self) -> &Admitter {
+        &self.0.admitter
+    }
+
+    /// Test hook (#453): the admission counts now.
+    #[doc(hidden)]
+    pub fn admission_counts_for_test(&self) -> mimic_core::mesh::admission::Counts {
+        self.0.admitter.counts()
     }
 
     /// `n` `x-mimic-*` fields were removed from a response of the app.
@@ -830,7 +853,8 @@ impl MeshState {
         }
     }
 
-    /// Ticks every second until `stop` completes.
+    /// Ticks every second until `stop` completes. Once `MIMIC_MESH_STARTUP_WAIT` has passed
+    /// without a view, held or persisted, the contract is unknown: one warning (spec §4.1).
     pub async fn run_age(self, stop: impl std::future::Future<Output = ()>) {
         let ticking = async {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -839,9 +863,15 @@ impl MeshState {
                 self.tick();
             }
         };
+        let unknown = async {
+            tokio::time::sleep_until((self.0.started + self.0.startup_wait).into()).await;
+            if !self.0.seen.load(Ordering::Acquire) {
+                tracing::warn!(target: "mesh", "admission contract unknown");
+            }
+        };
         tokio::select! {
             () = stop => {}
-            () = ticking => {}
+            ((), ()) = async { tokio::join!(unknown, ticking) } => {}
         }
     }
 

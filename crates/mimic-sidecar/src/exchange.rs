@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response, StatusCode};
+use mimic_core::mesh::admission::Refusal;
 use mimic_core::mesh::fault;
 use mimic_core::mesh::timeout::Kind;
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
@@ -296,6 +297,12 @@ impl Ctx {
     }
 }
 
+/// The authority a request names, by its target or its `Host`, normalised; `None` when it names
+/// none (the metrics then use the destination).
+fn authority_of(ctx: &Ctx, uri_authority: Option<&str>, host: Option<&str>) -> Option<String> {
+    target_authority(uri_authority, host).map(|raw| normalise_authority(raw, ctx.default_port()))
+}
+
 impl Tracker {
     /// Starts the observation of `req` and wraps its body.
     pub(crate) fn start(
@@ -308,8 +315,7 @@ impl Tracker {
             .headers()
             .get(header::HOST)
             .map(|host| host.to_str().unwrap_or(""));
-        let named_authority = target_authority(req.uri().authority().map(|a| a.as_str()), host)
-            .map(|raw| normalise_authority(raw, ctx.default_port()));
+        let named_authority = authority_of(ctx, req.uri().authority().map(|a| a.as_str()), host);
         let authority = named_authority
             .clone()
             .unwrap_or_else(|| ctx.dst.to_string());
@@ -801,6 +807,111 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
     });
 }
 
+/// What a refusal line may say of its request: no header value, query or body.
+pub struct RefusedRequest<'a> {
+    pub method: Option<&'a str>,
+    pub path: Option<&'a str>,
+    pub uri_authority: Option<&'a str>,
+    pub host: Option<&'a str>,
+}
+
+impl<'a> RefusedRequest<'a> {
+    /// What an HTTP/1 head read by the codec says, if one was read.
+    pub(crate) fn http1(head: Option<&'a RequestHead>) -> RefusedRequest<'a> {
+        RefusedRequest {
+            method: head.map(|h| h.method.as_str()),
+            path: head.map(|h| h.path.as_str()),
+            uri_authority: head.and_then(|h| h.uri_authority.as_deref()),
+            host: head.and_then(|h| h.host.as_deref()),
+        }
+    }
+}
+
+/// A request the inbound admission refused (spec §4.1 "Observability"): counted in the RED
+/// metrics with its `503`, counted as synthetic by discovery when the tap is active, and one
+/// access line with the reason. Nothing of it is captured.
+pub(crate) fn admission_refused(
+    ctx: &Ctx,
+    protocol: &'static str,
+    tap: Option<&Tap>,
+    request: &RefusedRequest<'_>,
+    reason: Refusal,
+    duration: Duration,
+) {
+    const STATUS: u16 = 503;
+    let authority = authority_of(ctx, request.uri_authority, request.host)
+        .unwrap_or_else(|| ctx.dst.to_string());
+    if let Some(tap) = tap.filter(|tap| tap.active()) {
+        tap.synthetic_exchange(ctx.direction == Direction::Outbound);
+    }
+    ctx.proxy
+        .request(ctx.direction, protocol, &authority, Some(STATUS), duration);
+    access::exchange(&access::Exchange {
+        direction: ctx.direction,
+        protocol,
+        dst: ctx.dst,
+        authority,
+        method: request.method.map(str::to_string),
+        path: request.path.map(str::to_string),
+        status: Some(STATUS),
+        grpc_status: None,
+        upgrade: false,
+        tls: ctx.tls,
+        outcome: Outcome::Ok,
+        duration: Some(duration),
+        head: Some(duration),
+        bytes_in: 0,
+        bytes_out: 0,
+        mock: None,
+        mock_miss: None,
+        load_run: None,
+        backend: None,
+        upstream: None,
+        attempts: None,
+        route: None,
+        rule: None,
+        timeout: None,
+        mirrored: false,
+        reason: Some(reason.as_str()),
+        fault: None,
+        fault_delay_ms: None,
+    });
+}
+
+/// The observation of the admission refusals of one inbound HTTP/1 connection.
+#[derive(Clone)]
+pub struct RefusalLog {
+    ctx: Ctx,
+    tap: Option<Tap>,
+}
+
+impl RefusalLog {
+    pub(crate) fn new(ctx: Ctx, tap: Option<Tap>) -> RefusalLog {
+        RefusalLog { ctx, tap }
+    }
+
+    /// The original destination: the endpoint a refusal names.
+    pub(crate) fn dst(&self) -> SocketAddr {
+        self.ctx.dst
+    }
+
+    pub(crate) fn refused(
+        &self,
+        request: &RefusedRequest<'_>,
+        reason: Refusal,
+        duration: Duration,
+    ) {
+        admission_refused(
+            &self.ctx,
+            PROTOCOL_H1,
+            self.tap.as_ref(),
+            request,
+            reason,
+            duration,
+        );
+    }
+}
+
 /// An HTTP/1 exchange seen by the codec and not written yet.
 struct Open {
     started: Instant,
@@ -879,11 +990,8 @@ impl Http1Tracker {
 
     fn authority(&self, request: Option<&RequestHead>) -> String {
         request
-            .and_then(|r| target_authority(r.uri_authority.as_deref(), r.host.as_deref()))
-            .map_or_else(
-                || self.ctx.dst.to_string(),
-                |raw| normalise_authority(raw, self.ctx.default_port()),
-            )
+            .and_then(|r| authority_of(&self.ctx, r.uri_authority.as_deref(), r.host.as_deref()))
+            .unwrap_or_else(|| self.ctx.dst.to_string())
     }
 
     pub(crate) fn event(&mut self, event: Event) {

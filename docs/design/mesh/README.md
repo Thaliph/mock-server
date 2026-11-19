@@ -5,7 +5,7 @@
 > and diagrams drawn from the code under `crates/mimic-core/src/mesh` and
 > `crates/mimic-sidecar/src/mesh`. They change no behaviour. The forward design is
 > [`../mimic-mesh.md`](../mimic-mesh.md); the contract is [`docs/SPEC.md`](../../SPEC.md)
-> (§7.9 and the criteria of §12.20 to §12.28), and the spec wins wherever a page here differs.
+> (§7.9 and the criteria of §12.20 to §12.29), and the spec wins wherever a page here differs.
 
 ## Pages
 
@@ -17,9 +17,10 @@
 | M3 | [Routes, timeouts, mirrors](m3-routes.md) | #447, #448, #449, #450 | `RTE-01` to `RTE-96` (§12.23 to §12.26) | delivered, except the mirror cost of `RTE-94` (#542) |
 | M4 | [Outlier detection and circuit breaker](m4-outlier-breaker.md) | #451 | `CBR-01` to `CBR-36` (§12.27) | delivered |
 | M4 | [Fault injection](m4-faults.md) | #452 | `FLT-01` to `FLT-32` (§12.28) | delivered with #452 |
+| M5 | [The admission contract in the inbound sidecar](m5-admission.md) | #453 | `ADM-01` to `ADM-34` (§12.29) | delivered with #453 |
 
-Admission (M5) and the north-south gateway (M6) are not started. Mesh traffic management beyond these
-milestones is v2.
+The signalling (#454) and autoscaling (#455) of M5 and the north-south gateway (M6) are not started. Mesh
+traffic management beyond these milestones is v2.
 
 ## One request through the mesh, and which milestone added each step
 
@@ -41,6 +42,10 @@ flowchart LR
   Try --> Response["Response to the app"]
 ```
 
+On the callee's side, the inbound sidecar of each pod applies its admission contract before its app sees a
+request (M5, [m5-admission.md](m5-admission.md)): a refusal `overloaded` or `queue-timeout` names the pod, and the
+caller's sidecar retries it on another pod at the "proxy-level failure" edge above.
+
 ## Conventions of the pages
 
 - Every page has the goal, the key decisions (each with its reason and the issue where it was
@@ -61,6 +66,6 @@ flowchart LR
 
 | Layer | Modules |
 |---|---|
-| `mimic-core` (pure: no tokio, no I/O, no clock; times and random draws are passed in) | `mesh::input`, `mesh::policy`, `mesh::view`, `mesh::route`, `mesh::lb`, `mesh::retry`, `mesh::timeout`, `mesh::mirror`, `mesh::outlier`, `mesh::fault`, `mesh::strip`, `mesh::head` |
+| `mimic-core` (pure: no tokio, no I/O, no clock; times and random draws are passed in) | `mesh::input`, `mesh::policy`, `mesh::view`, `mesh::route`, `mesh::lb`, `mesh::retry`, `mesh::timeout`, `mesh::mirror`, `mesh::outlier`, `mesh::fault`, `mesh::admission`, `mesh::strip`, `mesh::head` |
 | `mimic-controller` | `mesh::watch` (reflectors), `mesh::convert` (objects to input structs), `mesh::hub` (debounce, build, cache, long-poll), `mesh::status` (`MimicConfig` and `HTTPRoute` status), `mesh::config`, `mesh::metrics` |
-| `mimic-sidecar` | `mesh::follow` (long-poll), `mesh::store` (state file), `mesh::router` (per-port tables, budgets, outlier state, breaker counts), `mesh::serve` (per-request path), `mesh::dial` (L4 and TLS), `mesh::pool`, `mesh::replay` (body bytes held for retries and mirrors), `mesh::gate` (the HTTP/1 head reader in front of `hyper`), `mesh::metrics` |
+| `mimic-sidecar` | `mesh::follow` (long-poll), `mesh::store` (state file), `mesh::router` (per-port tables, budgets, outlier state, breaker counts), `mesh::serve` (per-request path), `mesh::dial` (L4 and TLS), `mesh::pool`, `mesh::replay` (body bytes held for retries and mirrors), `mesh::gate` (the HTTP/1 head reader in front of `hyper`), `mesh::admit` (the pod's admission state and its queue timer), `mesh::metrics` |

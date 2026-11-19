@@ -115,6 +115,9 @@ cleanup() {
   if [[ -n ${FLT_27_CLEANUP:-} ]]; then
     kubectl delete namespace flt-27 flt-27-b --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${ADM_31_CLEANUP:-} ]]; then
+    kubectl delete namespace adm-31 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n ${RTE_55_CLEANUP:-} ]]; then
     kubectl delete namespace rte-55 --ignore-not-found --wait=false >/dev/null 2>&1 || true
     [[ -z ${RTE_55_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -565,7 +568,35 @@ mc_denied_with "spec.faults[0].match.path.type" "a RegularExpression path" flt-d
   faults: [{match: {path: {type: RegularExpression, value: /c.*}}, abort: {percent: 10, status: 503}}]"
 mc_denied_with "faults fit a Service target only" "faults with only a Deployment target" flt-d10 "$mc_dep
   faults: [{abort: {percent: 10, status: 503}}]"
+# ADM-13 (#453): admission, bounds, required fields and target kind.
+log "adm_13: the MimicConfig CRD accepts admission within its bounds on a Deployment and refuses each one out of them"
+mc_id=adm_13
+mc_accepted "admission 1/1" adm-a1 "$mc_dep
+  admission: {concurrency: 1, rps: 1}"
+mc_accepted "admission 100000/1000000" adm-a2 "$mc_dep
+  admission: {concurrency: 100000, rps: 1000000}"
+[[ $(kubectl -n default get mimicconfig adm-a2 -o jsonpath='{.spec.admission.concurrency} {.spec.admission.rps}') == "100000 1000000" ]] \
+  || fail "adm_13: the admission 100000/1000000 was not kept"
+mc_accepted "admission on a config with both target kinds" adm-a3 '  targetRefs:
+    - {group: apps, kind: Deployment, name: cart}
+    - {group: "", kind: Service, name: cart}
+  admission: {concurrency: 64, rps: 200}'
+mc_denied_with spec.admission.concurrency "concurrency 0" adm-d1 "$mc_dep
+  admission: {concurrency: 0, rps: 10}"
+mc_denied_with spec.admission.concurrency "concurrency 100001" adm-d2 "$mc_dep
+  admission: {concurrency: 100001, rps: 10}"
+mc_denied_with spec.admission.concurrency "an admission without concurrency" adm-d3 "$mc_dep
+  admission: {rps: 10}"
+mc_denied_with spec.admission.rps "rps 0" adm-d4 "$mc_dep
+  admission: {concurrency: 10, rps: 0}"
+mc_denied_with spec.admission.rps "rps 1000001" adm-d5 "$mc_dep
+  admission: {concurrency: 10, rps: 1000001}"
+mc_denied_with spec.admission.rps "an admission without rps" adm-d6 "$mc_dep
+  admission: {concurrency: 10}"
+mc_denied_with "admission fits a Deployment target only" "admission with only a Service target" adm-d7 "$mc_svc
+  admission: {concurrency: 10, rps: 10}"
 mc_id=msh_17
+kubectl -n default delete mimicconfig adm-a1 adm-a2 adm-a3 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig flt-a1 flt-a2 flt-a3 flt-a4 flt-a5 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig rty-a1 rty-a2 rty-a3 rty-a4 rty-a5 rty-a6 rty-a7 rty-a8 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig msh1 msh2 msh3 msh4 --ignore-not-found >/dev/null
@@ -6551,6 +6582,244 @@ e2e_until flt_27 30 "20 GET /fail were not all 200 under 500 ms within 30 s of t
 kubectl delete namespace flt-27 flt-27-b --wait=false >/dev/null
 FLT_27_CLEANUP=
 echo "flt_27: the config aborted 20 /fail ($flt_27_aborts aborts), delayed 20 requests at least $flt_27_min ms ($flt_27_delays delays), and none once deleted"
+
+# --- Admission contract (#453, spec §12.29 ADM-31) ---------------------------------------------------------------------
+# Objects of this section only: adm-31 (injected, privileged: cart, a Deployment of 3 pods under a MimicConfig admission
+# 1/1000 whose app answers after 300 ms; client, an injected caller; outside, a pod that is not injected). outside holds
+# the slot of one cart pod with a request to its pod IP that the app answers after 120 s; the hold is killed at the end
+# of the section and by the trap. Python test services; the namespace is deleted at the end and by the trap.
+log "adm_31: a busy pod's refusals are retried by an injected caller, answered with its fields to a non-meshed one, gone once the config is deleted"
+ADM_31_CLEANUP=1
+ns_fresh adm-31 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+cat > "$WORK/adm31-pod.py" <<'PY'
+import http.server
+import socket
+import threading
+import time
+
+NAME = socket.gethostname().encode()
+HOLD = 120
+DELAY = 0.3
+lock = threading.Lock()
+count = 0
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def answer(self):
+        global count
+        if self.path == "/__count":
+            with lock:
+                body = str(count).encode()
+        else:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            with lock:
+                count += 1
+            time.sleep(HOLD if self.path == "/hold" else DELAY)
+            body = NAME
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+Server(("", 8080), Handler).serve_forever()
+PY
+kubectl -n adm-31 create configmap pod --from-file=pod.py="$WORK/adm31-pod.py" >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cart, namespace: adm-31}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: cart}}
+  template:
+    metadata: {labels: {app: cart}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, /srv/pod.py]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /__count, port: 8080}, periodSeconds: 1}
+          volumeMounts: [{name: srv, mountPath: /srv}]
+      volumes: [{name: srv, configMap: {name: pod}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: cart, namespace: adm-31}
+spec:
+  selector: {app: cart}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: adm-31}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: outside, namespace: adm-31}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: outside}}
+  template:
+    metadata: {labels: {app: outside, mimic.platform.io/inject: disabled}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for d in cart client outside; do
+  kubectl -n adm-31 rollout status deploy/$d --timeout=3m >/dev/null || fail "adm_31: $d did not roll out Ready"
+done
+adm_31_client=$(kubectl -n adm-31 get pods -l app=client -o jsonpath='{.items[0].metadata.name}') \
+  || fail "adm_31: cannot find the client pod"
+adm_31_outside=$(kubectl -n adm-31 get pods -l app=outside -o jsonpath='{.items[0].metadata.name}') \
+  || fail "adm_31: cannot find the outside pod"
+adm_31_containers=$(kubectl -n adm-31 get pod "$adm_31_outside" -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}')
+! found -w mimic-sidecar <<<"$adm_31_containers" || fail "adm_31: the outside pod has a sidecar"
+read -ra adm_31_pods <<<"$(kubectl -n adm-31 get pods -l app=cart -o jsonpath='{.items[*].metadata.name}')"
+(( ${#adm_31_pods[@]} == 3 )) || fail "adm_31: cart has ${#adm_31_pods[@]} pods, 3 expected"
+adm_31_view() { [[ $(rty_metric adm-31 "$adm_31_client" mimic_mesh_view_endpoints) == 3 ]]; }
+e2e_until adm_31 60 "the sidecar of client never held a view with the 3 endpoints of cart" adm_31_view
+# Slow start (default 30 s, spec §7.9): every pod past its window before the hold starts.
+sleep 31
+
+cat > "$WORK/adm31-direct.py" <<'PY'
+import http.client
+import sys
+
+host, path, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+c = http.client.HTTPConnection(host, 8080, timeout=timeout)
+c.request("GET", path)
+r = c.getresponse()
+r.read()
+fields = [r.getheader(n) or "-" for n in ("x-mimic-error", "x-mimic-endpoint", "x-mimic-origin")]
+print(r.status, *fields)
+PY
+cat > "$WORK/adm31-client.py" <<'PY'
+import http.client
+
+body = b"p" * 64
+for _ in range(60):
+    try:
+        c = http.client.HTTPConnection("cart.adm-31.svc", 80, timeout=10)
+        c.request("POST", "/p", body=body)
+        r = c.getresponse()
+        r.read()
+        c.close()
+        print(r.status)
+    except Exception:
+        print(0)
+PY
+kubectl -n adm-31 exec -i "$adm_31_outside" -c app -- python3 -c 'import sys; open("/tmp/direct.py", "w").write(sys.stdin.read())' \
+  < "$WORK/adm31-direct.py" || fail "adm_31: cannot copy the direct script"
+kubectl -n adm-31 exec -i "$adm_31_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/adm31-client.py" || fail "adm_31: cannot copy the client script"
+# adm_31_count <pod>: the requests the app of a cart pod counted (GET /__count from inside it, not counted).
+adm_31_count() {
+  kubectl -n adm-31 exec "$1" -c app -- python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/__count").read().decode())'
+}
+# adm_31_applied <pod>: the mesh view applied lines of the pod's sidecar so far.
+adm_31_applied() { tls_count adm-31 "$1" '.message == "mesh view applied"'; }
+# adm_31_grew <pod> <count>: whether the pod's sidecar applied a view since the count was taken.
+adm_31_grew() { (( $(adm_31_applied "$1") > $2 )); }
+# adm_31_all_grew: whether every cart pod's sidecar applied a view since adm_31_before was taken.
+adm_31_all_grew() {
+  local i
+  for i in "${!adm_31_pods[@]}"; do adm_31_grew "${adm_31_pods[$i]}" "${adm_31_before[$i]}" || return 1; done
+}
+# adm_31_direct <path>: the line "<status> <x-mimic-error> <x-mimic-endpoint> <x-mimic-origin>" of a GET from the
+# outside pod to the busy pod's IP.
+adm_31_direct() { kubectl -n adm-31 exec "$adm_31_outside" -c app -- python3 /tmp/direct.py "$adm_31_ip" "$1" 10; }
+
+# The contract: every cart pod's sidecar enforces it once it applied a view after the config.
+adm_31_before=()
+for adm_31_pod in "${adm_31_pods[@]}"; do
+  adm_31_before+=("$(adm_31_applied "$adm_31_pod")") || fail "adm_31: cannot read the logs of $adm_31_pod"
+done
+kubectl apply -f - >/dev/null <<YAML || fail "adm_31: the MimicConfig cart-admission was rejected"
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: cart-admission, namespace: adm-31}
+spec:
+  targetRefs: [{group: apps, kind: Deployment, name: cart}]
+  admission: {concurrency: 1, rps: 1000}
+YAML
+e2e_until adm_31 30 "the MimicConfig cart-admission is not Accepted: True" flt_27_is adm-31 cart-admission True/Accepted
+e2e_until adm_31 60 "a cart pod's sidecar applied no mesh view after the config" adm_31_all_grew
+
+# The hold: one request to the busy pod's IP, admitted, that its app answers after 120 s.
+adm_31_busy=${adm_31_pods[0]}
+adm_31_ip=$(kubectl -n adm-31 get pod "$adm_31_busy" -o jsonpath='{.status.podIP}')
+[[ -n $adm_31_ip ]] || fail "adm_31: cannot read the IP of $adm_31_busy"
+adm_31_held=$(adm_31_count "$adm_31_busy") || fail "adm_31: cannot read the count of $adm_31_busy"
+kubectl -n adm-31 exec "$adm_31_outside" -c app -- python3 /tmp/direct.py "$adm_31_ip" /hold 130 >/dev/null 2>&1 &
+adm_31_hold=$!
+PIDS+=("$adm_31_hold")
+held_at=$SECONDS
+adm_31_holding() { (( $(adm_31_count "$adm_31_busy") == adm_31_held + 1 )); }
+e2e_until adm_31 10 "the app of $adm_31_busy never counted the held request" adm_31_holding
+
+# A non-meshed caller gets the busy pod's own refusal.
+adm_31_out=$(adm_31_direct /direct) || fail "adm_31: the direct script failed"
+adm_31_want="503 queue-timeout $adm_31_ip:8080 inbound; pod=$adm_31_busy"
+[[ $adm_31_out == "$adm_31_want" ]] || fail "adm_31: the direct GET printed '$adm_31_out', '$adm_31_want' expected"
+
+# An injected caller retries the busy pod's refusals on the other pods.
+adm_31_out=$(kubectl -n adm-31 exec "$adm_31_client" -c app -- python3 /tmp/client.py) \
+  || fail "adm_31: the client script failed"
+adm_31_ok=$(grep -c '^200$' <<<"$adm_31_out" || true)
+(( adm_31_ok == 60 )) || fail "adm_31: $adm_31_ok of 60 POST were 200: $(sort <<<"$adm_31_out" | uniq -c | tr '\n' ' ')"
+adm_31_retried=$(rty_metric_sum adm-31 "$adm_31_client" mimic_mesh_retries_total 'reason="queue_timeout"')
+adm_31_retried=${adm_31_retried%.*}
+(( adm_31_retried >= 1 )) || fail "adm_31: the client's sidecar retried no queue-timeout refusal"
+adm_31_lines=$(tls_count adm-31 "$adm_31_busy" '.target == "access" and .reason == "queue-timeout"')
+(( adm_31_lines >= 1 + adm_31_retried )) \
+  || fail "adm_31: the busy pod's sidecar wrote $adm_31_lines queue-timeout lines, at least $((1 + adm_31_retried)) expected"
+
+# The config deleted: once the busy pod's sidecar applied the view, the same direct GET reaches its app.
+adm_31_before=("$(adm_31_applied "$adm_31_busy")") || fail "adm_31: cannot read the logs of $adm_31_busy"
+kubectl -n adm-31 delete mimicconfig cart-admission >/dev/null || fail "adm_31: cannot delete the MimicConfig cart-admission"
+e2e_until adm_31 60 "the busy pod's sidecar applied no mesh view after the delete" adm_31_grew "$adm_31_busy" "${adm_31_before[0]}"
+# Past 110 s the hold may have ended, and a 200 would prove nothing.
+(( SECONDS - held_at < 110 )) || fail "adm_31: the view took until $((SECONDS - held_at)) s into the 120 s hold"
+adm_31_count_before=$(adm_31_count "$adm_31_busy") || fail "adm_31: cannot read the count of $adm_31_busy"
+adm_31_out=$(adm_31_direct /direct) || fail "adm_31: the direct script failed after the delete"
+[[ $adm_31_out == "200 - - -" ]] || fail "adm_31: the direct GET printed '$adm_31_out' after the delete, '200 - - -' expected"
+adm_31_count_after=$(adm_31_count "$adm_31_busy") || fail "adm_31: cannot read the count of $adm_31_busy"
+(( adm_31_count_after == adm_31_count_before + 1 )) \
+  || fail "adm_31: the app of $adm_31_busy counted $((adm_31_count_after - adm_31_count_before)) requests for the direct GET"
+
+kill_tree "$adm_31_hold"
+wait "$adm_31_hold" 2>/dev/null || true
+kubectl delete namespace adm-31 --wait=false >/dev/null
+ADM_31_CLEANUP=
+echo "adm_31: 60 POST were 200 with $adm_31_retried queue-timeout retries ($adm_31_lines refusal lines on $adm_31_busy), the direct GET was 503 with the pod's fields, then 200 once the config was deleted"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

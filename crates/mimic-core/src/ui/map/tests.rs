@@ -65,6 +65,7 @@ pub(super) fn config(ns: &str, name: &str, created: i64, dests: &[(&str, &str)])
         outlier_detection: None,
         circuit_breaker: None,
         faults: None,
+        admission: None,
     }
 }
 

@@ -668,7 +668,7 @@ a micro-benchmark (`criterion`) covers the pure code.
 | M2 | No failure: no change vs M1 beyond noise (≤ 0.2 ms p50). One of three pods refusing connections: error rate seen by the client 0 %, p99 ≤ M1 + 5 ms. |
 | M3 | Route match ≤ 10 µs for 100 rules (criterion); canary 90/10 within ±2 % over 10 000 requests; mirror adds ≤ 0.2 ms p50 to the primary call. |
 | M4 | Outlier ejection within 5 failing requests; breaker answers ≤ 1 ms. |
-| M5 | Under the contract: ≤ 0.5 ms added p99 vs M4; refusal answered ≤ 1 ms after the decision; queue wait never above 160 ms (150 + scheduling); at 2× the contract the admitted rate stays within ±5 % of `rps`. |
+| M5 | Under the contract: ≤ 0.5 ms added p90 vs the same run without a contract (ABBA pairs; the p99 is recorded, it is scheduling noise over a 50 ms backend, SPEC ADM-32); refusal answered ≤ 1 ms after the decision; queue wait never above 160 ms (150 + scheduling); at 2× the contract the admitted rate stays within ±5 % of `rps`. |
 | M6 | Gateway hop p99 ≤ the M1 sidecar hop + 1 ms at 200 rps. |
 
 If B0 already shows that this machine cannot sustain 200 rps cleanly, the budgets are taken at

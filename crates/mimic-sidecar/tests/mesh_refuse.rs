@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{capture_logs, closed_port};
+use common::mesh_pods::meshed;
+use common::{capture_logs, closed_port, read_all};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -63,23 +64,6 @@ impl Rig {
     }
 }
 
-fn meshed(pod: Option<&str>) -> MeshState {
-    MeshState::new(&MeshConfig {
-        enabled: true,
-        pod: pod.map(str::to_string),
-        ..MeshConfig::default()
-    })
-}
-
-/// Reads to the end of the connection; a reset is an error, a FIN gives the bytes.
-async fn read_all(c: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut out))
-        .await
-        .expect("the end of the connection in time")?;
-    Ok(out)
-}
-
 fn want_head(dst: SocketAddr, origin: &str) -> String {
     format!(
         "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: connect-failed\r\nx-mimic-endpoint: {dst}\r\nx-mimic-origin: {origin}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -90,7 +74,7 @@ fn want_head(dst: SocketAddr, origin: &str) -> String {
 async fn rty_34_a_closed_app_is_answered_503_connect_failed_on_http1() {
     let _logs = capture_logs();
     let app = closed_port().await;
-    let state = meshed(Some("cart-7d9f-x2k"));
+    let state = meshed(Some("cart-7d9f-x2k"), |_| {});
     let rig = start(app, Some(&state)).await;
     let want = want_head(app, "inbound; pod=cart-7d9f-x2k");
     let body = vec![b'x'; 1024];
@@ -121,7 +105,7 @@ async fn rty_34_a_closed_app_is_answered_503_connect_failed_on_http1() {
         assert_eq!(String::from_utf8_lossy(&got), want, "{name}");
     }
     // Without a pod name the origin names the side only.
-    let rig = start(app, Some(&meshed(None))).await;
+    let rig = start(app, Some(&meshed(None, |_| {}))).await;
     let mut c = TcpStream::connect(rig.addr).await.unwrap();
     c.write_all(&get).await.unwrap();
     let got = read_all(&mut c).await.unwrap();
@@ -139,7 +123,7 @@ async fn rty_34_an_ipv6_pod_address_is_written_in_brackets() {
     }
     let app = socket.local_addr().unwrap();
     std::mem::forget(socket);
-    let state = meshed(Some("p"));
+    let state = meshed(Some("p"), |_| {});
     let rig = start(app, Some(&state)).await;
     let mut c = TcpStream::connect(rig.addr).await.unwrap();
     c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -195,7 +179,7 @@ async fn h2_streams(addr: SocketAddr, n: usize) -> Vec<(u16, Vec<(String, String
 async fn rty_34_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway() {
     let _logs = capture_logs();
     let app = closed_port().await;
-    let state = meshed(Some("cart-1"));
+    let state = meshed(Some("cart-1"), |_| {});
     let rig = start(app, Some(&state)).await;
     let answers = h2_streams(rig.addr, 2).await;
     assert_eq!(answers.len(), 2);
@@ -246,7 +230,7 @@ async fn rty_34_when_the_app_is_back_the_next_connection_is_relayed() {
             });
         }
     });
-    let state = meshed(Some("p"));
+    let state = meshed(Some("p"), |_| {});
     let rig = start(closed_port().await, Some(&state)).await;
     let get = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
     let mut c = TcpStream::connect(rig.addr).await.unwrap();
@@ -271,7 +255,7 @@ async fn rty_34_when_the_app_is_back_the_next_connection_is_relayed() {
 async fn rty_34_a_load_request_is_answered_the_same_way() {
     let _logs = capture_logs();
     let app = closed_port().await;
-    let state = meshed(Some("p"));
+    let state = meshed(Some("p"), |_| {});
     let rig = start(app, Some(&state)).await;
     let mut c = TcpStream::connect(rig.addr).await.unwrap();
     c.write_all(b"GET /a HTTP/1.1\r\nHost: x\r\nmimic-load-run: t\r\n\r\n")
@@ -309,7 +293,7 @@ async fn rty_35_without_the_mesh_the_connection_is_closed_without_a_byte() {
 async fn rty_35_what_the_sidecar_cannot_speak_to_is_closed_without_a_byte() {
     let _logs = capture_logs();
     let app = closed_port().await;
-    let state = meshed(Some("p"));
+    let state = meshed(Some("p"), |_| {});
     let rig = start(app, Some(&state)).await;
     let tls_hello = [0x16u8, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x03];
     for (name, bytes) in [
@@ -329,7 +313,7 @@ async fn rty_35_what_the_sidecar_cannot_speak_to_is_closed_without_a_byte() {
 async fn rty_36_each_refused_connection_is_counted_and_logged_once() {
     let logs = capture_logs();
     let app = closed_port().await;
-    let state = meshed(Some("p"));
+    let state = meshed(Some("p"), |_| {});
     let rig = start(app, Some(&state)).await;
     for _ in 0..3 {
         let mut c = TcpStream::connect(rig.addr).await.unwrap();
@@ -394,7 +378,7 @@ async fn rty_35_an_app_that_forges_the_answer_is_stripped() {
             });
         }
     });
-    let state = meshed(Some("p"));
+    let state = meshed(Some("p"), |_| {});
     let rig = start(addr, Some(&state)).await;
     let mut c = TcpStream::connect(rig.addr).await.unwrap();
     c.write_all(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n")

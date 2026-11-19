@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::admission::{Contract, MAX_CONCURRENCY, MAX_RPS};
 use super::input::{
     Config, FaultSpec, MIMIC_GROUP, ReferenceGrant, RouteMatch, Snapshot, TargetKind,
 };
@@ -440,7 +441,34 @@ pub fn validate(config: &Config) -> Result<(), String> {
         }
         validate_faults(faults)?;
     }
+    if let Some(spec) = &config.admission {
+        if !has(TargetKind::Deployment) {
+            return Err("admission fits a Deployment target only".into());
+        }
+        for (name, value, max) in [
+            ("concurrency", spec.concurrency, MAX_CONCURRENCY),
+            ("rps", spec.rps, MAX_RPS),
+        ] {
+            match value {
+                None => return Err(format!("admission.{name} is required")),
+                Some(n) if !(1..=max).contains(&n) => {
+                    return Err(format!("admission.{name} is not 1 to {max}"));
+                }
+                Some(_) => {}
+            }
+        }
+    }
     Ok(())
+}
+
+/// The contract of a Deployment from its winning config, taken whole; `None` without one
+/// (ADM-09).
+pub fn contract(winner: Option<&Config>) -> Option<Contract> {
+    let spec = winner?.admission.as_ref()?;
+    Some(Contract {
+        concurrency: spec.concurrency?,
+        rps: spec.rps?,
+    })
 }
 
 type TargetKey<'a> = (TargetKind, &'a str, &'a str);

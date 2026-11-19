@@ -13,7 +13,7 @@ use bytes::Bytes;
 use common::faults::{abort_on, absent, lower, no_series, status};
 use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, mesh_state, view_services};
 use common::{capture_logs, fixture_mesh, h2_client, median, metric, until};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -130,7 +130,7 @@ async fn h2_call(
     let request = hyper::Request::builder()
         .method(method)
         .uri(format!("http://cart.shop.svc{path}"))
-        .body(Empty::<Bytes>::new())
+        .body(Full::new(Bytes::new()))
         .unwrap();
     let response = sender.send_request(request).await.expect("an answer");
     let header = |name: &str| {

@@ -4,7 +4,7 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    AbortSpec, BreakerSpec, DelaySpec, Destination, GrantFrom, GrantTo, OutlierSpec,
+    AbortSpec, AdmissionSpec, BreakerSpec, DelaySpec, Destination, GrantFrom, GrantTo, OutlierSpec,
     RetryBudgetSpec, Target, TargetKind, TargetPort,
 };
 use mimic_core::mesh::policy::validate;
@@ -439,4 +439,88 @@ fn flt_03_a_fixed_that_does_not_parse_or_is_over_60s_makes_the_config_invalid_ne
     assert!(validate(&c).is_err(), "an abort without percent");
     let c = fault_config(json!([{"abort": {"percent": "1", "status": -1}}]));
     assert!(validate(&c).is_err());
+}
+
+fn admission_config(admission: serde_json::Value) -> mimic_core::mesh::input::Config {
+    service_config(json!({
+        "targetRefs": [{"group": "apps", "kind": "Deployment", "name": "cart"}],
+        "admission": admission
+    }))
+}
+
+#[test]
+fn adm_11_admission_converts_both_fields_and_is_none_when_absent() {
+    for (concurrency, rps) in [(64, 200), (1, 1), (100_000, 1_000_000)] {
+        let c = admission_config(json!({"concurrency": concurrency, "rps": rps}));
+        assert_eq!(
+            c.admission,
+            Some(AdmissionSpec {
+                concurrency: Some(concurrency),
+                rps: Some(rps)
+            })
+        );
+        assert_eq!(validate(&c), Ok(()));
+    }
+    let c = service_config(
+        json!({"targetRefs": [{"group": "apps", "kind": "Deployment", "name": "cart"}]}),
+    );
+    assert_eq!(c.admission, None);
+    assert_eq!(validate(&c), Ok(()));
+}
+
+#[test]
+fn adm_11_a_value_the_api_server_did_not_check_makes_the_config_invalid_never_a_panic() {
+    let values = [
+        json!(0),
+        json!(100_001),
+        json!(-1),
+        json!("64"),
+        json!(1.5),
+        json!(null),
+        json!(10_000_000_000u64),
+    ];
+    // A value that cannot be read is out of bounds, not absent.
+    for bad in &values {
+        let c = admission_config(json!({"concurrency": bad, "rps": 200}));
+        assert_eq!(
+            validate(&c),
+            Err("admission.concurrency is not 1 to 100000".into()),
+            "{bad}"
+        );
+    }
+    for bad in values.iter().filter(|v| **v != json!(100_001)) {
+        let c = admission_config(json!({"concurrency": 64, "rps": bad}));
+        assert_eq!(
+            validate(&c),
+            Err("admission.rps is not 1 to 1000000".into()),
+            "{bad}"
+        );
+    }
+    let c = admission_config(json!({"concurrency": 64, "rps": 1_000_001}));
+    assert!(
+        validate(&c)
+            .expect_err("rps over")
+            .contains("admission.rps")
+    );
+    let c = admission_config(json!({"rps": 5}));
+    assert!(
+        validate(&c)
+            .expect_err("no concurrency")
+            .contains("admission.concurrency")
+    );
+    let c = admission_config(json!({"concurrency": 5}));
+    assert!(validate(&c).expect_err("no rps").contains("admission.rps"));
+    for shape in [json!({}), json!(5), json!([]), json!(null)] {
+        let c = admission_config(shape.clone());
+        let err = validate(&c).expect_err("must not validate");
+        assert!(err.contains("admission."), "{shape}: {err}");
+    }
+    let c = service_config(json!({
+        "targetRefs": [{"group": "", "kind": "Service", "name": "cart"}],
+        "admission": {"concurrency": 64, "rps": 200}
+    }));
+    assert_eq!(
+        validate(&c),
+        Err("admission fits a Deployment target only".into())
+    );
 }

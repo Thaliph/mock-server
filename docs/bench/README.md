@@ -447,6 +447,32 @@ runs `mesh-breaker` with 32 connections and at least 10 % breaker-open answers. 
 | 2026-11-15 | mesh-eject | h2c | 200 | 199.92 | 9.78 | 10.93 | 13.29 | 16.46 | 0 | 0.262 | 0.123 | 17 | 14.7 |
 | 2026-11-15 | mesh-breaker | http1 | 200 | 199.64 | 5.71 | 56.01 | 59.61 | 59.97 | 4488 | 0.17 | 0.021 | 18.5 | 14.2 |
 | 2026-11-15 | mesh-breaker | h2c | 200 | 199.58 | 3.59 | 56.15 | 59.84 | 66.13 | 4488 | 0.137 | 0.027 | 18.9 | 14.4 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 50 | 49.89 | 59.18 | 67.91 | 69.99 | 76.68 | 0 | 0.057 | 0.02 | 18.3 | 15.2 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 50 | 49.87 | 59.01 | 67.84 | 69.97 | 73.35 | 0 | 0.053 | 0.019 | 18.8 | 15.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 50 | 49.9 | 59.02 | 68.09 | 74.24 | 77.32 | 0 | 0.057 | 0.02 | 19.1 | 15.6 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 50 | 49.89 | 59.93 | 67.46 | 69.16 | 69.33 | 0 | 0.054 | 0.019 | 19.2 | 15.7 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 100 | 99.78 | 59.06 | 65.38 | 66.83 | 66.98 | 0 | 0.108 | 0.037 | 19.5 | 15.7 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 100 | 99.78 | 58.66 | 65.87 | 67.63 | 67.8 | 0 | 0.108 | 0.038 | 19.6 | 15.9 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 100 | 99.79 | 58.82 | 67.11 | 69.16 | 69.36 | 0 | 0.108 | 0.038 | 19.6 | 15.9 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 100 | 99.79 | 58.73 | 67.67 | 69.93 | 74.16 | 0 | 0.109 | 0.038 | 19.6 | 16 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 200 | 199.57 | 59.26 | 67.84 | 69.86 | 72.77 | 0 | 0.217 | 0.075 | 19.6 | 16 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 200 | 199.54 | 60.29 | 68.46 | 78.01 | 122.74 | 0 | 0.213 | 0.075 | 20 | 16 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | http1 | 200 | 199.56 | 59.98 | 68.03 | 69.84 | 71.6 | 0 | 0.221 | 0.078 | 20.1 | 16 |
+| 2026-11-19 | mesh-admission (no admission) | http1 | 200 | 199.57 | 59.16 | 67.85 | 69.92 | 77.9 | 0 | 0.216 | 0.075 | 20.2 | 16.1 |
+| 2026-11-19 | mesh-admission (admission 64/30, 2x) | http1 | 180 | 176.75 | 172.35 | 224.25 | 389.95 | 566.34 | 2638 | 0.241 | 0.064 | 23.1 | 16.1 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 50 | 49.89 | 64.48 | 69.43 | 76.47 | 77.79 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 50 | 49.88 | 64.24 | 69.17 | 75.31 | 77.43 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 50 | 49.87 | 64.28 | 69.41 | 78.94 | 80.54 | 0 | 0.065 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 50 | 49.89 | 64.21 | 68.99 | 71.04 | 72.72 | 0 | 0.066 | 0.023 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 100 | 99.79 | 64.34 | 69.23 | 76.9 | 79.2 | 0 | 0.128 | 0.045 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 100 | 99.7 | 64.2 | 69.38 | 80.08 | 88.89 | 0 | 0.13 | 0.045 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 100 | 99.76 | 64.19 | 69.11 | 73 | 74.53 | 0 | 0.129 | 0.045 | 23.2 | 16.6 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 100 | 99.78 | 64.19 | 69.05 | 72.77 | 74.94 | 0 | 0.125 | 0.045 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 200 | 199.53 | 64.18 | 69.07 | 76.39 | 81.46 | 0 | 0.255 | 0.089 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 200 | 199.55 | 64.41 | 69.21 | 75.46 | 77.46 | 0 | 0.26 | 0.09 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (admission 64/1000) | h2c | 200 | 199.53 | 64.29 | 69.16 | 76.84 | 79.78 | 0 | 0.256 | 0.09 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (no admission) | h2c | 200 | 199.52 | 64.27 | 69.13 | 74.95 | 77.39 | 0 | 0.254 | 0.09 | 23.2 | 16.7 |
+| 2026-11-19 | mesh-admission (admission 64/30, 2x) | h2c | 180 | 176.73 | 170.42 | 224.8 | 390.08 | 542.72 | 2637 | 0.257 | 0.077 | 23.2 | 16.7 |
 
 | Check | Result | Budget | Verdict |
 |---|---|---|---|
@@ -468,3 +494,69 @@ the same way with no mirror: 8.42 to 8.55 ms and 10.02 to 10.15 ms (the "no rout
 above), so +0.0 to +0.11 ms and -0.12 to +0.01 ms: within 0.2 ms. Against the runs of the day before the spread of
 the machine is larger than the budget (M1 `mesh-lb` 8.19 / 9.69 ms: +0.34 / +0.34 ms; M2 8.74 / 10.54 ms: -0.21 /
 -0.51 ms), so the comparison is meaningful only within a session.
+
+## M5: admission contract (#453, ADM-32)
+
+Setup `mesh-admission` measures the admission contract of the callee sidecars (SPEC §4.1 "Admission contract")
+against design §14. It has the topology of `mesh-breaker` (backend of 3 injected pods, mode discovery, `delay=50ms`
+asked in the URL, 32 connections) without its `MimicConfig`, and switches one `MimicConfig fortio-admission` on the
+backend Deployment. It runs last. It is not in the default matrix.
+
+```sh
+SETUPS=mesh-admission RATES="50 100 200" scripts/bench.sh   # 13 runs per protocol
+SETUPS=mesh-admission scripts/bench.sh --dry-run            # the plan, nothing started
+```
+
+- For each protocol and rate, four runs in ABBA order: without any admission contract (`adm-off`), under
+  `admission: {concurrency: 64, rps: 1000}` per pod (`adm-under`, which never binds: 200 rps over 3 pods is about
+  67 per pod), under it again, then without it again. A drift over the four runs cancels in the pair, whose sides
+  are each the mean of their two runs.
+- These runs log every request's latency (fortio `-access-log-file /dev/stderr`), and the pairs use the exact
+  p50, p90 and p99 of those latencies. Fortio's own percentiles cannot tell 0.5 ms here: its histogram has 10 ms
+  buckets around the 50 ms backend (60 to 70 ms, then 70 ms to the largest sample), and it interpolates a
+  percentile inside its bucket, so a few requests on either side of 70 ms, or the largest one, move its p99 by
+  milliseconds. In the first run of this setup (2026-11-19, `adm-off` then `adm-under`), the p99 differed by +0.1
+  to +4.4 ms while the p50 differed by -0.3 to +0.4 ms; at http1 50 rps the p99 delta (+2.76 ms) was that of the
+  two largest samples (+2.90 ms) times 0.95.
+- Then one run per protocol under `admission: {concurrency: 64, rps: 30}` per pod (`adm-over`), at twice the rps
+  of the 3 pods: 180 rps, with 64 connections so that the refusals (up to 150 ms in the queue) do not slow the load,
+  fortio's `-allow-initial-errors`, and `-uniform`. Without `-uniform` the 64 connections send together, in bursts
+  3 times a second, and each pod's bucket (`rps / 10` = 3 tokens) is full between them: the tokens it cannot hold
+  are lost, and the first run (2026-11-19, #553) admitted 22.2 to 23.0 rps per pod instead of 30.
+- Each change of the contract waits, up to 60 s, until the config is `Accepted` and every backend sidecar
+  pulled a view after it (`mimic_mesh_view_pulls_total{result="ok"}`), then 2 s.
+- For each `adm-over` run, the script records per backend pod the deltas of its inbound requests
+  (`mimic_http_requests_total{direction="inbound"}`, all and `2xx`) and the `duration_ms` of its sidecar's
+  refusal lines, grouped by `reason`, read with `kubectl logs --since-time` at the end of the run (kubelet
+  rotates a container log at about 10 MiB).
+
+The verdicts are in `mesh.admission` of `<date>-mesh-admission.json`. A false one adds the setup to the failed
+setups (exit 1 once the file is written):
+
+| Check | Budget |
+|---|---|
+| Per protocol, the median over the rates of the added p90 under the contract (`pair_medians[].median_delta_p90_ms`, from `pairs[].delta_p90_ms`), and no error under it; the p50 and p99 deltas are recorded only | at most +0.5 ms |
+| Load sent in an `adm-over` run (`over[].actual_qps`) | at least 95 % of 180 rps |
+| Admitted rate per pod (`2xx` delta over fortio's `ActualDuration`) | within 5 % of 30 rps per pod |
+| p99 of the `duration_ms` of the `overloaded` lines | at most 1 ms |
+| Longest `duration_ms` of a `queue-timeout` line (counts per millisecond in `queue_timeout_ms_counts`) | at most 160 ms |
+
+The p99 of a 30 s run moved by −10.5 to +8.3 ms between paired runs on a quiet machine, both signs, while the p90 stayed within ±0.5 ms: ADM-32 judges the p90 (#453). Compare only the runs of one session.
+The callers' retries and fortio's warm-up add offers, and the tokens still cap the admitted rate (the bias is at most
+the burst, 3, per pod and run). Results of 2026-11-19 (quiet machine, `2026-11-19-mesh-admission.json`, rows above):
+
+| Check | Result | Budget | Verdict |
+|---|---|---|---|
+| h2c: median over 50/100/200 rps of the p90 delta (ABBA pairs) | +0.258 ms (-0.095, +0.258, +0.401) | at most +0.5 ms | met |
+| http1: median over 50/100/200 rps of the p90 delta | -0.021 ms (-0.228, -0.021, +0.407) | at most +0.5 ms | met |
+| p50 deltas (recorded) | -0.412 to +0.338 ms | — | — |
+| p99 deltas (recorded) | h2c +0.65 to +1.53 ms, http1 -0.37 to +3.62 ms | — | — |
+| errors under the contract | 0 | 0 | met |
+| 2× run, load sent | 176.75 (http1) and 176.73 (h2c) qps | at least 171 qps | met |
+| 2× run, admitted per pod | 30.41 to 30.47 rps | within 5 % of 30 rps | met |
+| `overloaded` p99 `duration_ms` | 0 ms (about 2615 lines per protocol) | at most 1 ms | met |
+| longest `queue-timeout` | 152 ms (about 1530 lines per protocol) | at most 160 ms | met |
+
+The two earlier runs of the day, before the method was fixed, are on #453: one in 64-connection bursts admitted 22 to
+23 rps per pod (the burst of 3 tokens is full again between bursts), and one before ABBA had p99 deltas of -10.5 to
++8.3 ms.

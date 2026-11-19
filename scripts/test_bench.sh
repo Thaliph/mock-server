@@ -278,7 +278,58 @@ ben_12_mesh_eject_and_breaker_planned() {
   check "the default matrix has none of them" lacks "mesh-eject"
   run "SETUPS=mesh-eject-x" -- --dry-run
   check "a misspelt setup exits 2" rc_is 2
-  check "the message names the new setups" has "mesh-eject or mesh-breaker"
+  check "the message names the new setups" has "mesh-eject, mesh-breaker"
+  outdir=""
+}
+
+# adm_32: the mesh-admission setup (ADM-32, #453) is accepted and runs last. Each rate of RATES runs without the
+# admission, then under a contract that never binds; then one run per protocol at twice the contract's rps (per pod),
+# with more connections and the initial errors allowed. The plan names the budgets. Not in the default matrix.
+# runs_with <text> <n>: exactly n run lines hold the text.
+runs_with() { [[ $(grep "^run " <<<"$out" | grep -cF -- "$1") -eq $2 ]]; }
+adm_32_mesh_admission_setup_planned() {
+  mkdir -p "$tmp/out-admission"
+  outdir="$tmp/out-admission"
+  run "SETUPS=mesh-admission mesh-breaker" "PROTOCOLS=http1" "RATES=50 200" -- --dry-run
+  check "mesh-admission is accepted" rc_is 0
+  check "eleven runs" runs_is 11
+  check "ten pauses" pauses_is 10
+  check "mesh-breaker runs first" has "run 1/11 setup mesh-breaker protocol http1 rate 50 rps"
+  check "mesh-breaker takes run 2" has "run 2/11 setup mesh-breaker protocol http1 rate 200 rps"
+  # Each rate in ABBA order: without, under, under, without, so that a drift over the four runs cancels.
+  check "A: the baseline of a rate" has "run 3/11 setup mesh-admission protocol http1 rate 50 rps (no admission)"
+  check "B: the contract at the same rate" has "run 4/11 setup mesh-admission protocol http1 rate 50 rps (admission 64/1000)"
+  check "B: the contract again" has "run 5/11 setup mesh-admission protocol http1 rate 50 rps (admission 64/1000)"
+  check "A: the baseline again" has "run 6/11 setup mesh-admission protocol http1 rate 50 rps (no admission)"
+  check "the next rate starts with its baseline" has "run 7/11 setup mesh-admission protocol http1 rate 200 rps (no admission)"
+  check "and ends with it" has "run 10/11 setup mesh-admission protocol http1 rate 200 rps (no admission)"
+  check "the over run comes last, at 180 rps" has "run 11/11 setup mesh-admission protocol http1 rate 180 rps (admission 64/30, 2x)"
+  check "the over run asks for 180 rps" runs_with "-qps 180" 1
+  check "the over run has 64 connections" runs_with "-c 64" 1
+  check "only the over run spreads its connections in time" runs_with "-uniform" 1
+  check "only the over run and mesh-breaker allow the initial errors" runs_with "-allow-initial-errors" 3
+  check "the over run allows the initial errors" has "(admission 64/30, 2x): fortio load -qps 180 -t 30s -c 64"
+  check "the other runs have 32 connections" runs_with "-c 32" 10
+  check "every run asks for the 50 ms delay" runs_with "delay=50ms" 11
+  check "the pairs log every request's latency" runs_with "-access-log-file /dev/stderr" 8
+  check "the plan names the order" has "ABBA"
+  check "the plan names the added p90 budget" has "+0.5 ms"
+  check "the plan names the median" has "median"
+  check "the plan names the refusal budget" has "at most 1 ms"
+  check "the plan names the queue-timeout budget" has "at most 160 ms"
+  check "the plan names the rate budget" has "within 5 % of 30 rps per pod"
+  check "the results file of mesh-admission is named" has "$today-mesh-admission.json"
+  check "nothing is run" no_calls
+  run "SETUPS=mesh-admission" "PROTOCOLS=http1 h2c" "RATES=100" -- --dry-run
+  check "two protocols: ten runs" runs_is 10
+  check "one over run per protocol" runs_with "(admission 64/30, 2x)" 2
+  check "the h2c over run" has "run 10/10 setup mesh-admission protocol h2c rate 180 rps (admission 64/30, 2x)"
+  run -- --dry-run
+  check "the default matrix lacks mesh-admission" lacks "mesh-admission"
+  run "SETUPS=mesh-admission-x" -- --dry-run
+  check "a misspelt setup exits 2" rc_is 2
+  check "the message names the setup" has "mesh-breaker or mesh-admission"
+  check "nothing is run" no_calls
   outdir=""
 }
 
@@ -287,7 +338,7 @@ for name in ben_01_arguments_only_dry_run ben_02_invalid_configuration_refused \
   ben_05_images_pinned_by_digest ben_06_lock_held_refused_stale_reclaimed \
   ben_07_outputs_named_and_dry_run_writes_nothing ben_08_namespace_cleanup_trap_planned \
   ben_09_machine_description_fields_no_host_identity ben_10_mesh_refuse_setup_planned \
-  ben_11_16_mesh_setups_plan ben_12_mesh_eject_and_breaker_planned; do
+  ben_11_16_mesh_setups_plan ben_12_mesh_eject_and_breaker_planned adm_32_mesh_admission_setup_planned; do
   lock="$tmp/locks-$name"
   mkdir -p "$lock"
   outdir=""

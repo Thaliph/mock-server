@@ -65,6 +65,7 @@ fn cluster(services: usize, endpoints_each: usize) -> Snapshot {
         outlier_detection: None,
         circuit_breaker: None,
         faults: None,
+        admission: None,
     });
     s
 }

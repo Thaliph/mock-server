@@ -149,6 +149,107 @@ pub enum Captured {
     ResponseBody(Vec<u8>),
 }
 
+/// How the body of a request held whole is framed (see [`held_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBody {
+    None,
+    Length(u64),
+    Chunked,
+}
+
+/// A whole request head the codec frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestFraming {
+    /// Bytes of the head: leading blank lines and its blank line included.
+    pub end: usize,
+    pub body: RequestBody,
+    /// A `Connection` field holds the token `close` (any case, any list position).
+    pub close: bool,
+    /// An `Expect` field, any value.
+    pub expect: bool,
+}
+
+/// How far [`held_request`] read the head at the start of some bytes, with the codec's scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadState {
+    /// Not whole yet, every byte so far valid.
+    Open,
+    /// Whole: its end, leading blank lines and its blank line included. Its framing may still
+    /// be one the codec refuses (see [`HeldRequest::framing`]).
+    Whole(usize),
+    /// A byte the scanner rejects: a line, or a limit ([`HEAD_LIMIT`], [`LINE_LIMIT`]).
+    Unframed,
+}
+
+/// What [`held_request`] read of the request head at the start of some bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRequest {
+    pub state: HeadState,
+    /// The request line read as the codec reads it (with `host` once the head is whole); `None`
+    /// when no complete request line parses.
+    pub head: Option<RequestHead>,
+    /// `Some` only for a whole head that [`Codec::client_bytes`] would frame.
+    pub framing: Option<RequestFraming>,
+}
+
+/// Reads at most one head at the start of `held`, with the codec's own rules (limits, line
+/// syntax, framing); the bytes after its blank line are not read. A relay that holds a head
+/// and answers it itself decides from this where the request ends.
+pub fn held_request(held: &[u8]) -> HeldRequest {
+    let mut scanner = HeadScanner::new(Kind::Request);
+    let (end, scan) = scanner.feed(held);
+    let no_fields = || collect_fields(std::iter::empty());
+    match scan {
+        Scan::Done => {
+            let mut lines = scanner.lines();
+            let start = lines.next().unwrap_or_default();
+            let fields = collect_fields(lines);
+            let head = request_head(start, &fields);
+            let body = head
+                .as_ref()
+                .and_then(|head| fields.framing(true, head.version).ok())
+                .and_then(|framing| match framing {
+                    Framing::Length(n) if n > 0 => Some(RequestBody::Length(n)),
+                    Framing::Length(_) | Framing::None => Some(RequestBody::None),
+                    Framing::Chunked => Some(RequestBody::Chunked),
+                    // Never a request's.
+                    Framing::UntilClose => None,
+                });
+            let framing = body.map(|body| RequestFraming {
+                end,
+                body,
+                close: fields.connection_close,
+                expect: fields.expect,
+            });
+            HeldRequest {
+                state: HeadState::Whole(end),
+                head,
+                framing,
+            }
+        }
+        // As the codec names an unframed head: its first line, no field.
+        Scan::Unframed(_) => HeldRequest {
+            state: HeadState::Unframed,
+            head: scanner
+                .lines()
+                .next()
+                .and_then(|line| request_head(line, &no_fields())),
+            framing: None,
+        },
+        // Only a request line read whole (its line end seen) is one.
+        Scan::More => HeldRequest {
+            state: HeadState::Open,
+            head: scanner
+                .raw()
+                .contains(&b'\n')
+                .then(|| scanner.lines().next())
+                .flatten()
+                .and_then(|line| request_head(line, &no_fields())),
+            framing: None,
+        },
+    }
+}
+
 /// What a head says about its body and its upgrade, before the direction-specific rules.
 struct Fields {
     content_lengths: Vec<u64>,
@@ -159,7 +260,11 @@ struct Fields {
     coding_parameters: bool,
     host: Option<String>,
     connection_upgrade: bool,
+    /// A `connection` field holds the token `close`.
+    connection_close: bool,
     has_upgrade: bool,
+    /// An `expect` field, any value.
+    expect: bool,
 }
 
 enum Framing {
@@ -187,7 +292,9 @@ fn collect_fields<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Fields {
         coding_parameters: false,
         host: None,
         connection_upgrade: false,
+        connection_close: false,
         has_upgrade: false,
+        expect: false,
     };
     for line in lines {
         // A folded continuation belongs to a header that is not a framing header (the
@@ -228,14 +335,14 @@ fn collect_fields<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Fields {
                 f.host = Some(String::from_utf8_lossy(value).into_owned());
             }
         } else if name.eq_ignore_ascii_case(b"connection") {
-            if value
-                .split(|&b| b == b',')
-                .any(|t| trim_ows(t).eq_ignore_ascii_case(b"upgrade"))
-            {
-                f.connection_upgrade = true;
+            for token in value.split(|&b| b == b',').map(trim_ows) {
+                f.connection_upgrade |= token.eq_ignore_ascii_case(b"upgrade");
+                f.connection_close |= token.eq_ignore_ascii_case(b"close");
             }
         } else if name.eq_ignore_ascii_case(b"upgrade") {
             f.has_upgrade = true;
+        } else if name.eq_ignore_ascii_case(b"expect") {
+            f.expect = true;
         }
     }
     f

@@ -14,7 +14,7 @@ use common::mock_rig::{Options, rig_with, users_set};
 use common::{
     H2Sender, Logs, capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until,
 };
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use mimic_core::Mode;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::mode::Announced;
@@ -90,7 +90,7 @@ fn h2_get(sender: &H2Sender) -> JoinHandle<(u16, Option<String>, bool, Duration)
     tokio::spawn(async move {
         let began = Instant::now();
         let request = hyper::Request::get("http://cart.shop.svc/")
-            .body(Empty::<Bytes>::new())
+            .body(Full::new(Bytes::new()))
             .unwrap();
         let response = sender.send_request(request).await.expect("an answer");
         let (status, error, endpoint) = (

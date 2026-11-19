@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::mesh_pods::{EchoPod, H1Client, Pod, cluster_ip, view_on};
+use common::mesh_pods::{
+    EchoPod, H1Client, Pod, cluster_ip, h1_request, h2_call, payload, retries, view_on,
+};
 use common::{capture_logs, closed_port, fixture_mesh};
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
@@ -50,14 +52,6 @@ fn attempts(metrics: &str, result: &str) -> f64 {
         metrics,
         "mimic_mesh_attempts_total{",
         &[&format!("result=\"{result}\"")],
-    )
-}
-
-fn retries(metrics: &str, reason: &str) -> f64 {
-    metric(
-        metrics,
-        "mimic_mesh_retries_total{",
-        &[&format!("reason=\"{reason}\"")],
     )
 }
 
@@ -274,51 +268,6 @@ async fn h2_goaway(requests: Arc<AtomicUsize>, last: u8) -> SocketAddr {
     addr
 }
 
-/// An `h2c` request through the sidecar: the status, the head and the body, or the error.
-async fn h2_call(
-    addr: SocketAddr,
-    method: &str,
-    body: Vec<u8>,
-) -> Result<(u16, hyper::HeaderMap, Vec<u8>), String> {
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
-        .await
-        .unwrap();
-    tokio::spawn(connection);
-    let request = Request::builder()
-        .method(method)
-        .uri("http://cart.shop.svc/p")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_err(|e| format!("{e:?}"))?
-        .to_bytes();
-    Ok((parts.status.as_u16(), parts.headers, body.to_vec()))
-}
-
-async fn h1_request(client: &mut H1Client, method: &str, body: &[u8]) -> (String, Vec<u8>) {
-    let mut request = format!(
-        "{method} /p HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(body);
-    client.send(&request).await;
-    client.read().await.expect("an answer")
-}
-
-fn payload(n: usize) -> Vec<u8> {
-    (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect()
-}
-
 fn lower(head: &str) -> String {
     head.to_lowercase()
 }
@@ -339,8 +288,8 @@ async fn rty_08_a_pod_refusing_connections_is_skipped_by_every_method_and_protoc
             let method = if n % 2 == 0 { "POST" } else { "GET" };
             let sent = if n % 2 == 0 { body.clone() } else { Vec::new() };
             let (status, got) = if h2 {
-                let (status, _, got) = h2_call(f.addr, method, sent).await.unwrap();
-                (status, got)
+                let answer = h2_call(f.addr, method, sent).await.unwrap();
+                (answer.status, answer.body)
             } else {
                 let (head, got) = h1_request(&mut client, method, &sent).await;
                 (head[9..12].parse().unwrap(), got)
@@ -445,7 +394,8 @@ async fn rty_09_refused_streams_and_goaway_are_retried_on_another_pod() {
         let f = fixture_mesh(cluster_ip(), &state, None).await;
         let body = payload(512);
         for _ in 0..20 {
-            let (status, _, got) = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+            let answer = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+            let (status, got) = (answer.status, answer.body);
             assert_eq!(status, 200);
             assert_eq!(got, b"ok");
         }
@@ -483,7 +433,8 @@ async fn rty_09_an_internal_error_reset_is_retried_for_a_get_and_not_for_a_post(
     let state = state_for(cluster_ip(), &[broken, ok.addr], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     for _ in 0..10 {
-        let (status, _, got) = h2_call(f.addr, "GET", Vec::new()).await.unwrap();
+        let answer = h2_call(f.addr, "GET", Vec::new()).await.unwrap();
+        let (status, got) = (answer.status, answer.body);
         assert_eq!((status, got), (200, b"ok".to_vec()));
     }
     let single = state_for(cluster_ip(), &[broken], |_| {});
@@ -901,7 +852,8 @@ async fn rty_14_an_h2c_post_in_the_buffer_is_retried() {
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let body = payload(60 * 1024);
     for _ in 0..10 {
-        let (status, _, got) = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+        let answer = h2_call(f.addr, "POST", body.clone()).await.unwrap();
+        let (status, got) = (answer.status, answer.body);
         assert_eq!((status, got), (200, b"ok".to_vec()));
     }
     assert!(ok.seen.lock().unwrap().iter().all(|(_, b, _)| *b == body));
@@ -1243,8 +1195,8 @@ async fn rty_37_a_post_refused_by_a_callee_app_is_retried_on_another_pod() {
             let method = if n % 2 == 0 { "POST" } else { "GET" };
             let sent = if n % 2 == 0 { body.clone() } else { Vec::new() };
             let (status, headers, got) = if h2 {
-                let (status, headers, got) = h2_call(f.addr, method, sent).await.unwrap();
-                (status, format!("{headers:?}"), got)
+                let answer = h2_call(f.addr, method, sent).await.unwrap();
+                (answer.status, format!("{:?}", answer.headers), answer.body)
             } else {
                 let (head, got) = h1_request(&mut client, method, &sent).await;
                 (head[9..12].parse().unwrap(), head, got)

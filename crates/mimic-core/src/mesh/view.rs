@@ -7,9 +7,10 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::admission::Contract;
 use super::input::{EndpointSlice, Route, Service, Snapshot, TargetKind, TargetPort};
 use super::policy::{
-    MAX_FAULTS, MAX_RETRIES, MAX_SLOW_START_SECS, Policy, Winners, consents, effective,
+    MAX_FAULTS, MAX_RETRIES, MAX_SLOW_START_SECS, Policy, Winners, consents, contract, effective,
 };
 use super::route::{
     Compiled, MatchView, ModifierView, RouteView, RuleView, compile, refused_header,
@@ -76,6 +77,10 @@ pub struct ServiceView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct View {
+    /// The contract of the deployment's winning config (spec §7.9 "Admission"); never in a
+    /// view of `mesh: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<Contract>,
     pub cluster: String,
     pub format: u32,
     pub generations: BTreeMap<String, i64>,
@@ -102,6 +107,14 @@ impl View {
         }
         if view.mode.parse::<Mode>().is_err() {
             return Err("unknown mode".into());
+        }
+        if let Some(contract) = view.admission {
+            if !view.mesh {
+                return Err("admission in a view of mesh false".into());
+            }
+            if !contract.in_bounds() {
+                return Err("admission out of bounds".into());
+            }
         }
         if view.services.len() > limits.max_services {
             return Err(format!("view over {} services", limits.max_services));
@@ -523,11 +536,14 @@ pub fn build(
 ) -> Built {
     let winners = Winners::new(&snapshot.configs);
     let own = winners.get(TargetKind::Deployment, namespace, deployment);
+    let mesh = own.and_then(|c| c.mesh_enabled).unwrap_or(true);
     let mut view = View {
+        // Set before the empty view is measured: it counts in `max_view_bytes`.
+        admission: if mesh { contract(own) } else { None },
         cluster: snapshot.cluster.clone(),
         format: FORMAT,
         generations: BTreeMap::new(),
-        mesh: own.and_then(|c| c.mesh_enabled).unwrap_or(true),
+        mesh,
         mode: mode.as_str().to_string(),
         services: BTreeMap::new(),
     };

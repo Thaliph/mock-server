@@ -96,6 +96,7 @@ pub fn cfg(ns: &str, name: &str, created: i64, targets: &[(TargetKind, &str)]) -
         outlier_detection: None,
         circuit_breaker: None,
         faults: None,
+        admission: None,
     }
 }
 

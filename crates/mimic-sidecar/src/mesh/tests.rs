@@ -368,3 +368,31 @@ fn rty_05_invalid_values_are_refused() {
         assert!(error.contains(var), "{error}");
     }
 }
+
+#[test]
+fn adm_29_the_redirect_is_never_read_from_the_environment() {
+    assert!(MeshConfig::default().redirect.is_empty());
+    let every = [
+        ("MIMIC_MESH", "on"),
+        ("MIMIC_MESH_STALE_AFTER", "5s"),
+        ("MIMIC_MESH_STARTUP_WAIT", "1s"),
+        ("MIMIC_MESH_MAX_SERVICES", "100"),
+        ("MIMIC_MESH_MAX_ENDPOINTS", "1000"),
+        ("MIMIC_MESH_MAX_VIEW_BYTES", "1Mi"),
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "10s"),
+        ("MIMIC_MESH_CONNECT_TIMEOUT", "1s"),
+        ("MIMIC_MESH_OPAQUE_PORTS", "5432"),
+        ("MIMIC_MESH_RETRY_BUFFER", "1Ki"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "2Mi"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "16"),
+        ("MIMIC_POD_NAME", "cart-0"),
+        // Names a redirect could be read from, were there one: none is.
+        ("MIMIC_MESH_REDIRECT", "10.0.0.1:8080=127.0.0.1:15006"),
+        ("MIMIC_MESH_REDIRECTS", "10.0.0.1:8080=127.0.0.1:15006"),
+        ("MIMIC_REDIRECT", "10.0.0.1:8080=127.0.0.1:15006"),
+    ];
+    let built = config(&every).unwrap();
+    assert!(built.enabled);
+    assert!(built.redirect.is_empty());
+    assert!(config(&[]).unwrap().redirect.is_empty());
+}

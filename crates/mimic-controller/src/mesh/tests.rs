@@ -83,6 +83,7 @@ pub(crate) fn config(ns: &str, name: &str, deployment: &str, dests: &[(&str, &st
         outlier_detection: None,
         circuit_breaker: None,
         faults: None,
+        admission: None,
     }
 }
 

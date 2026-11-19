@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use bytes::Bytes;
 use http_body_util::BodyExt;
+use hyper::body::{Frame, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, server};
@@ -21,10 +23,11 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::discovery::Tap;
-use crate::exchange::{self, Ctx, ReqBody, Tracker};
+use crate::exchange::{self, Ctx, RefusedRequest, ReqBody, Tracker};
 use crate::load::{Body, Marker, mark_answer, refused, screen};
-use crate::mesh::MeshState;
+use crate::mesh::{MeshState, Slot};
 use crate::mock::{self, Mock};
+use crate::refuse;
 use crate::transport::Stream;
 
 const PROTOCOL: &str = "h2";
@@ -316,6 +319,37 @@ async fn forward(
         None => None,
     };
     let mut spent = began.elapsed();
+    // Admission (spec §4.1 "Admission contract"), after the load marker: a `599` takes no
+    // place. The wait is not the sidecar's own time.
+    let slot = match state.strip.as_ref() {
+        Some(mesh) => match mesh.admitter().admit().await {
+            Ok(slot) => Some(slot),
+            Err(refusal) => {
+                let response = refuse::h2_response(refusal.as_str(), state.ctx.dst, &mesh.origin());
+                let request = RefusedRequest {
+                    method: Some(req.method().as_str()),
+                    path: Some(req.uri().path()),
+                    uri_authority: req.uri().authority().map(|a| a.as_str()),
+                    host: req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .map(|host| host.to_str().unwrap_or("")),
+                };
+                // A load request was counted as one already.
+                let tap = state.tap.as_ref().filter(|_| load_run.is_none());
+                exchange::admission_refused(
+                    &state.ctx,
+                    PROTOCOL,
+                    tap,
+                    &request,
+                    refusal,
+                    began.elapsed(),
+                );
+                return Ok(response);
+            }
+        },
+        None => None,
+    };
     state.open().await?;
     let resumed = Instant::now();
     let sender = state
@@ -352,12 +386,57 @@ async fn forward(
             }
             spent += resumed.elapsed();
             state.ctx.proxy.overhead(state.ctx.direction, spent);
-            Ok(answered)
+            Ok(match slot {
+                Some(slot) => answered.map(|inner| {
+                    SlotBody {
+                        inner,
+                        slot: Some(slot),
+                    }
+                    .boxed_unsync()
+                }),
+                None => answered,
+            })
         }
         Err(e) => {
             tracker.failed();
             Err(e.into())
         }
+    }
+}
+
+/// The response body of an admitted stream: it holds the stream's slot until it ends, at its
+/// last frame, its trailers or an error, or when it is dropped (a reset stream).
+struct SlotBody {
+    inner: Body,
+    slot: Option<Slot>,
+}
+
+impl hyper::body::Body for SlotBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        let ended = match &polled {
+            Poll::Ready(None | Some(Err(_))) => true,
+            Poll::Ready(Some(Ok(frame))) => frame.trailers_ref().is_some(),
+            Poll::Pending => false,
+        };
+        if ended {
+            self.slot = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 

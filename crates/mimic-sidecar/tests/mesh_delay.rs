@@ -13,7 +13,7 @@ use bytes::Bytes;
 use common::faults::{abort_on, absent, delay, faults, no_series, status};
 use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, mesh_state};
 use common::{Logs, capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use mimic_core::discovery::histogram::bucket_index;
 use mimic_core::mesh::fault::drawn;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
@@ -98,7 +98,7 @@ async fn flt_15_h2c_a_200ms_delay_holds_every_stream() {
     let (mut sent, mut latencies) = (Vec::new(), Vec::new());
     for _ in 0..20 {
         let request = hyper::Request::get("http://cart.shop.svc/")
-            .body(Empty::<Bytes>::new())
+            .body(Full::new(Bytes::new()))
             .unwrap();
         sent.push(Instant::now());
         let response = sender.send_request(request).await.expect("an answer");
@@ -318,7 +318,7 @@ async fn flt_16_an_h2c_stream_reset_during_the_delay_frees_its_slot() {
         tokio::spawn(async move {
             let began = Instant::now();
             let request = hyper::Request::get("http://cart.shop.svc/")
-                .body(Empty::<Bytes>::new())
+                .body(Full::new(Bytes::new()))
                 .unwrap();
             let response = sender.send_request(request).await.expect("an answer");
             (response.status().as_u16(), began.elapsed())

@@ -19,8 +19,9 @@ use mimic_core::mesh::route::{RouteView, Table};
 use mimic_core::mesh::view::View;
 use prometheus_client::metrics::gauge::Gauge;
 
+use super::MeshConfig;
 use super::metrics::MeshMetrics;
-use super::pool::{self, Pools};
+use super::pool::{self, Pools, Redirect};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -539,13 +540,6 @@ impl Backend {
     }
 }
 
-/// What bounds the copies sent to mirrors (spec §7.9 "Mirrors").
-pub(crate) struct MirrorConfig {
-    pub max_in_flight: usize,
-    pub max_in_flight_total: usize,
-    pub timeout: Duration,
-}
-
 /// The copies in flight: in total and per mirror Service port (`<namespace>/<name>:<port>`).
 struct Slots {
     max_port: usize,
@@ -610,6 +604,8 @@ pub(crate) struct Router {
     pub(crate) metrics: MeshMetrics,
     /// `MIMIC_MESH_CONNECT_TIMEOUT`.
     pub(crate) connect_timeout: Duration,
+    /// Tests only (`MeshConfig.redirect`): pods dialled at another address.
+    pub(crate) redirect: Redirect,
     /// How long a pod whose connect failed is avoided.
     avoid: Duration,
     /// The retries and budget of each Service of the view held, by `<namespace>/<name>`.
@@ -621,34 +617,31 @@ pub(crate) struct Router {
 }
 
 impl Router {
-    pub(crate) fn new(
-        idle_timeout: Duration,
-        max_labels: usize,
-        seed: Option<u64>,
-        connect_timeout: Duration,
-        avoid: Duration,
-        refusal_delay: Duration,
-        mirrors: MirrorConfig,
-    ) -> Router {
-        let seed = seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX));
+    pub(crate) fn new(config: &MeshConfig) -> Router {
+        let seed = config
+            .seed
+            .unwrap_or_else(|| rand::random_range(0..=u64::MAX));
+        let idle_timeout = config.pool_idle_timeout;
+        let redirect = Redirect::new(config.redirect.clone());
         Router {
             started: Instant::now(),
             seed: AtomicU64::new(seed),
             first_seed: seed,
             backends: RwLock::new(BTreeMap::new()),
-            pools: Pools::new(idle_timeout),
-            mirror_pools: Pools::new(idle_timeout),
+            pools: Pools::new(idle_timeout, redirect.clone()),
+            mirror_pools: Pools::new(idle_timeout, redirect.clone()),
             mirror_slots: Arc::new(Slots {
-                max_port: mirrors.max_in_flight,
-                max_total: mirrors.max_in_flight_total,
+                max_port: config.mirror_max_in_flight,
+                max_total: config.mirror_max_in_flight_total,
                 held: Mutex::new((0, BTreeMap::new())),
             }),
-            mirror_timeout: mirrors.timeout,
-            metrics: MeshMetrics::new(max_labels),
-            connect_timeout,
-            avoid,
+            mirror_timeout: config.mirror_timeout,
+            metrics: MeshMetrics::new(config.max_endpoint_labels),
+            connect_timeout: config.connect_timeout,
+            redirect,
+            avoid: config.avoid_failed_for,
             services: Mutex::new(BTreeMap::new()),
-            refusal_delay,
+            refusal_delay: config.refusal_delay,
             timers: Arc::default(),
         }
     }

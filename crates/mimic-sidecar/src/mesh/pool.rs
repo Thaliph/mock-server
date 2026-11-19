@@ -4,7 +4,7 @@
 //! when none has a free stream, up to [`MAX_H2_CONNECTIONS`]. A connection idle for the idle
 //! timeout is closed; the pool of an endpoint that left the view is drained.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -279,7 +279,8 @@ struct Idle {
 }
 
 pub(crate) struct H1Pool {
-    addr: SocketAddr,
+    /// Where the pod is dialled: its address, or its test redirect (`MeshConfig.redirect`).
+    dial: SocketAddr,
     origin: Option<Arc<Origin>>,
     idle_timeout: Duration,
     connect_timeout: Duration,
@@ -295,13 +296,13 @@ pub(crate) struct H1Pool {
 
 impl H1Pool {
     fn new(
-        addr: SocketAddr,
+        dial: SocketAddr,
         origin: Option<Arc<Origin>>,
         idle_timeout: Duration,
         connect_timeout: Duration,
     ) -> H1Pool {
         H1Pool {
-            addr,
+            dial,
             origin,
             idle_timeout,
             connect_timeout,
@@ -379,7 +380,7 @@ impl H1Pool {
 
     /// A lease on a connection whose driver is gone (test hook).
     async fn closed_lease(self: &Arc<Self>, max: &Limit) -> io::Result<Lease> {
-        let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
+        let stream = dial_wire(self.dial, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .handshake(TokioIo::new(stream))
             .await
@@ -406,7 +407,7 @@ impl H1Pool {
         self: &Arc<Self>,
         slot: Slot<'_>,
     ) -> io::Result<(http1::SendRequest<Attempt>, Arc<AtomicBool>)> {
-        let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
+        let stream = dial_wire(self.dial, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
             .allow_obsolete_multiline_headers_in_responses(true)
@@ -461,7 +462,8 @@ struct Conn {
 }
 
 pub(crate) struct H2Pool {
-    addr: SocketAddr,
+    /// Where the pod is dialled: its address, or its test redirect (`MeshConfig.redirect`).
+    dial: SocketAddr,
     origin: Option<Arc<Origin>>,
     idle_timeout: Duration,
     connect_timeout: Duration,
@@ -474,13 +476,13 @@ pub(crate) struct H2Pool {
 
 impl H2Pool {
     fn new(
-        addr: SocketAddr,
+        dial: SocketAddr,
         origin: Option<Arc<Origin>>,
         idle_timeout: Duration,
         connect_timeout: Duration,
     ) -> H2Pool {
         H2Pool {
-            addr,
+            dial,
             origin,
             idle_timeout,
             connect_timeout,
@@ -493,7 +495,7 @@ impl H2Pool {
 
     /// A lease on a connection whose driver is gone (test hook).
     async fn closed_lease(&self) -> io::Result<Lease> {
-        let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
+        let stream = dial_wire(self.dial, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http2::Builder::new(TokioExecutor::new())
             .handshake(TokioIo::new(stream))
             .await
@@ -543,7 +545,7 @@ impl H2Pool {
             return Ok(lease);
         }
         if lock(&self.conns).len() < MAX_H2_CONNECTIONS {
-            let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
+            let stream = dial_wire(self.dial, self.connect_timeout, self.origin.as_deref()).await?;
             let max_streams = Arc::new(AtomicU32::new(u32::MAX));
             let goaway = Arc::new(AtomicU32::new(u32::MAX));
             let snoop = Snoop::new(stream, max_streams.clone()).with_goaway(goaway.clone());
@@ -777,8 +779,26 @@ impl Pool {
 /// A pool is per pod address, protocol and, for re-originated TLS, the name verified.
 type PoolKey = (SocketAddr, Protocol, Option<Arc<str>>);
 
+/// Tests only (ADM-29, `MeshConfig.redirect`): pods dialled at another address, as the callee
+/// pod's own redirection to its sidecar does in a cluster. Only the connect reads it: the choice,
+/// the labels, the binding of refusals and the access line keep the pod's address.
+#[derive(Clone, Default)]
+pub(crate) struct Redirect(Arc<BTreeMap<SocketAddr, SocketAddr>>);
+
+impl Redirect {
+    pub(crate) fn new(redirect: BTreeMap<SocketAddr, SocketAddr>) -> Redirect {
+        Redirect(Arc::new(redirect))
+    }
+
+    /// Where `pod` is dialled: its own address unless it is redirected.
+    pub(crate) fn dialled(&self, pod: SocketAddr) -> SocketAddr {
+        self.0.get(&pod).copied().unwrap_or(pod)
+    }
+}
+
 pub(crate) struct Pools {
     idle_timeout: Duration,
+    redirect: Redirect,
     pools: Mutex<HashMap<PoolKey, Arc<Pool>>>,
     sweeping: AtomicBool,
     /// Checkouts left that hand out a closed connection (test hook).
@@ -788,9 +808,10 @@ pub(crate) struct Pools {
 }
 
 impl Pools {
-    pub(crate) fn new(idle_timeout: Duration) -> Arc<Pools> {
+    pub(crate) fn new(idle_timeout: Duration, redirect: Redirect) -> Arc<Pools> {
         Arc::new(Pools {
             idle_timeout,
+            redirect,
             pools: Mutex::new(HashMap::new()),
             sweeping: AtomicBool::new(false),
             poison: AtomicUsize::new(0),
@@ -823,15 +844,17 @@ impl Pools {
                     return Err(io::Error::other("too many pools for the pod"));
                 }
                 let origin = origin.cloned();
+                // Resolved once: the pool still names, labels and binds `addr`.
+                let dial = self.redirect.dialled(addr);
                 let pool = Arc::new(match protocol {
                     Protocol::Http1 => Pool::Http1(Arc::new(H1Pool::new(
-                        addr,
+                        dial,
                         origin,
                         self.idle_timeout,
                         connect_timeout,
                     ))),
                     Protocol::Http2 => Pool::Http2(Arc::new(H2Pool::new(
-                        addr,
+                        dial,
                         origin,
                         self.idle_timeout,
                         connect_timeout,
@@ -986,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn msh_76_a_checkout_cancelled_while_connecting_gives_its_slot_back() {
         let (addr, _) = pod(false).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let mut cancelled = 0;
         let limit = Arc::new(AtomicU32::new(1024));
         for _ in 0..50 {
@@ -1023,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn msh_77_a_pod_has_at_most_8_pools_and_empty_ones_are_swept() {
         let (addr, _) = pod(true).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let mut last = None;
         for n in 0..9 {
             let origin = Arc::new(Origin::for_test(&format!("n{n}.shop.svc")));
@@ -1093,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn cbr_31_an_unrelated_close_does_not_make_the_pool_close_one_more() {
         let (addr, _) = pod(false).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let limit = Arc::new(AtomicU32::new(4));
         let lease = async || {
             pools
@@ -1124,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn msh_78_a_fresh_checkout_keeps_a_healthy_idle_connection() {
         let (addr, accepted) = pod(false).await;
-        let pools = Pools::new(Duration::from_secs(60));
+        let pools = Pools::new(Duration::from_secs(60), super::Redirect::default());
         let mut failed = get(&pools, addr, None).await;
         let idle = get(&pools, addr, None).await;
         drop(idle);

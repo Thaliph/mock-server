@@ -218,6 +218,46 @@ retry it on another pod for every method (`mimic_mesh_retries_total{reason="app_
 when every try was refused. On the pod, `mimic_mesh_inbound_refusals_total` rises and the sidecar logs
 `inbound connect failed` at warn. Over TLS, or with the mesh off, the connection is closed without an answer.
 
+**`503` with `x-mimic-error: overloaded` or `x-mimic-error: queue-timeout`, and `x-mimic-origin: inbound; pod=<name>`.**
+The pod named in `x-mimic-origin` has an admission contract and was full ([Mesh](Mesh#admission-contract)); its
+sidecar answered itself and its app saw nothing of the request:
+
+- `overloaded`: the pod's admission queue (`⌈concurrency / 10⌉` places) was full, refused at once;
+- `queue-timeout`: the request waited 150 ms in that queue without a free slot or token.
+
+A meshed caller's sidecar retries it on another pod for every method
+(`mimic_mesh_retries_total{reason="overloaded"}` or `{reason="queue_timeout"}` on the caller), so an app behind a
+sidecar sees it only when every try was refused or its retry budget was spent; a caller without a sidecar gets every
+refusal. On the refusing pod each one has an access line with `status` 503, `reason` `overloaded` or
+`queue-timeout` and no `upstream`:
+
+```bash
+kubectl -n <ns> logs <pod> -c mimic-sidecar \
+  | jq -c 'select(.reason == "overloaded" or .reason == "queue-timeout") | {path, status, reason, duration_ms}'
+```
+
+Find the contract (it is per pod: the workload serves `replicas × contract`):
+
+```bash
+kubectl -n <ns> get mimicconfig -o json \
+  | jq '.items[] | select(.spec.admission) | {name: .metadata.name, targets: .spec.targetRefs, admission: .spec.admission}'
+```
+
+Then raise `concurrency` or `rps`, add replicas, or find what holds the slots: a slow app, long-lived responses (SSE,
+gRPC streams hold a slot for their whole life), or clients that send or read slowly. One caller can take every slot
+of a pod: the contract does not tell callers apart. Size it with a load test ([Mesh](Mesh#sizing-a-contract-with-a-load-test)).
+The queue size and the 150 ms are not configurable.
+
+**An admission contract does not apply: requests are never refused.** Check that the `MimicConfig` with
+`admission` targets the **Deployment** (not only a Service) and is its winning one (`Accepted: True`; `Conflicted`
+means an older config wins: put `admission` there), that the mesh is on for it (`MIMIC_MESH=on`, no
+`spec.mesh.enabled: false`), and that the traffic is metered: inbound TLS, opaque TCP, the admin-port probes and the
+bytes after an upgrade never are.
+
+**Log line `admission contract unknown`.** A new pod's sidecar has no view yet, held or persisted, after
+`MIMIC_MESH_STARTUP_WAIT`: it holds and refuses nothing until a view arrives, then applies its contract from the next
+request. Check the controller and the sidecar's `mesh view pull failed` lines, as for `mesh view stale` above.
+
 **`x-mimic-error` or `x-mimic-endpoint` missing from a response of my app.** A meshed sidecar removes every
 `x-mimic-*` field from the responses of its app (`mimic_mesh_stripped_headers_total`). With `MIMIC_MESH=off` or
 `MimicConfig.spec.mesh.enabled: false` they are kept.

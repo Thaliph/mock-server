@@ -189,3 +189,27 @@ async fn msh_35_without_a_view_the_mode_is_the_one_of_the_state_file_then_the_en
     }
     assert_eq!(metric(admin, "mimic_mode{mode=\"none\"}"), Some(1.0));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adm_28_the_binary_warns_once_when_no_view_comes() {
+    let unknown = |v: &serde_json::Value| v["message"] == "admission contract unknown";
+    // A controller that never answers and no state file: one warning after the wait.
+    let dir = tempfile::tempdir().unwrap();
+    let api = mesh_api(vec![], Reply::Hold).await;
+    let mut process = sidecar(&api, dir.path(), &[("MIMIC_MESH_STARTUP_WAIT", "300ms")]);
+    let warned = process.wait_log(Duration::from_secs(5), unknown);
+    assert_eq!(warned["level"], "WARN");
+    assert_eq!(warned["target"], "mesh");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(process.logs().iter().filter(|v| unknown(v)).count(), 1);
+    drop(process);
+
+    // A persisted view: no warning.
+    let dir = tempfile::tempdir().unwrap();
+    persist(dir.path(), &two(), unix_now());
+    let api = mesh_api(vec![], Reply::Hold).await;
+    let mut process = sidecar(&api, dir.path(), &[("MIMIC_MESH_STARTUP_WAIT", "300ms")]);
+    wait_status(process.admin_addr(), "/readyz", 200, Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(process.logs().iter().filter(|v| unknown(v)).count(), 0);
+}

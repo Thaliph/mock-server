@@ -16,9 +16,9 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::access;
-use crate::exchange::{Ctx, Http1Tracker};
+use crate::exchange::{Ctx, Http1Tracker, RefusalLog};
 use crate::h2;
-use crate::http1;
+use crate::http1::{self, Inbound};
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::load::{Marker, Watch};
 use crate::mesh::{self, Backend, MeshState, Scope, Serving};
@@ -989,7 +989,9 @@ impl Conn<'_> {
                     tap.is_some(),
                     self.mock.clone(),
                     watch,
-                    self.strip(),
+                    self.strip()
+                        .map(|mesh| Inbound::new(mesh, RefusalLog::new(self.ctx(), tap.cloned()))),
+                    self.shared.detect_stall(),
                     Some(proxy.overhead_histogram(direction)),
                     |event| tracker.event(event),
                     self.shared.stopped(),
@@ -1000,11 +1002,18 @@ impl Conn<'_> {
                 if let Some(e) = &relayed.error {
                     tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
                 }
-                if let Some(refusal) = relayed.refused {
-                    // A load request the marker check refused (spec §4.1): nothing of it
-                    // reached the destination, whose connection is closed.
-                    drop(upstream);
-                    http1::refuse(&mut client, refusal).await;
+                if let Some(refused) = relayed.refused {
+                    // Refused by the load marker or the admission (spec §4.1): answered by this
+                    // side after the earlier answers; nothing of it reached the app, whose
+                    // connection is closed with it.
+                    let answer = refused.answer();
+                    refuse::close_with(
+                        &mut client,
+                        &mut upstream,
+                        answer.as_bytes(),
+                        abort.as_mut(),
+                    )
+                    .await;
                     return;
                 }
                 if let Some(mock) = &self.mock {

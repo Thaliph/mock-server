@@ -272,7 +272,7 @@ fn flt_01_an_invalid_fault_makes_the_config_invalid_in_its_status() {
     );
 }
 
-fn full_fault() -> FaultSpec {
+pub(super) fn full_fault() -> FaultSpec {
     spec(
         Some(RouteMatch {
             path: Some(PathMatch {
@@ -296,7 +296,7 @@ fn full_fault() -> FaultSpec {
     )
 }
 
-fn built(faults: Vec<FaultSpec>) -> super::view::Built {
+pub(super) fn built(faults: Vec<FaultSpec>) -> super::view::Built {
     let mut s = cluster();
     s.configs = vec![with(faults)];
     build(&s, "shop", "cart", Mode::Mock, &Limits::default())
