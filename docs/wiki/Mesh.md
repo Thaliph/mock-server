@@ -1,10 +1,11 @@
 # Mesh
 
 The **mimic mesh** makes the sidecar of a caller pick the pod that serves a call, instead of leaving
-the choice to kube-proxy. Today (milestones M1 to M4) it does client-side **load balancing**, **retries** of failures
+the choice to kube-proxy. Today (milestones M1 to M5) it does client-side **load balancing**, **retries** of failures
 that happened before the app could process a request (with a retry budget), Gateway API **routes** (canary weights,
-header modifiers, timeouts, mirrors), **outlier detection**, a **circuit breaker** and **fault injection** (aborts and
-delays for resilience tests); the rest comes in later milestones (see [What is coming](#what-is-coming)).
+header modifiers, timeouts, mirrors), **outlier detection**, a **circuit breaker**, **fault injection** (aborts and
+delays for resilience tests) and, on the inbound side, an **admission contract** per pod; the rest comes in later
+milestones (see [What is coming](#what-is-coming)).
 It works the same in modes `none` and `discovery` (see [Concepts](Concepts)); in `mock` the mock
 answers and nothing is sent to a pod. It is on by default and has its own kill switches (below).
 
@@ -177,6 +178,9 @@ spec:
     - {namespace: risk, name: scoring}
   mesh:
     enabled: true            # Deployment target: false = byte relay for this workload
+  admission:                 # Deployment target, per pod: see [Admission contract](#admission-contract)
+    concurrency: 64
+    rps: 200
   loadBalancer:
     slowStart: 30s           # Service target: <n>s, 0 to 3600 s, 0s disables
   outlierDetection:          # Service target: see [Outlier detection and circuit breaker](#outlier-detection-and-circuit-breaker)
@@ -188,7 +192,7 @@ spec:
 
 Several configs for the same target: the oldest (`creationTimestamp`, then name) wins as a whole, the
 others get `Accepted: False`, reason `Conflicted`. Other `Accepted: False` reasons: `TargetNotFound`,
-`Invalid`. Without any `MimicConfig`: slow start 30 s, mesh on, no declared destinations.
+`Invalid`. Without any `MimicConfig`: slow start 30 s, mesh on, no declared destinations, no admission contract.
 
 ## Retries
 
@@ -819,6 +823,171 @@ spec:
    `mimic_mesh_faults_total` stops rising; a delay already in flight finishes. Delete the route too if it was only
    for the test.
 
+## Admission contract
+
+An **admission contract** protects an app from overload on its own side: with it, the **inbound** sidecar of each
+pod lets at most `concurrency` requests be in flight to its app and at most `rps` requests per second reach it, and
+answers the rest itself with a `503` that meshed callers retry on another pod. It is set by a `MimicConfig` on the
+**Deployment** and enforced by every pod of it, each on its own. Without a contract nothing is held or refused: the
+sidecar forwards everything, as before.
+
+```yaml
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: cart, namespace: shop}
+spec:
+  targetRefs: [{group: apps, kind: Deployment, name: cart}]
+  admission:
+    concurrency: 64          # requests in flight per pod, 1 to 100000
+    rps: 200                 # requests per second per pod, 1 to 1000000
+```
+
+**Fields and bounds.**
+
+- `admission` has two fields, **both required**: `concurrency`, an integer from 1 to 100 000, and `rps`, an integer
+  from 1 to 1 000 000. There is no default: without `admission` there is no admission control.
+- It needs a **Deployment** target: the API server refuses `admission` in a config whose only targets are Services.
+  A value out of range or a missing field is refused by the API server with the schema or CEL message naming the
+  field, or makes the config `Accepted: False`, reason `Invalid`. The oldest config of a Deployment wins as a whole
+  ([Configuration](#configuration)): put `admission` in the Deployment's existing `MimicConfig`.
+- **Per pod.** Each pod's sidecar applies the whole contract to what it sees itself; nothing is shared between pods.
+  The capacity of the workload is `replicas × contract`: 3 pods with `concurrency: 64` serve up to 192 requests at
+  once.
+- It needs the mesh: with `MIMIC_MESH=off`, or `spec.mesh.enabled: false` (a view of `"mesh": false`), no contract
+  applies.
+
+**The decision.** A request is **admitted** when fewer than `concurrency` admitted requests are in flight **and** a
+token is left in a bucket of rate `rps` and size `burst = max(1, ⌈rps / 10⌉)`; either limit stops it on its own. The
+bucket is full when the contract starts. Otherwise the request waits in a FIFO **queue** of
+`max(1, ⌈concurrency / 10⌉)` places, and is admitted once both conditions hold again and no earlier request is
+waiting:
+
+- a request that has waited **150 ms** is refused `queue-timeout`;
+- a request that finds the queue full is refused `overloaded` at once.
+
+With the contract above, `burst` is 20 and the queue has 7 places. The queue size and the 150 ms are not
+configurable.
+
+**What is metered.** An HTTP/1 request once its head is whole, and an `h2c` stream once its headers have arrived.
+A load-test request ([Load test](Load-test)) counts like any other once its ticket is checked; a request whose
+ticket is refused (`599`) takes neither a slot nor a place. **Not metered**, so they reach the app without the
+contract: inbound TLS (the sidecar does not decrypt it), opaque TCP, the probes of the admin port
+(`/app-health/…`) and the bytes of an upgraded connection. A workload that serves HTTPS on its pod port has no
+admission control.
+
+**How long a request holds its slot.** From its admission until its response is complete: the last body byte with
+any trailers, or the app's close for a close-delimited body. It also stops counting when its exchange ends without
+a complete response (a side closes or resets the connection or the stream). A `101` to an `Upgrade` and a `2xx` to a
+`CONNECT` end the count at that head; an interim `1xx` does not. So **a long-lived response (SSE, a gRPC server
+stream) holds its slot for its whole life**, and so does a client that sends its body or reads its response
+slowly, as it would hold one of the app's own workers. Size `concurrency` for them, or leave such a workload
+without a contract.
+
+**HTTP/1 requests are held.** Under a contract the inbound relay reads each request head whole before it forwards
+its first byte, one request at a time, and forwards it only once it is admitted, unchanged. A client holds nothing
+while its head is incomplete, so a slow-loris client takes no slot. A head that cannot be judged (it reaches
+64 KiB without its end, cannot be framed, is not whole after the 30 s stall, or is cut by the client's close) is
+decided like any request when its hold ends: admitted, it is forwarded unchanged and keeps its slot until the
+connection ends; refused, nothing of it is forwarded and the answer carries `connection: close`. An
+`Expect: 100-continue` request is held the same way, before the app can answer `100 Continue`. Without a
+contract nothing is held.
+
+**The refusal.** The sidecar writes it itself; it never comes from the app, and the app never sees a byte of a
+refused request:
+
+```text
+HTTP/1.1 503 Service Unavailable
+x-mimic-error: queue-timeout
+x-mimic-endpoint: 10.244.1.7:8080
+x-mimic-origin: inbound; pod=cart-7d9f8b6c4-x2kqz
+content-length: 0
+```
+
+`x-mimic-error` is `overloaded` or `queue-timeout`, `x-mimic-endpoint` the address the caller dialled
+(`[::1]:8080` form for IPv6), `x-mimic-origin` the pod's name. No other field is written (no `date`). On HTTP/1 it
+comes after the answers to the earlier requests of the connection, so pipelined answers keep their order, and the
+connection is:
+
+- **kept** for an HTTP/1.1 request without `Connection: close` and without `Expect: 100-continue` whose body is
+  absent or has a `content-length` of at most 65 536: the answer is written at once, then the body is read and
+  discarded (when it is not whole within 1 s, the connection is closed);
+- **closed** otherwise (`chunked`, a larger `content-length`, `Expect`, HTTP/1.0, `Connection: close`, a head that
+  could not be judged): the answer carries `connection: close`.
+
+On `h2c` the stream is answered and its body is not read; the connection and its other streams go on. A gRPC
+client sees an HTTP `503`, which gRPC maps to `UNAVAILABLE`.
+
+**Who retries it.** A **meshed caller's** sidecar trusts the refusal (it names the pod it sent the request to) and
+retries it on another pod **for every method**, `POST` included, after 25 ms ± 50 %, within its `retries` and its
+retry budget ([Retries](#retries)). The refusal is neutral for outlier detection: a busy pod is not ejected. When
+no try is left the app gets the last refusal as received. A **caller without a sidecar** (or with the mesh off)
+gets the `503` as it is and must retry by itself.
+
+**When the contract changes.** It follows the view, without a restart, from the next request:
+
+- a lower `concurrency` cuts nothing: the requests in flight finish, and new ones wait until fewer than the new
+  limit are in flight; a higher one admits the waiting requests at once, in order;
+- a new `rps` keeps the tokens held, capped at the new `burst`; a new queue size leaves the waiting requests in
+  their place;
+- a contract removed admits every waiting request at once, and the requests that follow are not held;
+- a contract that appears counts only the requests admitted after it, so the app may serve up to `concurrency` more
+  for as long as the earlier requests last.
+
+A stale view keeps its contract, and so does a restarted sidecar container (from its persisted view). A **new pod**
+has no contract until its first view; when `MIMIC_MESH_STARTUP_WAIT` passes without one, the sidecar writes one WARN
+`admission contract unknown` and holds nothing until a view arrives. On `SIGTERM` the waiting requests are decided
+as usual, within their 150 ms.
+
+**What you see.** Each refused request writes one inbound access line with `status` 503, `reason` `overloaded` or
+`queue-timeout` and no `upstream` ([Access logs](Access-logs)), and counts in `mimic_http_requests_total` like any
+exchange. Discovery does not record it (it counts in `mimic_discovery_exchanges_total{result="synthetic"}`), so a
+mock never replays it. No component line is written per refusal. On the caller's side,
+`mimic_mesh_retries_total{reason=~"overloaded|queue_timeout"}` counts the retries. The admission metrics, the line
+`admission contract changed` and the dashboards come with #454.
+
+**Who sets it.** Whoever may write `mimicconfigs` in the Deployment's namespace; `targetRefs` cannot leave the
+namespace. A contract is overload protection, not access control (use a NetworkPolicy for that), and it does not
+keep callers fair to each other: one caller that can reach the pod IP can take every slot and token, and the other
+callers are then refused too.
+
+### Sizing a contract with a load test
+
+A contract should sit a little below what one pod serves before its latency collapses. A
+[load test](Load-test) measures that: it sends to the pod addresses of the deployment directly, and its requests
+go through the contract like any other. The deployment must be in mode `mock`, so its own calls are answered by the
+mock.
+
+1. **Find the saturation point of one pod, without a contract.** With the deployment scaled to one replica (so the
+   numbers of the run are those of one pod), run tests of increasing `concurrency`:
+
+   ```yaml
+   apiVersion: mimic.platform.io/v1alpha1
+   kind: MimicLoadTest
+   metadata: {name: cart-c32, namespace: shop}
+   spec:
+     deployment: cart
+     duration: 2m
+     concurrency: 32
+   ```
+
+   `kubectl -n shop get mimicloadtest cart-c32 -o json | jq .status.results` gives the requests per second and the
+   p50, p90 and p99 latency. The point where the requests per second stop rising while the p99 keeps growing is the
+   pod's saturation. Note the `concurrency` and the requests per second just before it.
+
+2. **Set the contract below it**, for example 80 % of both, in the Deployment's `MimicConfig` (`admission:
+   {concurrency: …, rps: …}`). Count the long-lived responses the app serves (SSE, gRPC streams): each holds a slot
+   for its whole life.
+
+3. **Check it with a second run above the contract.** Run the test again with a `concurrency` (or a `rate`) about
+   twice the contract. The refusals show in the `5xx` of `statuses` (counting them by reason in the results comes
+   with #454). The app never has more than `concurrency` requests in flight and an admitted request waits at most
+   150 ms in the queue, so the latency of the admitted requests should stay close to that of step 1 at that
+   concurrency instead of collapsing. On the pod,
+   `kubectl -n shop logs deploy/cart -c mimic-sidecar | jq -c 'select(.reason == "overloaded" or .reason == "queue-timeout") | {path, status, reason, duration_ms}'`
+   shows them.
+
+4. **Scale back.** The capacity is now `replicas × contract`; size the replicas (or the HPA) from it.
+
 ## Observability
 
 Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `backend` is
@@ -859,7 +1028,12 @@ connects tried). `dst` stays the original destination. Lines of relayed
 connections have neither.
 
 Warnings to know: `breaker open`, `mesh view stale` (once per stale period), `mesh view rejected` (a view that does not
-parse, once per streak), `tls verification failed`.
+parse, once per streak), `tls verification failed`, `admission contract unknown` (once, a new pod without a view
+after `MIMIC_MESH_STARTUP_WAIT`).
+
+An inbound request the [admission contract](#admission-contract) refused has an access line with `status` 503,
+`reason` `overloaded` or `queue-timeout` and no `upstream`; it counts in `mimic_http_requests_total` and in
+`mimic_discovery_exchanges_total{result="synthetic"}`. The admission metrics are #454.
 
 ## Limits
 
@@ -933,7 +1107,36 @@ parse, once per streak), `tls verification failed`.
 - **Faults are drawn per caller sidecar**: `percent` is a share in expectation, not an exact count per window.
   Callers without a sidecar, mocked calls, L4 connections, `Upgrade`, `CONNECT`, inbound traffic and a passthrough
   connection accepted in mode `mock` (#549) are never faulted.
-- Not yet: active health checks, admission control.
+- **The admission contract is per pod and does not tell callers apart.** The workload's capacity is
+  `replicas × contract`, nothing is shared between pods, and one caller (or anyone who can reach the pod IP) can take
+  every slot and token, so the other callers are refused too. It protects the app from overload; it is no access
+  control (a NetworkPolicy is) and keeps no fairness between callers. A meshed caller retries a refusal on another
+  pod within its retries and its budget; a caller without a sidecar gets the `503`
+  ([Admission contract](#admission-contract)).
+- **Some traffic is not metered by the contract**: inbound TLS, opaque TCP, the admin-port probes and the bytes after
+  a `101` or a `CONNECT` reach the app without it. A workload that serves HTTPS on its pod port has no admission
+  control; size the contract for what it does meter.
+- **Held slots follow the slowest side.** A request holds its slot until its response is complete: a long-lived
+  response (SSE, a gRPC stream), a client that sends its body slowly or reads its response slowly keeps it for as
+  long as that lasts. A client holds nothing while its head is incomplete (at most 64 KiB, the 30 s stall restarted
+  at each byte, within `MIMIC_MAX_CONNECTIONS`), but `concurrency` slow admitted requests can still starve the
+  contract of that pod, as they would starve the app's workers.
+- **A head that cannot be judged keeps its slot until its connection ends** (over 64 KiB, unframed, stalled or cut):
+  its response end is no longer seen. A client that sends them takes slots of its own pod only, as long as it keeps
+  those connections.
+- **The contract can be briefly unknown or exceeded.** A new pod has none until its first view (one WARN
+  `admission contract unknown` when `MIMIC_MESH_STARTUP_WAIT` passes without it); a restarted sidecar container
+  keeps the contract of its persisted view. A contract added while requests are in flight counts only the requests
+  admitted after it, and a lowered contract lets the requests in flight finish.
+- **HTTP/1 timing changes under a contract.** Each request head is held until it is whole and admitted: up to
+  150 ms in the queue, plus the wait for the answers to the earlier requests of a pipelined connection, also for an
+  `Expect: 100-continue` request before the app can answer `100 Continue`. Bytes are not changed. A refused
+  request's body, up to 64 KiB within 1 s, is read and discarded, and the requests pipelined behind it wait for
+  that read.
+- **The refusal names the pod**: `x-mimic-endpoint` and `x-mimic-origin` give the pod address the caller dialled and
+  the pod name, as the inbound `connect-failed` answer does. The caller already knows the address; a pod name is not
+  a secret.
+- Not yet: active health checks.
 
 ## What is coming
 
@@ -942,5 +1145,6 @@ parse, once per streak), `tls verification failed`.
 - **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts ([Timeouts](#timeouts)) and mirrors ([Mirroring](#mirroring)) are in.
 - **M4**: outlier detection and circuit breaker ([above](#outlier-detection-and-circuit-breaker)) and fault injection
   ([Fault injection](#fault-injection)) are in.
-- **M5**: admission contract, failure signalling and HPA.
+- **M5**: the admission contract is in ([Admission contract](#admission-contract)); its metrics, the line
+  `admission contract changed` and the dashboards (#454), and the HPA (#455) are coming.
 - **M6**: north-south gateway.

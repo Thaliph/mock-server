@@ -21,6 +21,21 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Admission contract in the inbound sidecar (#453, M5): `admission` (`concurrency` 1 to 100 000, `rps` 1 to
+  1 000 000, both required) on a `MimicConfig` that targets a Deployment, carried into the view and enforced **per
+  pod** by each pod's inbound sidecar, without a restart. A request is admitted while fewer than `concurrency` are in
+  flight and a token is left in a bucket of rate `rps` and size `max(1, ⌈rps / 10⌉)`; otherwise it waits in a FIFO
+  queue of `max(1, ⌈concurrency / 10⌉)` places, refused `queue-timeout` after 150 ms or `overloaded` at once when the
+  queue is full (neither configurable). A request holds its slot until its response is complete, so long-lived
+  responses hold it for their whole life. HTTP/1 request heads are held whole until admitted; `h2c` streams are
+  metered from their headers; inbound TLS, opaque TCP, admin-port probes and upgraded bytes are not metered. The
+  refusal is the sidecar's own `503` with `x-mimic-error`, `x-mimic-endpoint`, `x-mimic-origin: inbound; pod=<name>`
+  and `content-length: 0`; the app sees nothing of it, meshed callers retry it on another pod for every method, and
+  callers without a sidecar get it as it is. Each refusal has an inbound access line with `reason` and counts in
+  `mimic_http_requests_total` and `mimic_discovery_exchanges_total{result="synthetic"}`; one WARN
+  `admission contract unknown` when a new pod has no view after `MIMIC_MESH_STARTUP_WAIT`. Without a contract nothing
+  changes. The admission metrics and dashboards are #454. See Admission contract in the wiki page Mesh.
+
 - Fault injection in the sidecar (#452, M4): `faults` on a `MimicConfig` that targets a Service (at most 16, each
   with an optional `match`, one Gateway API `HTTPRouteMatch`, and `abort` (`percent`, `status` 200 to 599) and/or
   `delay` (`percent`, `fixed` 1 ms to 60 s)). Every injected caller's sidecar applies the faults of the drawn
