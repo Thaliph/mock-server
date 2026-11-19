@@ -477,13 +477,21 @@ asked in the URL, 32 connections) without its `MimicConfig`, and switches one `M
 backend Deployment. It runs last. It is not in the default matrix.
 
 ```sh
-SETUPS=mesh-admission RATES="50 100 200" scripts/bench.sh   # 7 runs per protocol
+SETUPS=mesh-admission RATES="50 100 200" scripts/bench.sh   # 13 runs per protocol
 SETUPS=mesh-admission scripts/bench.sh --dry-run            # the plan, nothing started
 ```
 
-- For each protocol and rate: a run without any admission contract (`adm-off`), then a run under
-  `admission: {concurrency: 64, rps: 1000}` per pod (`adm-under`), which never binds (200 rps over 3 pods is
-  about 67 per pod). The two runs are back to back, with the pause between them.
+- For each protocol and rate, four runs in ABBA order: without any admission contract (`adm-off`), under
+  `admission: {concurrency: 64, rps: 1000}` per pod (`adm-under`, which never binds: 200 rps over 3 pods is about
+  67 per pod), under it again, then without it again. A drift over the four runs cancels in the pair, whose sides
+  are each the mean of their two runs.
+- These runs log every request's latency (fortio `-access-log-file /dev/stderr`), and the pairs use the exact
+  p50, p90 and p99 of those latencies. Fortio's own percentiles cannot tell 0.5 ms here: its histogram has 10 ms
+  buckets around the 50 ms backend (60 to 70 ms, then 70 ms to the largest sample), and it interpolates a
+  percentile inside its bucket, so a few requests on either side of 70 ms, or the largest one, move its p99 by
+  milliseconds. In the first run of this setup (2026-11-19, `adm-off` then `adm-under`), the p99 differed by +0.1
+  to +4.4 ms while the p50 differed by -0.3 to +0.4 ms; at http1 50 rps the p99 delta (+2.76 ms) was that of the
+  two largest samples (+2.90 ms) times 0.95.
 - Then one run per protocol under `admission: {concurrency: 64, rps: 30}` per pod (`adm-over`), at twice the rps
   of the 3 pods: 180 rps, with 64 connections so that the refusals (up to 150 ms in the queue) do not slow the load,
   fortio's `-allow-initial-errors`, and `-uniform`. Without `-uniform` the 64 connections send together, in bursts
@@ -501,7 +509,7 @@ setups (exit 1 once the file is written):
 
 | Check | Budget |
 |---|---|
-| Added p99 under the contract (`pairs[].delta_p99_ms`), and no error under it | at most +0.5 ms |
+| Per protocol, the median over the rates of the added p99 under the contract (`pair_medians[]`, from `pairs[].delta_p99_ms`), and no error under it | at most +0.5 ms |
 | Load sent in an `adm-over` run (`over[].actual_qps`) | at least 95 % of 180 rps |
 | Admitted rate per pod (`2xx` delta over fortio's `ActualDuration`) | within 5 % of 30 rps per pod |
 | p99 of the `duration_ms` of the `overloaded` lines | at most 1 ms |

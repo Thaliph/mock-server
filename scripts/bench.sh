@@ -114,12 +114,13 @@ contains() {
 
 # variants_of <setup>: the variants of each rate and protocol, in order. mesh-mirror runs without any HTTPRoute
 # (none), with the HTTPRoute and no mirror filter (route, the baseline of RTE-94), then with the mirror (on);
-# mesh-admission without any admission contract (adm-off), then under one that never binds (adm-under), and runs_of
-# adds its adm-over run to each protocol; the others have one run (-). run_total counts them.
+# mesh-admission without any admission contract (adm-off) and under one that never binds (adm-under) in ABBA order, so
+# that a drift over the four runs cancels in the pair, and runs_of adds its adm-over run to each protocol; the others
+# have one run (-). run_total counts them.
 variants_of() {
   case $1 in
     mesh-mirror) echo "none route on" ;;
-    mesh-admission) echo "adm-off adm-under" ;;
+    mesh-admission) echo "adm-off adm-under adm-under adm-off" ;;
     *) echo "-" ;;
   esac
 }
@@ -248,7 +249,9 @@ fortio_args() {
     # bucket (rps / 10 tokens) fills and loses tokens between them, so less than the rps is
     # admitted although twice it is offered (#553).
     mesh-admission/adm-over) FORTIO_ARGS+=(-allow-initial-errors -uniform "$url") ;;
-    mesh-admission/*) FORTIO_ARGS+=("$url") ;;
+    # Every request's latency on stderr: fortio's histogram has 10 ms buckets around the 50 ms of the backend, and
+    # interpolates its p99 up to the largest sample, so it cannot tell 0.5 ms; the pairs read the exact p99.
+    mesh-admission/*) FORTIO_ARGS+=(-access-log-file /dev/stderr "$url") ;;
     *) FORTIO_ARGS+=("http://fortio-server:8080/") ;;
   esac
 }
@@ -309,7 +312,7 @@ if ((DRY_RUN)); then
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
       mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $(eject_bound) requests per ejection of the caller sidecar ($EJECT_PER_EJECTION consecutive failures + $CONNECTIONS connections - 1)" ;;
       mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the p99 of the access duration_ms of the breaker-open lines must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
-      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $ADMISSION_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract, then under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod, $ADMISSION_CONNECTIONS connections: the p99 under it must be at most +$ADMISSION_P99_BUDGET_MS ms over the run without it, with no error; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
+      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $ADMISSION_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract and under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod in ABBA order, $ADMISSION_CONNECTIONS connections, every request's latency logged: per protocol, the median over the rates of the p99 under the contract over the p99 without it (each the mean of its two runs) must be at most +$ADMISSION_P99_BUDGET_MS ms, with no error under it; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -1243,6 +1246,15 @@ breaker_summary() {
   echo "mesh-breaker: $(jq -r '.breaker_open_lines' "$WORK/mesh-breaker.extra.json") breaker-open lines ($(jq -r '.breaker_open_percent' "$WORK/mesh-breaker.extra.json") % of the requests, minimum $BREAKER_OPEN_MIN_PERCENT %), longest $(jq -r '.duration_ms_max' "$WORK/mesh-breaker.extra.json") ms"
 }
 
+# exact_latencies <file>: the requests fortio logged in its access log (one JSON line per request, `latency` in
+# seconds) and their p50, p90 and p99 in ms, to the microsecond; null when there is none.
+exact_latencies() {
+  jq -R -c 'fromjson? | select(type == "object" and .latency != null) | .latency' "$1" \
+    | jq -s -c 'sort | length as $n
+        | def at($p): .[(($n - 1) * $p / 100 | round)] * 1000000 | round / 1000;
+        if $n == 0 then null else {requests: $n, p50: at(50), p90: at(90), p99: at(99)} end'
+}
+
 # admission_summary: the mesh-admission block, in $WORK/mesh-admission.extra.json (ADM-32). pairs: the p99 under the
 # contract that never binds against the run without any, at the same protocol and rate, and its errors (a refusal is
 # one). over: per protocol, the load sent against twice the contract, the rate admitted by each backend pod (its 2xx
@@ -1255,13 +1267,26 @@ admission_summary() {
     def r2: (. * 100 | round) / 100;
     def abs: if . < 0 then -. else . end;
     def p99: if length == 0 then null else (sort | .[((length * 99 / 100) | floor)]) end;
+    def r3: (. * 1000 | round) / 1000;
+    def mean: add / length;
+    def median: sort | if length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+    # Each side is the mean of its two runs (ABBA); the latencies are the exact ones of the access log.
     ($runs | map(select(.admission.variant != "adm-over")) | group_by([.protocol, .rate]) | map(
-        (map(select(.admission.variant == "adm-off"))[0]) as $off
-        | (map(select(.admission.variant == "adm-under"))[0]) as $under
-        | ($under.latency_ms.p99 - $off.latency_ms.p99) as $delta
-        | {protocol: $under.protocol, rate: $under.rate, p99_off_ms: $off.latency_ms.p99,
-           p99_under_ms: $under.latency_ms.p99, delta_p99_ms: ($delta * 1000 | round / 1000),
-           errors_under: $under.errors, within_budget: ($delta <= $p99 and $under.errors == 0)})) as $pairs
+        map(select(.admission.variant == "adm-off")) as $off
+        | map(select(.admission.variant == "adm-under")) as $under
+        | ($off | map(.admission.latency_ms)) as $o
+        | ($under | map(.admission.latency_ms)) as $u
+        | {protocol: $under[0].protocol, rate: $under[0].rate,
+           p99_off_runs_ms: ($o | map(.p99)), p99_under_runs_ms: ($u | map(.p99)),
+           p99_off_ms: ($o | map(.p99) | mean | r3), p99_under_ms: ($u | map(.p99) | mean | r3),
+           delta_p50_ms: (($u | map(.p50) | mean) - ($o | map(.p50) | mean) | r3),
+           delta_p90_ms: (($u | map(.p90) | mean) - ($o | map(.p90) | mean) | r3),
+           delta_p99_ms: (($u | map(.p99) | mean) - ($o | map(.p99) | mean) | r3),
+           errors_under: ($under | map(.errors) | add)})) as $pairs
+    # The verdict: per protocol, the median over the rates of the p99 deltas, and no error under the contract.
+    | ($pairs | group_by(.protocol) | map({protocol: .[0].protocol, rates: map(.rate),
+        median_delta_p99_ms: (map(.delta_p99_ms) | median | r3), errors_under: (map(.errors_under) | add)}
+        | . + {within_budget: (.median_delta_p99_ms <= $p99 and .errors_under == 0)})) as $medians
     | ($runs | map(select(.admission.variant == "adm-over")) | map(
         (.fortio.ActualDuration / 1e9) as $secs
         | [.admission.pods[].refusals.overloaded[]] as $overloaded
@@ -1277,10 +1302,11 @@ admission_summary() {
              and ($overloaded | length) >= 1 and ($timeouts | length) >= 1
              and ($overloaded | p99) <= $refusal and ($timeouts | max) <= $queue)})) as $over
     | {budgets: {added_p99_ms: $p99, refusal_p99_ms: $refusal, queue_timeout_max_ms: $queue, rate_percent: $pct},
-       pairs: $pairs, over: $over,
-       within_budget: (($pairs | length) > 0 and ($over | length) > 0 and (($pairs + $over) | all(.within_budget)))}' \
+       pairs: $pairs, pair_medians: $medians, over: $over,
+       within_budget: (($medians | length) > 0 and ($over | length) > 0 and (($medians + $over) | all(.within_budget)))}' \
     >"$WORK/mesh-admission.extra.json"
-  jq -r '(.pairs[] | "mesh-admission pair \(.protocol) \(.rate) rps: p99 \(.p99_off_ms) ms without, \(.p99_under_ms) ms under the contract (+\(.delta_p99_ms) ms), \(.errors_under) errors"),
+  jq -r --argjson budget "$ADMISSION_P99_BUDGET_MS" '(.pairs[] | "mesh-admission pair \(.protocol) \(.rate) rps: p99 \(.p99_off_ms) ms without, \(.p99_under_ms) ms under the contract (\(.delta_p99_ms) ms; p50 \(.delta_p50_ms), p90 \(.delta_p90_ms)), \(.errors_under) errors"),
+    (.pair_medians[] | "mesh-admission \(.protocol): median p99 delta \(.median_delta_p99_ms) ms over the rates \(.rates | join(" ")), budget +\($budget) ms"),
     (.over[] | "mesh-admission over \(.protocol) \(.rate) rps: \(.actual_qps) qps sent, admitted \([.pods[].admitted_rps] | join(" ")) rps per pod, overloaded p99 \(.overloaded_p99_ms) ms (\(.overloaded_lines) lines), queue-timeout max \(.queue_timeout_max_ms) ms (\(.queue_timeout_lines) lines)")' \
     "$WORK/mesh-admission.extra.json"
 }
@@ -1319,13 +1345,16 @@ run_one() {
   fi
   # mesh-churn: a rolling restart of the backend starts with the load and runs through it (BEN-14).
   if ((churn)); then kubectl -n "$NS" rollout restart deploy/fortio-server >/dev/null; fi
-  raw=$(kubectl -n "$NS" exec "$caller" -c fortio -- /usr/bin/fortio "${FORTIO_ARGS[@]}" 2>>"$WORK/fortio.log") \
-    || { echo "FAIL fortio run $index failed, see $WORK/fortio.log" >&2; exit 1; }
+  raw=$(kubectl -n "$NS" exec "$caller" -c fortio -- /usr/bin/fortio "${FORTIO_ARGS[@]}" 2>"$WORK/run.err") \
+    || { cat "$WORK/run.err" >>"$WORK/fortio.log"; echo "FAIL fortio run $index failed, see $WORK/fortio.log" >&2; exit 1; }
+  # fortio's own log; the per-request lines of its access log are read below.
+  grep -v '^{"latency"' "$WORK/run.err" >>"$WORK/fortio.log" || true
   if ((churn)); then kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s >/dev/null; fi
   jq -e '.DurationHistogram.Count' <<<"$raw" >/dev/null || { echo "FAIL run $index printed no fortio JSON" >&2; exit 1; }
   if [[ $setup == mesh-admission ]]; then
     admission_json=$(jq -nc --arg variant "$variant" --argjson contract "$(admission_contract "$variant")" \
-      --arg label "$(variant_label "$variant")" '{variant: $variant, label: $label, contract: $contract}')
+      --arg label "$(variant_label "$variant")" --argjson exact "$(exact_latencies "$WORK/run.err")" \
+      '{variant: $variant, label: $label, contract: $contract} + (if $exact == null then {} else {latency_ms: $exact} end)')
   fi
   if [[ $variant == adm-over ]]; then
     : >"$WORK/admission.pods"
