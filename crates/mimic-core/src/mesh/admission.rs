@@ -76,6 +76,10 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    pub const fn reason(self) -> super::reason::Reason {
+        todo!()
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Refusal::Overloaded => "overloaded",

@@ -49,6 +49,12 @@ pub enum Refusal {
     AppRefused,
 }
 
+impl Refusal {
+    pub const fn reason(self) -> super::reason::Reason {
+        todo!()
+    }
+}
+
 /// A failure of one try, as the sidecar observed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
