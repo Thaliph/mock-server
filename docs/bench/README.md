@@ -468,3 +468,43 @@ the same way with no mirror: 8.42 to 8.55 ms and 10.02 to 10.15 ms (the "no rout
 above), so +0.0 to +0.11 ms and -0.12 to +0.01 ms: within 0.2 ms. Against the runs of the day before the spread of
 the machine is larger than the budget (M1 `mesh-lb` 8.19 / 9.69 ms: +0.34 / +0.34 ms; M2 8.74 / 10.54 ms: -0.21 /
 -0.51 ms), so the comparison is meaningful only within a session.
+
+## M5: admission contract (#453, ADM-32)
+
+Setup `mesh-admission` measures the admission contract of the callee sidecars (SPEC §4.1 "Admission contract")
+against design §14. It has the topology of `mesh-breaker` (backend of 3 injected pods, mode discovery, `delay=50ms`
+asked in the URL, 32 connections) without its `MimicConfig`, and switches one `MimicConfig fortio-admission` on the
+backend Deployment. It runs last. It is not in the default matrix.
+
+```sh
+SETUPS=mesh-admission RATES="50 100 200" scripts/bench.sh   # 7 runs per protocol
+SETUPS=mesh-admission scripts/bench.sh --dry-run            # the plan, nothing started
+```
+
+- For each protocol and rate: a run without any admission contract (`adm-off`), then a run under
+  `admission: {concurrency: 64, rps: 1000}` per pod (`adm-under`), which never binds (200 rps over 3 pods is
+  about 67 per pod). The two runs are back to back, with the pause between them.
+- Then one run per protocol under `admission: {concurrency: 64, rps: 30}` per pod (`adm-over`), at twice the rps
+  of the 3 pods: 180 rps, with 64 connections so that the refusals (up to 150 ms in the queue) do not slow the load,
+  and fortio's `-allow-initial-errors`.
+- Each change of the contract waits, up to 60 s, until the config is `Accepted` and every backend sidecar
+  pulled a view after it (`mimic_mesh_view_pulls_total{result="ok"}`), then 2 s.
+- For each `adm-over` run, the script records per backend pod the deltas of its inbound requests
+  (`mimic_http_requests_total{direction="inbound"}`, all and `2xx`) and the `duration_ms` of its sidecar's
+  refusal lines, grouped by `reason`, read with `kubectl logs --since-time` at the end of the run (kubelet
+  rotates a container log at about 10 MiB).
+
+The verdicts are in `mesh.admission` of `<date>-mesh-admission.json`. A false one adds the setup to the failed
+setups (exit 1 once the file is written):
+
+| Check | Budget |
+|---|---|
+| Added p99 under the contract (`pairs[].delta_p99_ms`), and no error under it | at most +0.5 ms |
+| Load sent in an `adm-over` run (`over[].actual_qps`) | at least 95 % of 180 rps |
+| Admitted rate per pod (`2xx` delta over fortio's `ActualDuration`) | within 5 % of 30 rps per pod |
+| p99 of the `duration_ms` of the `overloaded` lines | at most 1 ms |
+| Longest `duration_ms` of a `queue-timeout` line (counts per millisecond in `queue_timeout_ms_counts`) | at most 160 ms |
+
+A p99 delta of 0.5 ms on a 50 ms backend is close to the noise of the machine: compare only the runs of one session.
+The callers' retries and fortio's warm-up add offers, and the tokens still cap the admitted rate (the bias is at most
+the burst, 3, per pod and run). The results of the first run go here with the report on #453.

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Baseline benchmarks of the sidecar (BEN-01 to BEN-10, docs/SPEC.md §12.19, #436) and of the mesh
-# (BEN-11 to BEN-16, #444; mesh-refuse, RTY-23, #445; mesh-eject and mesh-breaker, CBR-34, #451). Run by hand on a quiet machine; not a CI job.
+# (BEN-11 to BEN-16, #444; mesh-refuse, RTY-23, #445; mesh-eject and mesh-breaker, CBR-34, #451; mesh-admission, ADM-32,
+# #453). Run by hand on a quiet machine; not a CI job.
 #
 #   scripts/bench.sh               the default matrix: 18 runs of 30 s with 10 s pauses, about 12 minutes, plus the cluster
 #   scripts/bench.sh --dry-run     the plan only, nothing started (scripts/test_bench.sh reads it)
 #   SETUPS="mesh-lb mesh-churn mesh-refuse" scripts/bench.sh   the mesh setups (3 backend pods, routing asserted)
 #   SETUPS=mesh-mirror scripts/bench.sh   every request mirrored to a second Service (RTE-94, #450)
 #   SETUPS="mesh-eject mesh-breaker" RATES=200 scripts/bench.sh   outlier ejection and circuit breaker (CBR-34, #451)
+#   SETUPS=mesh-admission scripts/bench.sh   the admission contract of the backend pods (ADM-32, #453)
 #
 # Environment (defaults in brackets):
 #   CLUSTER=mimic-bench            kind cluster: created when absent, reused otherwise
@@ -22,7 +24,11 @@
 #                                  rate and protocol runs without the route, then with it (RTE-94, #450);
 #                                  mesh-eject: mesh-refuse with the third pod resetting every connection after
 #                                  its request instead of refusing; mesh-breaker: mesh-lb with a MimicConfig
-#                                  circuitBreaker.maxRequests 8 and a 50 ms backend (CBR-34, #451)
+#                                  circuitBreaker.maxRequests 8 and a 50 ms backend (CBR-34, #451);
+#                                  mesh-admission: the topology of mesh-breaker without its MimicConfig; each
+#                                  rate and protocol runs without an admission contract, then under one that
+#                                  never binds (64/1000 per pod), then each protocol runs once at twice the
+#                                  rps of a contract 64/30 per pod (ADM-32, #453)
 #   PROPAGATION_SAMPLES=20         mesh-lb only: EndpointSlice changes timed, 0 to 100; 0 skips them
 #   PROTOCOLS="http1 h2c"          HTTP/1.1 keep-alive; h2c (HTTP/2 over cleartext)
 #   RATES="50 100 200"             requests per second, each 1 to 200
@@ -78,6 +84,12 @@ BREAKER_OPEN_BUDGET_MS=1    # mesh-breaker: the p99 of the access duration_ms of
 EJECT_PER_EJECTION=5        # mesh-eject: consecutiveFailures (default); the bound per ejection adds the connections in flight - 1
 BREAKER_CONNECTIONS=32      # mesh-breaker: fortio connections, more than maxRequests so that the breaker opens (BEN-03: at most 64)
 BREAKER_OPEN_MIN_PERCENT=10 # mesh-breaker: breaker-open answers, at least this share of the requests, proves it opened (CBR-34)
+ADMISSION_UNDER_CONCURRENCY=64 ADMISSION_UNDER_RPS=1000   # mesh-admission: never binding, 200 rps over 3 pods is about 67 per pod
+ADMISSION_OVER_CONCURRENCY=64                             # a queue of 7 places
+ADMISSION_RPS=30                                          # per pod, the "over" runs
+ADMISSION_OVER_RATE=$((2 * MESH_PODS * ADMISSION_RPS))    # 180 rps, under the 200 cap
+ADMISSION_OVER_CONNECTIONS=64                             # refusals wait up to 150 ms (BEN-03 cap)
+ADMISSION_P99_BUDGET_MS=0.5 ADMISSION_REFUSAL_BUDGET_MS=1 ADMISSION_QUEUE_BUDGET_MS=160 ADMISSION_RATE_PERCENT=5
 PROPAGATION_BUDGET_MS=2000  # EndpointSlice change to the sidecar's view applied, p99 (design §14, M1)
 SYNTHETIC_SERVICES=100      # the synthetic view of the RSS measurement (BEN-15)
 SYNTHETIC_ENDPOINTS=10      # endpoints of each synthetic Service
@@ -99,10 +111,15 @@ contains() {
 }
 
 # variants_of <setup>: the variants of each rate and protocol, in order. mesh-mirror runs without any HTTPRoute
-# (none), with the HTTPRoute and no mirror filter (route, the baseline of RTE-94), then with the mirror (on); the
-# others have one run (-). run_total counts them.
+# (none), with the HTTPRoute and no mirror filter (route, the baseline of RTE-94), then with the mirror (on);
+# mesh-admission without any admission contract (adm-off), then under one that never binds (adm-under), and runs_of
+# adds its adm-over run to each protocol; the others have one run (-). run_total counts them.
 variants_of() {
-  if [[ $1 == mesh-mirror ]]; then echo "none route on"; else echo "-"; fi
+  case $1 in
+    mesh-mirror) echo "none route on" ;;
+    mesh-admission) echo "adm-off adm-under" ;;
+    *) echo "-" ;;
+  esac
 }
 # variant_label <variant>: the plan words of a variant.
 variant_label() {
@@ -110,6 +127,9 @@ variant_label() {
     none) echo " (no route)" ;;
     route) echo " (route, no mirror)" ;;
     on) echo " (route with mirror)" ;;
+    adm-off) echo " (no admission)" ;;
+    adm-under) echo " (admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS)" ;;
+    adm-over) echo " (admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS, 2x)" ;;
   esac
 }
 
@@ -120,8 +140,8 @@ read -ra RATE_LIST <<<"$RATES"
 ((${#PROTOCOL_LIST[@]} > 0)) || config_error PROTOCOLS "empty"
 ((${#RATE_LIST[@]} > 0)) || config_error RATES "empty"
 for setup in "${SETUP_LIST[@]}"; do
-  contains "$setup" plain none discovery mesh-lb mesh-churn mesh-mirror mesh-refuse mesh-eject mesh-breaker \
-    || config_error SETUPS "$setup is not plain, none, discovery, mesh-lb, mesh-churn, mesh-mirror, mesh-refuse, mesh-eject or mesh-breaker"
+  contains "$setup" plain none discovery mesh-lb mesh-churn mesh-mirror mesh-refuse mesh-eject mesh-breaker mesh-admission \
+    || config_error SETUPS "$setup is not plain, none, discovery, mesh-lb, mesh-churn, mesh-mirror, mesh-refuse, mesh-eject, mesh-breaker or mesh-admission"
 done
 for protocol in "${PROTOCOL_LIST[@]}"; do
   contains "$protocol" http1 h2c || config_error PROTOCOLS "$protocol is not http1 or h2c"
@@ -164,9 +184,9 @@ SKIP_BUILD=${SKIP_BUILD-0}
 # The setups run in this order whatever the order of SETUPS: plain first, then the namespace is labelled,
 # the mesh setups last (they scale the backend to 3 pods, and the others need 1). mesh-refuse comes after the
 # others: its refusing pod stays in the namespace, and the setups before it must not see it. mesh-eject and
-# mesh-breaker come after it and remove the refusing pod first (prepare_setup).
+# mesh-breaker come after it and remove the refusing pod first (prepare_setup); mesh-admission runs last.
 ORDERED_SETUPS=()
-for setup in plain none discovery mesh-lb mesh-churn mesh-mirror mesh-refuse mesh-eject mesh-breaker; do
+for setup in plain none discovery mesh-lb mesh-churn mesh-mirror mesh-refuse mesh-eject mesh-breaker mesh-admission; do
   contains "$setup" "${SETUP_LIST[@]}" && ORDERED_SETUPS+=("$setup")
 done
 
@@ -176,26 +196,54 @@ for setup in "${ORDERED_SETUPS[@]}"; do
   [[ ! -e $file ]] || config_error BENCH_OUT_DIR "$file already exists, not overwritten"
 done
 
-# setup_connections <setup>: the fortio connections of a setup: CONNECTIONS, BREAKER_CONNECTIONS for mesh-breaker.
+# setup_connections <setup> [variant]: the fortio connections of a run: CONNECTIONS, BREAKER_CONNECTIONS for
+# mesh-breaker and mesh-admission, ADMISSION_OVER_CONNECTIONS for the adm-over run of mesh-admission.
 setup_connections() {
-  if [[ $1 == mesh-breaker ]]; then echo "$BREAKER_CONNECTIONS"; else echo "$CONNECTIONS"; fi
+  case $1/${2:--} in
+    mesh-admission/adm-over) echo "$ADMISSION_OVER_CONNECTIONS" ;;
+    mesh-breaker/* | mesh-admission/*) echo "$BREAKER_CONNECTIONS" ;;
+    *) echo "$CONNECTIONS" ;;
+  esac
+}
+
+# runs_of <setup>: one line "<protocol> <rate> <variant>" per run of the setup, in order. mesh-admission ends each
+# protocol with one adm-over run at ADMISSION_OVER_RATE, after the pairs of every rate.
+runs_of() {
+  local protocol rate variant
+  for protocol in "${PROTOCOL_LIST[@]}"; do
+    for rate in "${RATE_LIST[@]}"; do
+      for variant in $(variants_of "$1"); do echo "$protocol $rate $variant"; done
+    done
+    if [[ $1 == mesh-admission ]]; then echo "$protocol $ADMISSION_OVER_RATE adm-over"; fi
+  done
+}
+
+# run_total: the runs of every setup.
+run_total() {
+  local setup n=0
+  for setup in "${ORDERED_SETUPS[@]}"; do n=$((n + $(runs_of "$setup" | wc -l))); done
+  echo "$n"
 }
 
 # eject_bound: requests the resetting pod may receive per ejection (CBR-34): the consecutive failures that eject it,
 # plus the requests already in flight on the other connections, which an ejection cannot recall.
 eject_bound() { echo $((EJECT_PER_EJECTION + CONNECTIONS - 1)); }
 
-# fortio_args <protocol> <rate> [setup]: the fortio load command of one run, in FORTIO_ARGS (BEN-03). mesh-breaker asks
-# the backend for its own delay in the URL (the echo parameters of fortio's server), the others use the default.
+# fortio_args <protocol> <rate> [setup] [variant]: the fortio load command of one run, in FORTIO_ARGS (BEN-03).
+# mesh-breaker and mesh-admission ask the backend for its own delay in the URL (the echo parameters of fortio's
+# server), the others use the default.
 fortio_args() {
-  FORTIO_ARGS=(load -qps "$2" -t "$DURATION" -c "$(setup_connections "${3:-}")" -p "50,90,99,99.9" -json -)
+  local url="http://fortio-server:8080/?size=1024&delay=${BREAKER_DELAY_MS}ms"
+  FORTIO_ARGS=(load -qps "$2" -t "$DURATION" -c "$(setup_connections "${3:-}" "${4:-}")" -p "50,90,99,99.9" -json -)
   if [[ $1 == h2c ]]; then FORTIO_ARGS+=(-h2); fi
-  if [[ ${3:-} == mesh-breaker ]]; then
+  case ${3:-}/${4:--} in
     # More connections than maxRequests: the warm-up requests (one per connection) are already answered breaker-open.
-    FORTIO_ARGS+=(-allow-initial-errors "http://fortio-server:8080/?size=1024&delay=${BREAKER_DELAY_MS}ms")
-  else
-    FORTIO_ARGS+=("http://fortio-server:8080/")
-  fi
+    mesh-breaker/*) FORTIO_ARGS+=(-allow-initial-errors "$url") ;;
+    # Twice the contract: the warm-up requests (one per connection) may be refused already.
+    mesh-admission/adm-over) FORTIO_ARGS+=(-allow-initial-errors "$url") ;;
+    mesh-admission/*) FORTIO_ARGS+=("$url") ;;
+    *) FORTIO_ARGS+=("http://fortio-server:8080/") ;;
+  esac
 }
 
 # lock_state <dir>: "free", "stale" (the recorded process is gone, or no pid), or "held by pid N" (BEN-06).
@@ -254,6 +302,7 @@ if ((DRY_RUN)); then
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
       mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $(eject_bound) requests per ejection of the caller sidecar ($EJECT_PER_EJECTION consecutive failures + $CONNECTIONS connections - 1)" ;;
       mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the p99 of the access duration_ms of the breaker-open lines must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
+      mesh-admission) echo "mesh-admission: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, mode discovery; routing asserted before and after the runs; each rate runs without an admission contract, then under MimicConfig admission $ADMISSION_UNDER_CONCURRENCY/$ADMISSION_UNDER_RPS per pod, $BREAKER_CONNECTIONS connections: the p99 under it must be at most +$ADMISSION_P99_BUDGET_MS ms over the run without it, with no error; then each protocol runs once at $ADMISSION_OVER_RATE rps under admission $ADMISSION_OVER_CONCURRENCY/$ADMISSION_RPS per pod (2x), $ADMISSION_OVER_CONNECTIONS connections: at least 95 % of $ADMISSION_OVER_RATE rps sent, the admitted rate within $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps per pod, the p99 of the access duration_ms of the overloaded lines at most $ADMISSION_REFUSAL_BUDGET_MS ms and the longest queue-timeout at most $ADMISSION_QUEUE_BUDGET_MS ms" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -261,22 +310,16 @@ if ((DRY_RUN)); then
     echo "mesh-lb synthetic view: $SYNTHETIC_SERVICES Services, $SYNTHETIC_ENDPOINTS endpoints each, RSS budget baseline + $RSS_BUDGET_MIB MiB"
   fi
   check_locks
-  total=0
-  for setup in "${ORDERED_SETUPS[@]}"; do
-    read -ra variants <<<"$(variants_of "$setup")"
-    total=$((total + ${#variants[@]} * ${#PROTOCOL_LIST[@]} * ${#RATE_LIST[@]}))
-  done
+  total=$(run_total)
   index=0
   for setup in "${ORDERED_SETUPS[@]}"; do
-    for protocol in "${PROTOCOL_LIST[@]}"; do
-      for rate in "${RATE_LIST[@]}"; do
-        for variant in $(variants_of "$setup"); do
-          index=$((index + 1))
-          fortio_args "$protocol" "$rate" "$setup"
-          echo "run $index/$total setup $setup protocol $protocol rate $rate rps$(variant_label "$variant"): fortio ${FORTIO_ARGS[*]}"
-          if ((index < total)); then echo "pause ${PAUSE}s"; fi
-        done
-      done
+    mapfile -t runs < <(runs_of "$setup")
+    for run in "${runs[@]}"; do
+      read -r protocol rate variant <<<"$run"
+      index=$((index + 1))
+      fortio_args "$protocol" "$rate" "$setup" "$variant"
+      echo "run $index/$total setup $setup protocol $protocol rate $rate rps$(variant_label "$variant"): fortio ${FORTIO_ARGS[*]}"
+      if ((index < total)); then echo "pause ${PAUSE}s"; fi
     done
   done
   echo "cleanup on exit: kubectl delete namespace $NS"
@@ -623,8 +666,10 @@ YAML
     kubectl -n "$NS" rollout status deploy/fortio-mirror --timeout=180s
   fi
   if [[ $setup == mesh-* ]]; then
-    # Nothing of an earlier setup stays: a refusing or resetting pod, or a circuit breaker, would change the numbers.
-    kubectl -n "$NS" delete mimicconfig fortio-breaker --ignore-not-found >/dev/null
+    # Nothing of an earlier setup stays: a refusing or resetting pod, a circuit breaker or an admission contract would
+    # change the numbers.
+    kubectl -n "$NS" delete mimicconfig fortio-breaker fortio-admission --ignore-not-found >/dev/null
+    ADMISSION_STATE=adm-off
     if [[ $setup != mesh-refuse ]]; then
       kubectl -n "$NS" delete deploy/fortio-dead --ignore-not-found --wait=true >/dev/null
     fi
@@ -674,6 +719,84 @@ YAML
     exit 1
   fi
   if [[ $setup == mesh-breaker ]]; then breaker_config; fi
+}
+
+ADMISSION_STATE=adm-off
+# admission_config <variant>: the MimicConfig fortio-admission of mesh-admission on the backend Deployment: deleted for
+# adm-off, the contract of the variant otherwise. Nothing is done when it is in force already. Otherwise it waits, up
+# to 60 s, until the config is Accepted (when applied) and every backend pod's sidecar, which enforces the contract,
+# has pulled a view after it, and a little more for the apply.
+admission_config() {
+  local variant=$1 attempt pod grown concurrency rps accepted i
+  local -a pods before
+  [[ $variant != "$ADMISSION_STATE" ]] || return 0
+  mapfile -t pods < <(running_pods fortio-server)
+  before=()
+  for pod in "${pods[@]}"; do before+=("$(pulls_ok "$pod")"); done
+  case $variant in
+    adm-off) kubectl -n "$NS" delete mimicconfig fortio-admission --ignore-not-found >/dev/null ;;
+    *)
+      if [[ $variant == adm-over ]]; then
+        concurrency=$ADMISSION_OVER_CONCURRENCY rps=$ADMISSION_RPS
+      else
+        concurrency=$ADMISSION_UNDER_CONCURRENCY rps=$ADMISSION_UNDER_RPS
+      fi
+      kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: fortio-admission, namespace: $NS}
+spec:
+  targetRefs: [{group: apps, kind: Deployment, name: fortio-server}]
+  admission: {concurrency: $concurrency, rps: $rps}
+YAML
+      ;;
+  esac
+  for attempt in $(seq 60); do
+    grown=1
+    for i in "${!pods[@]}"; do
+      (($(pulls_ok "${pods[$i]}") > before[i])) || grown=0
+    done
+    accepted=True
+    if [[ $variant != adm-off ]]; then
+      accepted=$(kubectl -n "$NS" get mimicconfig fortio-admission \
+        -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}')
+    fi
+    if ((grown)) && [[ $accepted == True ]]; then
+      ADMISSION_STATE=$variant
+      sleep 2
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL mesh-admission: the MimicConfig is not Accepted or a backend sidecar pulled no view after the change to $variant in 60 s (attempt $attempt)" >&2
+  exit 1
+}
+
+# admission_contract <variant>: the contract of a variant as JSON, null for adm-off.
+admission_contract() {
+  case $1 in
+    adm-off) echo null ;;
+    adm-under) echo "{\"concurrency\": $ADMISSION_UNDER_CONCURRENCY, \"rps\": $ADMISSION_UNDER_RPS}" ;;
+    adm-over) echo "{\"concurrency\": $ADMISSION_OVER_CONCURRENCY, \"rps\": $ADMISSION_RPS}" ;;
+  esac
+}
+
+# inbound_requests <pod> [class]: the inbound requests the sidecar of the pod counted (mimic_http_requests_total), of one
+# status_class when given.
+inbound_requests() {
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$1:15100/proxy/metrics" \
+    | awk -v c="${2:-}" 'index($1, "mimic_http_requests_total{") == 1 && index($0, "direction=\"inbound\"") \
+        && (c == "" || index($0, "status_class=\"" c "\"")) { sum += $NF } END { print sum + 0 }'
+}
+
+# admission_refusals <pod> <since>: the duration_ms of the refusal lines of the pod's sidecar since the RFC 3339 time,
+# grouped by reason: {"overloaded": [...], "queue-timeout": [...]}. Read per run: kubelet rotates the log at about 10 MiB.
+admission_refusals() {
+  kubectl -n "$NS" logs "$1" -c mimic-sidecar --since-time="$2" 2>>"$WORK/logs.log" \
+    | jq -R -c 'fromjson? | select(.target == "access" and .direction == "inbound" and .reason != null)
+        | {reason, ms: .duration_ms}' \
+    | jq -s -c '{overloaded: map(select(.reason == "overloaded") | .ms),
+                 "queue-timeout": map(select(.reason == "queue-timeout") | .ms)}'
 }
 
 # breaker_config: the MimicConfig of mesh-breaker (circuitBreaker.maxRequests on the backend Service), then waits, up
@@ -1113,14 +1236,58 @@ breaker_summary() {
   echo "mesh-breaker: $(jq -r '.breaker_open_lines' "$WORK/mesh-breaker.extra.json") breaker-open lines ($(jq -r '.breaker_open_percent' "$WORK/mesh-breaker.extra.json") % of the requests, minimum $BREAKER_OPEN_MIN_PERCENT %), longest $(jq -r '.duration_ms_max' "$WORK/mesh-breaker.extra.json") ms"
 }
 
+# admission_summary: the mesh-admission block, in $WORK/mesh-admission.extra.json (ADM-32). pairs: the p99 under the
+# contract that never binds against the run without any, at the same protocol and rate, and its errors (a refusal is
+# one). over: per protocol, the load sent against twice the contract, the rate admitted by each backend pod (its 2xx
+# over fortio's ActualDuration), the duration_ms of the overloaded lines (p99) and of the queue-timeout lines (the
+# largest, and every value counted so that one outlier shows). Each verdict, and the whole one, is within_budget.
+admission_summary() {
+  jq -n --argjson p99 "$ADMISSION_P99_BUDGET_MS" --argjson refusal "$ADMISSION_REFUSAL_BUDGET_MS" \
+    --argjson queue "$ADMISSION_QUEUE_BUDGET_MS" --argjson pct "$ADMISSION_RATE_PERCENT" --argjson rps "$ADMISSION_RPS" \
+    --slurpfile runs "$WORK/mesh-admission.jsonl" '
+    def r2: (. * 100 | round) / 100;
+    def abs: if . < 0 then -. else . end;
+    def p99: if length == 0 then null else (sort | .[((length * 99 / 100) | floor)]) end;
+    ($runs | map(select(.admission.variant != "adm-over")) | group_by([.protocol, .rate]) | map(
+        (map(select(.admission.variant == "adm-off"))[0]) as $off
+        | (map(select(.admission.variant == "adm-under"))[0]) as $under
+        | ($under.latency_ms.p99 - $off.latency_ms.p99) as $delta
+        | {protocol: $under.protocol, rate: $under.rate, p99_off_ms: $off.latency_ms.p99,
+           p99_under_ms: $under.latency_ms.p99, delta_p99_ms: ($delta * 1000 | round / 1000),
+           errors_under: $under.errors, within_budget: ($delta <= $p99 and $under.errors == 0)})) as $pairs
+    | ($runs | map(select(.admission.variant == "adm-over")) | map(
+        (.fortio.ActualDuration / 1e9) as $secs
+        | [.admission.pods[].refusals.overloaded[]] as $overloaded
+        | [.admission.pods[].refusals["queue-timeout"][]] as $timeouts
+        | (.admission.pods | map((.ok / $secs) as $admitted
+            | {pod, offered_rps: (.requests / $secs | r2), admitted_rps: ($admitted | r2),
+               within_budget: (($admitted - $rps | abs) <= $rps * $pct / 100)})) as $pods
+        | {protocol, rate, actual_qps, contract: .admission.contract, pods: $pods,
+           overloaded_lines: ($overloaded | length), overloaded_p99_ms: ($overloaded | p99),
+           queue_timeout_lines: ($timeouts | length), queue_timeout_max_ms: ($timeouts | max),
+           queue_timeout_ms_counts: ($timeouts | group_by(.) | map({ms: .[0], n: length})),
+           within_budget: (.actual_qps >= 0.95 * .rate and ($pods | length) > 0 and ($pods | all(.within_budget))
+             and ($overloaded | length) >= 1 and ($timeouts | length) >= 1
+             and ($overloaded | p99) <= $refusal and ($timeouts | max) <= $queue)})) as $over
+    | {budgets: {added_p99_ms: $p99, refusal_p99_ms: $refusal, queue_timeout_max_ms: $queue, rate_percent: $pct},
+       pairs: $pairs, over: $over,
+       within_budget: (($pairs | length) > 0 and ($over | length) > 0 and (($pairs + $over) | all(.within_budget)))}' \
+    >"$WORK/mesh-admission.extra.json"
+  jq -r '(.pairs[] | "mesh-admission pair \(.protocol) \(.rate) rps: p99 \(.p99_off_ms) ms without, \(.p99_under_ms) ms under the contract (+\(.delta_p99_ms) ms), \(.errors_under) errors"),
+    (.over[] | "mesh-admission over \(.protocol) \(.rate) rps: \(.actual_qps) qps sent, admitted \([.pods[].admitted_rps] | join(" ")) rps per pod, overloaded p99 \(.overloaded_p99_ms) ms (\(.overloaded_lines) lines), queue-timeout max \(.queue_timeout_max_ms) ms (\(.queue_timeout_lines) lines)")' \
+    "$WORK/mesh-admission.extra.json"
+}
+
 # run_one <setup> <protocol> <rate> <index> <total> <variant>: one fortio run, sidecars measured before and after
-# (BEN-03). The variant is none, route or on for mesh-mirror, - for the others.
+# (BEN-03). The variant is none, route or on for mesh-mirror, adm-off, adm-under or adm-over for mesh-admission, - for
+# the others. An adm-over run also records, per backend pod, its inbound requests and their 2xx, and its refusal lines.
 run_one() {
   local setup=$1 protocol=$2 rate=$3 index=$4 total=$5 variant=$6
-  local mirror_json=null sent_before=0 primary_before=0
+  local mirror_json=null admission_json=null sent_before=0 primary_before=0 started pod i
   local caller callee raw cb ca cr callee_before callee_after callee_rss caller_json=null callee_json=null
   local measure_callee=1 churn=0
-  fortio_args "$protocol" "$rate" "$setup"
+  local -a backend requests_before ok_before
+  fortio_args "$protocol" "$rate" "$setup" "$variant"
   caller=$(pod_of fortio-client)
   callee=$(pod_of fortio-server)
   # No callee measure in plain (no sidecar) and in mesh-churn (the callee pods change during the run, BEN-14).
@@ -1134,12 +1301,36 @@ run_one() {
   fi
   echo "== run $index/$total setup $setup protocol $protocol rate $rate rps$(variant_label "$variant")"
   if [[ $variant == on ]]; then sent_before=$(mirrored_sent); primary_before=$(primary_requests); fi
+  if [[ $variant == adm-over ]]; then
+    mapfile -t backend < <(running_pods fortio-server)
+    requests_before=() ok_before=()
+    for pod in "${backend[@]}"; do
+      requests_before+=("$(inbound_requests "$pod")")
+      ok_before+=("$(inbound_requests "$pod" 2xx)")
+    done
+    started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fi
   # mesh-churn: a rolling restart of the backend starts with the load and runs through it (BEN-14).
   if ((churn)); then kubectl -n "$NS" rollout restart deploy/fortio-server >/dev/null; fi
   raw=$(kubectl -n "$NS" exec "$caller" -c fortio -- /usr/bin/fortio "${FORTIO_ARGS[@]}" 2>>"$WORK/fortio.log") \
     || { echo "FAIL fortio run $index failed, see $WORK/fortio.log" >&2; exit 1; }
   if ((churn)); then kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s >/dev/null; fi
   jq -e '.DurationHistogram.Count' <<<"$raw" >/dev/null || { echo "FAIL run $index printed no fortio JSON" >&2; exit 1; }
+  if [[ $setup == mesh-admission ]]; then
+    admission_json=$(jq -nc --arg variant "$variant" --argjson contract "$(admission_contract "$variant")" \
+      '{variant: $variant, contract: $contract}')
+  fi
+  if [[ $variant == adm-over ]]; then
+    : >"$WORK/admission.pods"
+    for i in "${!backend[@]}"; do
+      pod=${backend[$i]}
+      jq -nc --arg pod "$pod" --argjson requests "$(($(inbound_requests "$pod") - requests_before[i]))" \
+        --argjson ok "$(($(inbound_requests "$pod" 2xx) - ok_before[i]))" \
+        --argjson refusals "$(admission_refusals "$pod" "$started")" \
+        '{pod: $pod, requests: $requests, ok: $ok, refusals: $refusals}' >>"$WORK/admission.pods"
+    done
+    admission_json=$(jq -c --slurpfile pods "$WORK/admission.pods" '. + {pods: $pods}' <<<"$admission_json")
+  fi
   if [[ $variant == none ]]; then mirror_json='{"enabled": false, "route": false}'; fi
   if [[ $variant == route ]]; then mirror_json='{"enabled": false, "route": true}'; fi
   if [[ $variant == on ]]; then
@@ -1163,9 +1354,9 @@ run_one() {
     callee_json=$(sidecar_json "$callee_before" "$callee_after" "$callee_rss" "$DURATION_S")
   fi
   jq -c -n --arg setup "$setup" --arg protocol "$protocol" --argjson rate "$rate" \
-    --argjson connections "$(setup_connections "$setup")" --argjson duration_s "$DURATION_S" --argjson fortio "$raw" \
+    --argjson connections "$(setup_connections "$setup" "$variant")" --argjson duration_s "$DURATION_S" --argjson fortio "$raw" \
     --argjson caller "$caller_json" --argjson callee "$callee_json" --argjson churn "$churn" \
-    --argjson mirror "$mirror_json" '
+    --argjson mirror "$mirror_json" --argjson admission "$admission_json" '
     def pct($p): [$fortio.DurationHistogram.Percentiles[] | select(.Percentile == $p) | .Value * 1000][0];
     {
       setup: $setup, protocol: $protocol, rate: $rate, duration_s: $duration_s, connections: $connections,
@@ -1175,6 +1366,7 @@ run_one() {
       latency_ms: {p50: pct(50), p90: pct(90), p99: pct(99), "p99.9": pct(99.9)},
       rollout_restart: ($churn == 1),
       mirror: $mirror,
+      admission: $admission,
       sidecar: {caller: $caller, callee: $callee},
       fortio: $fortio
     }' >>"$WORK/$setup.jsonl"
@@ -1191,31 +1383,33 @@ write_results() {
   jq -r --arg date "$TODAY" --arg setup "$setup" '
     def v: if . == null then "-" else tostring end;
     def r2: if . == null then "-" else (. * 100 | round / 100 | tostring) end;
-    "| \($date) | \($setup)\(if .mirror.enabled == false then (if .mirror.route then " (route, no mirror)" else " (no route)" end) else "" end) | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
+    def admission: if .admission == null then ""
+      elif .admission.contract == null then " (no admission)"
+      else " (admission \(.admission.contract.concurrency)/\(.admission.contract.rps)\(if .admission.variant == "adm-over" then ", 2x" else "" end))" end;
+    "| \($date) | \($setup)\(if .mirror.enabled == false then (if .mirror.route then " (route, no mirror)" else " (no route)" end) else "" end)\(admission) | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
     "$WORK/$setup.jsonl" >>"$OUT_DIR/README.md"
   echo "wrote $file"
 }
 
-total=0
-for setup in "${ORDERED_SETUPS[@]}"; do
-  read -ra variants <<<"$(variants_of "$setup")"
-  total=$((total + ${#variants[@]} * ${#PROTOCOL_LIST[@]} * ${#RATE_LIST[@]}))
-done
+total=$(run_total)
 index=0
 for setup in "${ORDERED_SETUPS[@]}"; do
   prepare_setup "$setup"
   if [[ $setup == mesh-* ]]; then mesh_routing "$setup" before 1; fi
-  for protocol in "${PROTOCOL_LIST[@]}"; do
-    for rate in "${RATE_LIST[@]}"; do
-      for variant in $(variants_of "$setup"); do
-        index=$((index + 1))
-        if [[ $variant != - ]]; then mirror_route "$variant"; fi
-        run_one "$setup" "$protocol" "$rate" "$index" "$total" "$variant"
-        if ((index < total)); then sleep "$PAUSE"; fi
-      done
-    done
+  # Read first: a command of a run must not read the list on its stdin.
+  mapfile -t runs < <(runs_of "$setup")
+  for run in "${runs[@]}"; do
+    read -r protocol rate variant <<<"$run"
+    index=$((index + 1))
+    case $variant in
+      none | route | on) mirror_route "$variant" ;;
+      adm-*) admission_config "$variant" ;;
+    esac
+    run_one "$setup" "$protocol" "$rate" "$index" "$total" "$variant"
+    if ((index < total)); then sleep "$PAUSE"; fi
   done
   if [[ $setup == mesh-mirror ]]; then mirror_route none; fi
+  if [[ $setup == mesh-admission ]]; then admission_config adm-off; fi
   if [[ $setup == mesh-* ]]; then
     # Fallbacks are not asserted under mesh-churn: a refused connection to a restarting pod is measured (BEN-14).
     # mesh-refuse is strict: its refusing pod is retried to a sibling, so no try should need the ClusterIP.
@@ -1252,6 +1446,16 @@ for setup in "${ORDERED_SETUPS[@]}"; do
       FAILED_SETUPS+=("$setup")
     fi
     kubectl -n "$NS" delete mimicconfig fortio-breaker --ignore-not-found >/dev/null
+  fi
+  if [[ $setup == mesh-admission ]]; then
+    admission_summary
+    jq -n --slurpfile m "$WORK/$setup.mesh.json" --slurpfile e "$WORK/$setup.extra.json" '$m[0] + {admission: $e[0]}' \
+      >"$WORK/$setup.mesh.json.tmp"
+    mv "$WORK/$setup.mesh.json.tmp" "$WORK/$setup.mesh.json"
+    if [[ $(jq -r '.within_budget' "$WORK/$setup.extra.json") != true ]]; then
+      echo "FAIL mesh-admission: a pair is over +$ADMISSION_P99_BUDGET_MS ms of p99 or has errors under the contract, or an over run sent under 95 % of $ADMISSION_OVER_RATE rps, admitted a pod outside $ADMISSION_RATE_PERCENT % of $ADMISSION_RPS rps, or wrote refusals over $ADMISSION_REFUSAL_BUDGET_MS ms (overloaded p99) or $ADMISSION_QUEUE_BUDGET_MS ms (queue-timeout) (within_budget false in the results)" >&2
+      FAILED_SETUPS+=("$setup")
+    fi
   fi
   write_results "$setup"
   if ((MIRROR_MISMATCH)); then
