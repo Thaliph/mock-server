@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RefusedRequest, ReqBody, Tracker};
-use crate::load::{Body, Marker, mark_answer, refused, screen};
+use crate::load::{Body, Marker, Passed, mark_answer, refused, screen};
 use crate::mesh::{MeshState, Slot};
 use crate::mock::{self, Mock};
 use crate::refuse;
@@ -325,6 +325,9 @@ async fn forward(
         Some(mesh) => match mesh.admitter().admit().await {
             Ok(slot) => Some(slot),
             Err(refusal) => {
+                if let (Some(marker), Some(_)) = (state.load.as_ref(), &load_run) {
+                    marker.passed(Passed::RefusedAdmission);
+                }
                 let response = refuse::h2_response(refusal.reason(), state.ctx.dst, &mesh.origin());
                 let request = RefusedRequest {
                     method: Some(req.method().as_str()),
@@ -350,6 +353,9 @@ async fn forward(
         },
         None => None,
     };
+    if let (Some(marker), Some(_)) = (state.load.as_ref(), &load_run) {
+        marker.passed(Passed::Forwarded);
+    }
     state.open().await?;
     let resumed = Instant::now();
     let sender = state

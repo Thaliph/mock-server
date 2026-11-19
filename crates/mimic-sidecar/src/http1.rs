@@ -31,7 +31,7 @@ use tokio::sync::Notify;
 use crate::access::Outcome;
 use crate::exchange::{RefusalLog, RefusedRequest};
 use crate::listener::DETECT_STALL;
-use crate::load::{MARKER_HEADER, REQUEST_HEADER, Refusal, Watch};
+use crate::load::{MARKER_HEADER, Passed, REQUEST_HEADER, Refusal, Watch};
 use crate::mesh::{Admitter, MeshState, Slot};
 use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
@@ -574,6 +574,9 @@ impl<F: FnMut(Event)> Relay<F> {
                             match inbound.admit.admit().await {
                                 Ok(slot) => Some(slot),
                                 Err(refusal) => {
+                                    if let (Some(watch), Some(_)) = (self.watch.as_ref(), &run) {
+                                        watch.marker.passed(Passed::RefusedAdmission);
+                                    }
                                     let refused = Refusing {
                                         refusal,
                                         request,
@@ -599,6 +602,7 @@ impl<F: FnMut(Event)> Relay<F> {
                     if let Some(watch) = self.watch.as_ref() {
                         match (run, whole) {
                             (Some(run), Some((end, _))) => {
+                                watch.marker.passed(Passed::Forwarded);
                                 if let Some(tap) = &watch.tap {
                                     tap.load_exchange();
                                 }
