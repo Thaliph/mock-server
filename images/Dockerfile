@@ -37,7 +37,7 @@ FROM eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdf
 
 # e2e: headless Chromium of the UI check (UI-12, scripts/e2e/ui_browser.py). The digest is the multi-arch index
 # of the pinned tag. Dependabot proposes later releases after its cooldown.
-FROM docker.io/chromedp/headless-shell:158.0.8106.0@sha256:7e9783a01393515a5b1998a92a1ae46959f56ad3e05de8b9c0500f2e24fc3887 AS e2e-chromium
+FROM docker.io/chromedp/headless-shell:159.0.8130.0@sha256:5e1207c6b0034b96bd7aa4e933f2634a346d5c9e04e17f2b2569aabdaea16e9a AS e2e-chromium
 
 # Benchmarks (#436, scripts/bench.sh): fortio v1.76.0, the load generator and the echo server of the baseline, published
 # 2026-10-11 (GitHub release), outside the 14-day cooldown.
