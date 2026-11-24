@@ -2605,7 +2605,9 @@ no `MimicLoadTest` and creates no Job).
     is not recorded (`mimic_discovery_exchanges_total{result="load"}`). From #454 such a
     request that the admission contract then refuses (§4.1 "Admission contract") is counted
     `refused_admission` in `mimic_load_inbound_total` instead of `forwarded`, which counts
-    only the requests that reached the app. Otherwise it is
+    only the requests that reached the app; a request whose client leaves while it waits in
+    the admission queue reached neither and is counted under no `result` (the admission's own
+    `cancelled` counts it, §9). Otherwise it is
     answered by the sidecar `599`, `x-mimic-load: refused; reason=<reason>`, `content-length:
     0`, the app receiving nothing (not one byte: an `h2` sidecar opens its connection to the app
     only for the first stream it forwards); `reason` is `mode`, `workload` (another namespace or
