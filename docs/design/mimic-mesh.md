@@ -610,18 +610,21 @@ Dashboards (§9.1 of the spec) gain a *Mesh* row (calls, attempts, reasons, ejec
   gauge.
 - The HPA scales a deployment on `mimic_admission_utilization` as a `Pods` metric through the
   **custom metrics API**, served by **prometheus-adapter** (owner decision), which reads the
-  **chart-installed Prometheus by default** or an external one (`autoscaling.prometheus.url`).
-- Chart: `autoscaling.enabled` installs prometheus-adapter (image pinned by digest, distroless
-  base, non-root, Pod Security `restricted`) with one rule exposing the gauge per pod, its
-  `APIService` `v1beta1.custom.metrics.k8s.io`, RBAC and NetworkPolicy; it turns on the
-  sidecar scrape objects it needs. Mimic does not create HPAs (least privilege): the wiki gives
-  the HPA manifest (`averageValue: 700m` = 70 % of the contract).
-- Risk accepted: prometheus-adapter's last release is v0.12.0 (2024); the repository is not
-  archived and still receives commits. The integration is one rule and a standard API, so
-  replacing it (KEDA, another adapter) later changes the chart only.
-- The cluster can have only one `custom.metrics.k8s.io` APIService: the chart refuses to render
-  it when `autoscaling.adapter.existingAPIService` says one is already there, and documents
-  adding mimic's rule to the existing adapter instead.
+  **chart-installed Prometheus by default** or an external one.
+- Amended by #455 (spec §10.7 "Autoscaling on the admission contract", §12.29): the chart does
+  **not** install prometheus-adapter. Its last release is v0.12.0 (2024), and its image has 57
+  HIGH or CRITICAL Trivy findings (2026-11-24). Mimic ships reviewed values for the
+  prometheus-community chart instead, pinned by version and digest, in `deploy/autoscaling/`:
+  the one rule, an `APIService` for `custom.metrics.k8s.io` only, and a NetworkPolicy. An
+  overlay covers an external Prometheus. The chart gains one value,
+  `monitoring.prometheus.queryFrom`, so the adapter can reach the bundled Prometheus. Mimic
+  does not create HPAs (least privilege): `deploy/autoscaling/hpa.yaml` is the example
+  (`averageValue: 700m` = 70 % of the contract).
+- Risk accepted: the adapter's maintenance and image findings (spec §11.1, review by
+  2027-02-24). The integration is one rule and a standard API, so replacing it (KEDA, another
+  adapter) later changes the examples only.
+- The cluster can have only one `custom.metrics.k8s.io` APIService: a cluster that already has
+  one adds mimic's rule to its adapter, and Helm refuses to adopt the existing APIService.
 
 ## 12. Interaction with mock mode and load tests
 
