@@ -377,6 +377,18 @@ policy can take some seconds to be enforced (the kind test waits up to 30 s), an
 address, and the author's own query still reads, one aggregate at a time, anything the token can read: hence the
 read-only, scoped token.
 
+**To allow the credential in some namespaces only, add the rule to the policy.** Do not put a namespace selector on
+the binding. The policy does not check a namespace outside the selector of its binding. In that namespace, a
+`ScaledObject` can send the token to any address. Keep the binding as the file gives it, with no selector. Add a
+validation to the policy that refuses a reference to `mimic-prometheus` from another namespace. For example, to
+allow the namespace `shop` only:
+
+```yaml
+    - expression: variables.uses.size() == 0 || request.namespace in ["shop"]
+      messageExpression: >-
+        "the ClusterTriggerAuthentication mimic-prometheus cannot be used in namespace " + request.namespace
+```
+
 ### The `ScaledObject`
 
 ```yaml
@@ -549,7 +561,9 @@ Autoscaling is also only as available as the least trusted `ScaledObject` author
   whoever can write a `ScaledObject` or `ScaledJob` anywhere obtains the external Prometheus token, with every scope
   its issuer gave it. With the policy, the token goes only to the configured address over verified TLS, and the
   author's own query still reads anything the token can read: use a read-only token, scoped by prom-label-proxy or
-  by the hosted Prometheus ([An external Prometheus](#an-external-prometheus)). The policy covers `ScaledObject` and
+  by the hosted Prometheus ([An external Prometheus](#an-external-prometheus)). To allow the credential in some
+  namespaces only, add that rule to the policy. Do not put a namespace selector on the binding: the policy does not
+  check a namespace outside the selector. The policy covers `ScaledObject` and
   `ScaledJob`, the KEDA kinds whose triggers take a `serverAddress`; a KEDA bump that adds another kind able to
   reference a `ClusterTriggerAuthentication` needs the policy extended.
 - **Autoscaling is as available as the least trusted `ScaledObject` author.** One KEDA operator and one Prometheus
