@@ -55,14 +55,14 @@ documents:
 
 Before:
 
-> Requests that find no free slot of the contract are held by the inbound sidecar in a bounded queue,
+> Requests that the contract cannot admit at once are held by the inbound sidecar in a bounded queue,
 > being refused when it is full or after its 150 ms deadline has been reached.
 
 After:
 
-> If the contract has no free slot, the inbound sidecar puts the request in the queue. If the queue
-> is full, the sidecar refuses the request with `overloaded`. A request must not stay in the queue
-> for more than 150 ms. After 150 ms, the sidecar refuses the request with `queue-timeout`.
+> If the inbound sidecar cannot admit the request at once, it puts the request in the queue. If the
+> queue is full, the sidecar refuses the request with `overloaded`. A request must not stay in the
+> queue for more than 150 ms. After 150 ms, the sidecar refuses the request with `queue-timeout`.
 
 ## Scope
 
