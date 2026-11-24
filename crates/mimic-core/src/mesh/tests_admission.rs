@@ -387,6 +387,7 @@ struct Harness {
     /// The queued tickets, with their offer instant, and every ticket ever given.
     pending: BTreeMap<Ticket, Duration>,
     tickets: Vec<Ticket>,
+    /// The offers made to a contract: without one nothing is counted.
     offers: u64,
 }
 
@@ -503,7 +504,9 @@ impl Harness {
         }
         match op {
             Op::Offer => {
-                self.offers += 1;
+                if self.a.contract().is_some() {
+                    self.offers += 1;
+                }
                 let offer = self.a.offer(t, &mut self.out);
                 self.absorb(true)?;
                 let n = self.a.counts(self.last);
@@ -718,6 +721,23 @@ fn adm_06_the_same_contract_again_changes_nothing() {
     a.set_contract(contract(1000, 10), ms(50), &mut out);
     let _t = queued(a.offer(ms(50), &mut out));
     assert_eq!(a.next_instant(), Some(ms(100)));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn adm_07_an_offer_without_a_contract_is_admitted_and_counts_nothing() {
+    let mut a = Admission::new();
+    let mut out = Vec::new();
+    let held = admit_n(&mut a, 3, ms(0));
+    assert_eq!(held.len(), 3);
+    assert_eq!(a.counts(ms(10)), Counts::default());
+    // After a contract is removed, only the offers made to it stay counted.
+    a.set_contract(contract(1, 1000), ms(10), &mut out);
+    let _p = admitted(a.offer(ms(10), &mut out));
+    a.set_contract(None, ms(20), &mut out);
+    let _q = admitted(a.offer(ms(20), &mut out));
+    let n = a.counts(ms(20));
+    assert_eq!((n.admitted_at_once, n.queued, n.overloaded), (1, 0, 0));
     assert!(out.is_empty());
 }
 
