@@ -382,7 +382,8 @@ pub fn compile(route: &Route, services: &[Service], grants: Option<&[ReferenceGr
     }
 }
 
-fn bounded(text: &str) -> String {
+/// `text` cut to 1024 bytes on a character boundary (status messages).
+pub(crate) fn bounded(text: &str) -> String {
     let mut end = text.len().min(MAX_MESSAGE);
     while !text.is_char_boundary(end) {
         end -= 1;

@@ -4,6 +4,7 @@
 pub mod compact;
 pub mod discovery;
 pub mod fd;
+pub mod gateway;
 pub mod grpc;
 pub mod identity;
 pub mod inject;
