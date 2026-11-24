@@ -23,7 +23,7 @@ workspace = true
 
 [dev-dependencies]
 dhat = "0.3.3"
-json-patch = "4.2.0"
+json-patch = "5.0.0"
 jsonschema = { version = "0.60.2", default-features = false }
 p256 = "0.14.0"
 proptest = "1.12.0"
