@@ -33,7 +33,12 @@ All notable changes to mimic are documented in this file. The format follows
   replicas. It reads the bundled Prometheus; `scaledobject-external.yaml` reads an external one through a
   `ClusterTriggerAuthentication` whose token and CA are in a Secret of KEDA's namespace. New chart value
   `monitoring.prometheus.queryFrom`: NetworkPolicy peers admitted to port 9090 of the bundled Prometheus besides
-  Grafana, for the KEDA operator (each peer reads every series). KEDA 2.21 needs Kubernetes 1.34 or later. No new
+  Grafana, for the KEDA operator (each peer reads every series). `keda-auth-policy.yaml`, a
+  `ValidatingAdmissionPolicy` applied with the external variant, refuses a `ScaledObject` or `ScaledJob` whose
+  trigger uses that credential with another `serverAddress`, another type, `unsafeSsl` or a `FromEnv` key, so the
+  token reaches the configured address only. `keda-scaledobject-editor.yaml` is a ClusterRole granting `scaledobjects`
+  only, to bind per namespace. The bundled Prometheus bounds each query: `--query.timeout=15s`,
+  `--query.max-samples=5000000` and `--query.max-concurrency=4`. KEDA 2.21 needs Kubernetes 1.34 or later. No new
   `MIMIC_*` variable, metric or Rust code. See Autoscaling on the admission contract in the wiki page Monitoring.
 
 - Admission signalling (#454, M5). New sidecar metrics: `mimic_admission_requests_total{result}` (`admitted`,
