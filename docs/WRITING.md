@@ -1,16 +1,22 @@
-# Writing the spec: Simplified Technical English
+# Spec style: Simplified Technical English
 
 The spec (`docs/SPEC.md`), the design notes and the step specs are written for developers, reviewers
 and operators whose first language is not always English. We write them in the style of
 **ASD-STE100 Simplified Technical English** (STE). STE is a controlled language from the aerospace
 industry: one word has one meaning, sentences are short, and each instruction is one action. The rules
-below are our short form of the STE writing rules. They apply to all new or changed text in the spec,
-the design notes, the issue comments of the architect and the spec writer, and the wiki.
+below are our short form of the STE writing rules. They apply to all new or changed text in these
+documents:
+
+- the spec;
+- the design notes;
+- the issue comments of the architect and the spec writer;
+- the wiki.
 
 ## Words
 
 1. Use one term for one thing. Do not use synonyms. When the spec names a thing (`view`, `contract`,
-   `try`, `refusal`), use that name every time. Do not change to "attempt", "limit" or "rejection".
+   `try`, `refusal`), use that name every time. Do not change to "attempt", "admission rule" or
+   "rejection".
 2. Use a word with its main meaning only. "Close" is "to close a connection", not "near".
 3. Use simple verbs: *use*, *send*, *refuse*, *count*, *keep*. Do not use phrasal verbs ("set up",
    "carry out", "get rid of") when a simple verb exists ("configure", "do", "remove").
@@ -19,7 +25,7 @@ the design notes, the issue comments of the architect and the spec writer, and t
 5. Code names, field names, metric names and error values are technical names. Write them in
    backticks, exactly as the code writes them.
 6. Do not write more than three nouns in a row. "The admission contract queue deadline" becomes "the
-   deadline of the admission queue".
+   deadline of the queue of the admission contract".
 
 ## Sentences
 
@@ -40,8 +46,8 @@ the design notes, the issue comments of the architect and the spec writer, and t
 13. One paragraph has one topic and at most six sentences.
 14. Use a vertical list for three or more items, steps or conditions. Number the steps when their order
     is important.
-15. An acceptance criterion starts with its test level (**U**, **I**, **E**, **B**, **D**), then gives
-    the setup, the action and the expected result, in that order. Each expected result is a separate
+15. An acceptance criterion starts with its test level (§12.2, or an extra level that its section
+    defines). Then it gives the setup, the action and the expected result, in that order. Each expected result is a separate
     sentence or list item that a test can check.
 16. Put a warning or a security limit before the instruction that it applies to.
 
@@ -49,14 +55,14 @@ the design notes, the issue comments of the architect and the spec writer, and t
 
 Before:
 
-> Requests over the contract are refused by the inbound sidecar after having been held in a bounded
-> queue whose deadline, which is 150 ms, is enforced per request, unless the head can't be judged.
+> Requests that find no free slot of the contract are held by the inbound sidecar in a bounded queue,
+> being refused when it is full or after its 150 ms deadline has been reached.
 
 After:
 
-> The inbound sidecar refuses a request that is over the contract. Before it refuses the request, it
-> keeps the request in a bounded queue. Each request can wait in the queue for 150 ms at most. This
-> rule does not apply to a head that the sidecar cannot read (§4.1).
+> If the contract has no free slot, the inbound sidecar puts the request in the queue. If the queue
+> is full, the sidecar refuses the request with `overloaded`. A request must not stay in the queue
+> for more than 150 ms. After 150 ms, the sidecar refuses the request with `queue-timeout`.
 
 ## Scope
 
