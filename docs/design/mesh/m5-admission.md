@@ -199,7 +199,7 @@ sequenceDiagram
   participant S as Target pod sidecar
   participant A as Target pod app
   participant C as Controller
-  Note over G,S: target verified, a kept connection already had an x-mimic-load ok answer
+  Note over G,S: a kept connection, verified by an earlier x-mimic-load ok answer
   G->>S: GET /front/users/7 with mimic-load-run ticket
   S->>S: marker check, mode mock and ticket valid
   S->>S: admission, queue full
@@ -208,16 +208,16 @@ sequenceDiagram
   Note over S: mimic_load_inbound_total refused_admission, access line reason overloaded, admission counters at the next 100 ms tick
   G->>G: load answer, trusted refusal of the target (ADM-57)
   Note over G: mimicErrors overloaded plus 1, not in statuses nor latency, connection kept, run goes on (ADM-59)
-  Note over G,S: target not yet verified, a new connection
+  Note over G,S: no idle verified connection (the kept one is busy), so a new one
   G->>S: probe GET /load on port 15100
   S-->>G: 200 deployment, namespace, pod front-1, mode mock
   G->>S: request with ticket on the new connection
   S->>S: queued, 150 ms without a slot or token
   S-->>G: 503 x-mimic-error queue-timeout, same origin and endpoint
-  Note over G: mimicErrors queue-timeout plus 1, connection dropped, target stays unverified (PM decision 2026-11-19)
-  G->>S: probe GET /load again before the next request
+  Note over G: mimicErrors queue-timeout plus 1, the new connection had no ok answer, so it is dropped and the next new connection probes again (PM decision 2026-11-19)
+  G->>S: probe GET /load again before the next new connection
   S-->>G: 200 mode mock
-  G->>S: request with ticket
+  G->>S: request with ticket on that new connection
   S->>A: admitted, forwarded without mimic-load-run
   A-->>S: 200
   S-->>G: 200 x-mimic-load ok

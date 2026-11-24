@@ -89,6 +89,10 @@ fn marked(value: &[u8]) -> Answer {
 /// `x-mimic-origin` naming its pod, and the address dialled in its display form.
 fn inbound(head: &RefusalHead<'_>, expected: &Expected<'_>) -> Option<MimicError> {
     let pod = Origin::Pod(expected.pod.as_bytes());
+    // The printed form too, not only the parsed address as `retry::trusted` compares (spec §7.8:
+    // "equal to the `<ip>:<port>` the generator dialled"): a trusted refusal changes the run's
+    // results, and the sidecar writes `x-mimic-endpoint` with `Display`, so only that form is
+    // ever genuine. Keep the two apart.
     if head.origin.one().and_then(origin) != Some(pod) || !head.displays(expected.addr) {
         return None;
     }

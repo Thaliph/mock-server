@@ -1762,7 +1762,10 @@
             "drawStyle": "line",
             "fillOpacity": 10,
             "lineWidth": 1,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
           },
           "min": 0,
           "thresholds": {

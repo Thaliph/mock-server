@@ -165,6 +165,9 @@ const IDEMPOTENT: [&str; 6] = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE
 pub fn trusted(status: u16, fields: &[(&[u8], &[u8])], pod: Option<SocketAddr>) -> Option<Refusal> {
     let pod = pod?;
     let head = refusal::refusal_head(status, fields.iter().copied())?;
+    // The parsed address is enough here (spec §7.9: "parses as ... and equals the pod
+    // address"): a non-canonical form of the pod's own address names that pod, and a refusal
+    // only turns into another try. `load::answer` also asks the printed form; keep the two apart.
     if head.endpoint != pod {
         return None;
     }
