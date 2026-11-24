@@ -1243,6 +1243,36 @@ async fn rty_37_every_pod_refusing_passes_the_last_answer_after_four_tries() {
 }
 
 #[tokio::test]
+async fn adm_51_a_forwarded_app_refusal_is_labelled_connect_failed() {
+    let _logs = capture_logs();
+    let pods = [
+        Probe::start("a", false, Mode::AppRefused(Some("inbound"))).await,
+        Probe::start("b", false, Mode::AppRefused(Some("inbound"))).await,
+        Probe::start("c", false, Mode::AppRefused(Some("inbound"))).await,
+    ];
+    let state = state_for(
+        cluster_ip(),
+        &[pods[0].addr, pods[1].addr, pods[2].addr],
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let (head, _) = h1_request(&mut client, "POST", b"abc").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(
+            &scrape,
+            "mimic_mesh_requests_total{",
+            &["reason=\"connect-failed\""]
+        ),
+        1.0,
+        "{scrape}"
+    );
+    assert!(!scrape.contains("app-refused"), "{scrape}");
+}
+
+#[tokio::test]
 async fn rty_37_a_connect_failed_without_a_valid_origin_is_passed_as_received() {
     let _logs = capture_logs();
     for origin in [None, Some("outbound"), Some("inbound; pod=A")] {

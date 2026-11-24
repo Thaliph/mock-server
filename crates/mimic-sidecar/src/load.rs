@@ -18,6 +18,7 @@ use hyper::body::Bytes;
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::{Response, StatusCode};
 use mimic_core::Mode;
+use mimic_core::load::answer;
 use mimic_core::load::ticket::{self, Payload};
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
@@ -33,7 +34,7 @@ use crate::tls::TlsConfig;
 /// The request header that carries the ticket.
 pub const REQUEST_HEADER: &str = "mimic-load-run";
 /// The answer header: `ok`, or `refused; reason=<reason>`.
-pub const MARKER_HEADER: &str = "x-mimic-load";
+pub const MARKER_HEADER: &str = answer::MARKER;
 /// Verified tickets kept, the last seen: a request costs a lookup.
 const MAX_VERIFIED: usize = 16;
 const ENABLED_VAR: &str = "MIMIC_LOAD_ENABLED";
@@ -105,8 +106,26 @@ impl Refusal {
 
     /// The value of `x-mimic-load` that says it.
     pub fn header_value(self) -> HeaderValue {
-        HeaderValue::from_str(&format!("refused; reason={}", self.as_str()))
+        HeaderValue::from_str(&format!("{}{}", answer::REFUSED, self.as_str()))
             .unwrap_or_else(|_| HeaderValue::from_static("refused"))
+    }
+}
+
+/// What became of a load request whose ticket passed (spec §7.8 "Sidecar").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Passed {
+    /// Admitted by the contract, or no contract: passed on to the app.
+    Forwarded,
+    /// Refused `overloaded` or `queue-timeout` by the admission contract.
+    RefusedAdmission,
+}
+
+impl Passed {
+    fn result(self) -> &'static str {
+        match self {
+            Passed::Forwarded => "forwarded",
+            Passed::RefusedAdmission => "refused_admission",
+        }
     }
 }
 
@@ -152,9 +171,11 @@ impl Marker {
                 result: refusal.result(),
             });
         }
-        let _ = results.get_or_create(&ResultLabel {
-            result: "forwarded",
-        });
+        for passed in [Passed::Forwarded, Passed::RefusedAdmission] {
+            let _ = results.get_or_create(&ResultLabel {
+                result: passed.result(),
+            });
+        }
         metrics.registry_mut().register(
             "load_inbound",
             "Inbound requests carrying mimic-load-run, by result",
@@ -171,8 +192,9 @@ impl Marker {
         }))
     }
 
-    /// Judges the `mimic-load-run` headers of a request, counts the result and, for a refusal,
-    /// writes the warning of its reason once per mode period. `Ok` is the run's uid.
+    /// Judges the `mimic-load-run` headers of a request and, for a refusal, counts it and writes
+    /// the warning of its reason once per mode period. `Ok` is the run's uid: a pass is counted
+    /// later, with [`Marker::passed`], once its admission is decided.
     pub fn admit(&self, headers: &HeaderMap) -> Result<String, Refusal> {
         let values: Vec<&[u8]> = headers
             .get_all(REQUEST_HEADER)
@@ -185,15 +207,26 @@ impl Marker {
     /// [`Marker::admit`] for the values of the `mimic-load-run` headers of a request head.
     pub fn admit_values(&self, values: &[&[u8]]) -> Result<String, Refusal> {
         let decided = self.decide(values);
-        let result = match decided {
-            Ok(_) => "forwarded",
-            Err(refusal) => refusal.result(),
-        };
-        self.0.results.get_or_create(&ResultLabel { result }).inc();
         if let Err(refusal) = decided {
+            self.0
+                .results
+                .get_or_create(&ResultLabel {
+                    result: refusal.result(),
+                })
+                .inc();
             self.warn(refusal);
         }
         decided
+    }
+
+    /// Counts one ticket that passed, exactly once per request.
+    pub(crate) fn passed(&self, end: Passed) {
+        self.0
+            .results
+            .get_or_create(&ResultLabel {
+                result: end.result(),
+            })
+            .inc();
     }
 
     /// Whether `headers` carry the marker at all.
@@ -295,7 +328,7 @@ async fn identity(State(marker): State<Marker>) -> impl IntoResponse {
 /// one `ok` stays.
 pub fn mark_answer(headers: &mut HeaderMap) {
     headers.remove(MARKER_HEADER);
-    headers.insert(MARKER_HEADER, HeaderValue::from_static("ok"));
+    headers.insert(MARKER_HEADER, HeaderValue::from_static(answer::OK));
 }
 
 /// The body of a forwarded or sidecar-made answer.

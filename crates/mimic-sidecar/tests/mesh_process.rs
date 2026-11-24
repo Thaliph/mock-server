@@ -67,6 +67,22 @@ fn metric(admin: std::net::SocketAddr, name: &str) -> Option<f64> {
         .and_then(|l| l.rsplit(' ').next()?.parse().ok())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adm_53_the_binary_with_the_mesh_off_has_no_admission_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = mesh_api(vec![], Reply::Hold).await;
+    let mut process = sidecar(&api, dir.path(), &[("MIMIC_MESH", "off")]);
+    let admin = process.admin_addr();
+    wait_status(admin, "/readyz", 200, Duration::from_secs(10));
+    let (status, body) = http_get(admin, "/metrics");
+    assert_eq!(status, 200);
+    assert!(body.contains("mimic_build_info"), "a scrape of the sidecar");
+    assert!(
+        !body.contains("mimic_admission_"),
+        "an admission family with the mesh off"
+    );
+}
+
 #[test]
 fn msh_31_an_invalid_variable_exits_2() {
     for (var, value) in [

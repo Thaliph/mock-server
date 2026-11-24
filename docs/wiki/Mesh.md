@@ -942,8 +942,11 @@ as usual, within their 150 ms.
 `queue-timeout` and no `upstream` ([Access logs](Access-logs)), and counts in `mimic_http_requests_total` like any
 exchange. Discovery does not record it (it counts in `mimic_discovery_exchanges_total{result="synthetic"}`), so a
 mock never replays it. No component line is written per refusal. On the caller's side,
-`mimic_mesh_retries_total{reason=~"overloaded|queue_timeout"}` counts the retries. The admission metrics, the line
-`admission contract changed` and the dashboards come with #454.
+`mimic_mesh_retries_total{reason=~"overloaded|queue_timeout"}` counts the retries. On the pod,
+`mimic_admission_requests_total{result}` counts the offers by result, `mimic_admission_utilization` is the share of
+the contract in use over 15 s (refused demand included, so above 1 under overload), and each change of the contract
+in force writes one INFO `admission contract changed`; see [Admission metrics](Monitoring#admission-metrics) and the
+*Admission* row of the `mimic-sidecar` dashboard.
 
 **Who sets it.** Whoever may write `mimicconfigs` in the Deployment's namespace; `targetRefs` cannot leave the
 namespace. A contract is overload protection, not access control (use a NetworkPolicy for that), and it does not
@@ -952,45 +955,13 @@ callers are then refused too.
 
 ### Sizing a contract with a load test
 
-A contract should sit a little below what one pod serves before its latency collapses. A
-[load test](Load-test) measures that: it sends to the pod addresses of the deployment directly, and its requests
-go through the contract like any other. The deployment must be in mode `mock`, so its own calls are answered by the
-mock.
-
-1. **Find the saturation point of one pod, without a contract.** With the deployment scaled to one replica (so the
-   numbers of the run are those of one pod), run tests of increasing `concurrency`:
-
-   ```yaml
-   apiVersion: mimic.platform.io/v1alpha1
-   kind: MimicLoadTest
-   metadata: {name: cart-c32, namespace: shop}
-   spec:
-     deployment: cart
-     duration: 2m
-     concurrency: 32
-   ```
-
-   `kubectl -n shop get mimicloadtest cart-c32 -o json | jq .status.results` gives the requests per second and the
-   p50, p90 and p99 latency. The point where the requests per second stop rising while the p99 keeps growing is the
-   pod's saturation. Note the `concurrency` and the requests per second just before it.
-
-2. **Set the contract below it**, for example 80 % of both, in the Deployment's `MimicConfig` (`admission:
-   {concurrency: …, rps: …}`). Count the long-lived responses the app serves (SSE, gRPC streams): each holds a slot
-   for its whole life.
-
-3. **Check it above the contract with a client that is not a load test.** A load test stops at the first refusal:
-   a refusal has no `x-mimic-load` field, so the generator ends the run `Unverified` (load tests count refusals from
-   #454). From a pod without a mimic sidecar (a meshed caller retries the refusals on other pods), send about twice the contract to one pod's IP (or through the Service, still at one
-   replica) with fortio or hey instead, for example
-   `fortio load -qps <2 × rps> -c <2 × concurrency> -uniform -t 30s http://<pod ip>:<port>/` (`-uniform` spreads
-   the connections in time; started together, they send in bursts). Or keep the load test at or
-   below the contract and read the refusals from the access lines. The app never has more than `concurrency`
-   requests in flight and an admitted request waits at most 150 ms in the queue, so the latency of the admitted
-   requests should stay close to that of step 1 at that concurrency instead of collapsing. On the pod,
-   `kubectl -n shop logs deploy/cart -c mimic-sidecar | jq -c 'select(.reason == "overloaded" or .reason == "queue-timeout") | {path, status, reason, duration_ms}'`
-   shows them.
-
-4. **Scale back.** The capacity is now `replicas × contract`; size the replicas (or the HPA) from it.
+A contract should sit a little below what one pod serves before its latency breaks. A [load test](Load-test)
+measures that: it sends to the pod addresses of the deployment directly, and its requests go through the contract
+like any other. The generator counts the refusals of the targets' sidecars in the run's `mimicErrors` and goes on,
+so a run above the contract shows its refusals instead of a latency collapse. The four steps (an open-model run
+without a contract at rising rates, a contract below the break, a second run, then the utilisation at the planned
+load) are in [Finding and setting the contract](Load-test#finding-and-setting-the-contract). The capacity is then
+`replicas × contract`; size the replicas (or the HPA) from it.
 
 ## Observability
 
@@ -1037,7 +1008,8 @@ after `MIMIC_MESH_STARTUP_WAIT`).
 
 An inbound request the [admission contract](#admission-contract) refused has an access line with `status` 503,
 `reason` `overloaded` or `queue-timeout` and no `upstream`; it counts in `mimic_http_requests_total` and in
-`mimic_discovery_exchanges_total{result="synthetic"}`. The admission metrics are #454.
+`mimic_discovery_exchanges_total{result="synthetic"}`. The `mimic_admission_*` metrics of the contract and the
+INFO line `admission contract changed` are in [Monitoring](Monitoring#admission-metrics).
 
 ## Limits
 
@@ -1140,6 +1112,11 @@ An inbound request the [admission contract](#admission-contract) refused has an 
 - **The refusal names the pod**: `x-mimic-endpoint` and `x-mimic-origin` give the pod address the caller dialled and
   the pod name, as the inbound `connect-failed` answer does. The caller already knows the address; a pod name is not
   a secret.
+- **Callers drive the utilisation, and the admission metrics lag.** `mimic_admission_utilization` counts refused
+  demand and is not capped, so any client that can reach a pod IP, and a namespace writer that lowers the contract,
+  raise it. The admission metrics are taken every 100 ms: a scrape can miss the latest 100 ms, and the last 100 ms
+  before the sidecar exits are never exported (the access lines count every refusal at once). See
+  [Monitoring](Monitoring#limits).
 - Not yet: active health checks.
 
 ## What is coming
@@ -1149,6 +1126,7 @@ An inbound request the [admission contract](#admission-contract) refused has an 
 - **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts ([Timeouts](#timeouts)) and mirrors ([Mirroring](#mirroring)) are in.
 - **M4**: outlier detection and circuit breaker ([above](#outlier-detection-and-circuit-breaker)) and fault injection
   ([Fault injection](#fault-injection)) are in.
-- **M5**: the admission contract is in ([Admission contract](#admission-contract)); its metrics, the line
-  `admission contract changed` and the dashboards (#454), and the HPA (#455) are coming.
+- **M5**: the admission contract is in ([Admission contract](#admission-contract)), and so are its metrics, the line
+  `admission contract changed`, the dashboard rows and load tests counting refusals (#454,
+  [Monitoring](Monitoring#admission-metrics)); the HPA (#455) is coming.
 - **M6**: north-south gateway.

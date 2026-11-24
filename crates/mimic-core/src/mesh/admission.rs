@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::reason::Reason;
+
 /// Largest `admission.concurrency` (the smallest is 1).
 pub const MAX_CONCURRENCY: u32 = 100_000;
 /// Largest `admission.rps` (the smallest is 1).
@@ -76,10 +78,10 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    pub fn as_str(self) -> &'static str {
+    pub const fn reason(self) -> Reason {
         match self {
-            Refusal::Overloaded => "overloaded",
-            Refusal::QueueTimeout => "queue-timeout",
+            Refusal::Overloaded => Reason::Overloaded,
+            Refusal::QueueTimeout => Reason::QueueTimeout,
         }
     }
 }
@@ -107,7 +109,8 @@ pub struct Resolved {
     pub verdict: Verdict,
 }
 
-/// ADM-07, the input of #454. Every field is cumulative except the first two.
+/// ADM-07, the input of #454: the offers made to a contract (one made without is not
+/// counted). Every field is cumulative except the first two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counts {
     pub in_flight: u32,
@@ -198,8 +201,9 @@ impl Admission {
     pub fn offer(&mut self, now: Duration, out: &mut Vec<Resolved>) -> Offer {
         self.advance(now);
         self.apply_queue(out);
+        // Without a contract nothing is offered to one: admitted, and not counted (spec §9
+        // `mimic_admission_requests_total`).
         let Some(contract) = self.contract else {
-            self.counts.admitted_at_once += 1;
             return Offer::Admitted(Permit { epoch: self.epoch });
         };
         if self.queue.is_empty() && self.can_admit(contract) {

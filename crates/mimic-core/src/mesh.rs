@@ -11,10 +11,13 @@ pub mod lb;
 pub mod mirror;
 pub mod outlier;
 pub mod policy;
+pub mod reason;
+pub mod refusal;
 pub mod retry;
 pub mod route;
 pub mod strip;
 pub mod timeout;
+pub mod utilization;
 pub mod view;
 
 #[cfg(test)]
@@ -52,6 +55,8 @@ mod tests_policy;
 #[cfg(test)]
 mod tests_prop;
 #[cfg(test)]
+mod tests_reason;
+#[cfg(test)]
 mod tests_retry;
 #[cfg(test)]
 mod tests_route;
@@ -61,3 +66,5 @@ mod tests_routes_view;
 mod tests_strip;
 #[cfg(test)]
 mod tests_timeout;
+#[cfg(test)]
+mod tests_utilization;

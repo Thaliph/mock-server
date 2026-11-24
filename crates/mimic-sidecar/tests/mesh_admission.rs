@@ -5,51 +5,20 @@
 mod common;
 
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::admission::{
-    ANSWER_TIMEOUT, Answer, App, call, contract, inbound, no_contract, refusal_fields,
+    ANSWER_TIMEOUT, Answer, App, call, contract, from_env, hold_slot, inbound, no_contract,
+    persist, refusal_fields, rig, spawn_call,
 };
 use common::faults::no_series;
 use common::mesh_pods::meshed;
-use common::{
-    Fixture, H2Sender, Logs, capture_logs, counted, fixture_mesh_on, h2_client, h2_send, metric,
-    until,
-};
+use common::{capture_logs, counted, fixture_mesh_on, h2_client, h2_send, metric, until};
 use http_body_util::BodyExt;
 use hyper::Request;
-use mimic_runtime::config::Env;
-use mimic_sidecar::mesh::{MeshConfig, MeshState};
-use tokio::task::JoinHandle;
 
 const ORIGIN: &str = "inbound; pod=cart-7d9f-x2k";
-
-/// An app answering after `delay_ms`, and a meshed sidecar in front of it holding `view`.
-async fn rig(view: mimic_core::mesh::view::View, delay_ms: u64) -> (App, MeshState, Fixture) {
-    let app = App::h2c(delay_ms).await;
-    let state = meshed(Some("cart-7d9f-x2k"), |_| {});
-    state.hold(view, "\"1-a\"");
-    let f = inbound(app.addr, &state, |s| s).await;
-    (app, state, f)
-}
-
-/// Sends `/` on a clone of `sender` in a task.
-fn spawn_call(sender: &H2Sender, path: &'static str) -> JoinHandle<Answer> {
-    let mut sender = sender.clone();
-    tokio::spawn(async move { call(&mut sender, path, &[]).await })
-}
-
-/// A held slot: a `/` the app holds (its delay is set long before), sent first.
-async fn hold_slot(app: &App, sender: &H2Sender) -> JoinHandle<Answer> {
-    let before = app.counts.requests();
-    let held = spawn_call(sender, "/");
-    until("the app holds the first request", || {
-        app.counts.requests() > before && app.counts.in_flight() >= 1
-    })
-    .await;
-    held
-}
 
 fn assert_refused(answer: &Answer, error: &str, app: std::net::SocketAddr) {
     assert_eq!(answer.status, 503, "{answer:?}");
@@ -59,16 +28,6 @@ fn assert_refused(answer: &Answer, error: &str, app: std::net::SocketAddr) {
         "{answer:?}"
     );
     assert!(answer.body.is_empty(), "{answer:?}");
-}
-
-/// The lines of `message` so far.
-async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
-    logs.settled().await;
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["message"] == message)
-        .collect()
 }
 
 #[tokio::test]
@@ -426,7 +385,7 @@ async fn adm_24_a_stale_view_keeps_its_contract() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     state.tick();
     assert_eq!(
-        lines(&logs, "mesh view stale").await.len(),
+        logs.messages("mesh view stale").await.len(),
         1,
         "the view is stale"
     );
@@ -434,38 +393,6 @@ async fn adm_24_a_stale_view_keeps_its_contract() {
     let _held = hold_slot(&app, &client).await;
     let next = call(&mut client, "/", &[]).await;
     assert_refused(&next, "queue-timeout", app.addr);
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-/// `<dir>/state/mesh.json` holding `view`, fetched now.
-fn persist(dir: &std::path::Path, view: &mimic_core::mesh::view::View) {
-    std::fs::create_dir_all(dir.join("state")).unwrap();
-    std::fs::write(
-        dir.join("state").join("mesh.json"),
-        format!(
-            "{{\"fetchedAt\":{},\"view\":{}}}",
-            unix_now(),
-            view.to_json()
-        ),
-    )
-    .unwrap();
-}
-
-/// A meshed state of `MIMIC_MESH=on` with no controller, its state file in `dir`.
-fn from_env(dir: &std::path::Path, vars: &[(&str, &str)]) -> MeshState {
-    let env = Env::from_pairs(
-        [("MIMIC_MESH", "on"), ("MIMIC_POD_NAME", "cart-7d9f-x2k")]
-            .iter()
-            .chain(vars)
-            .map(|(k, v)| (k.to_string(), v.to_string())),
-    );
-    MeshState::new(&MeshConfig::from_env(&env, dir).unwrap())
 }
 
 #[tokio::test]
@@ -497,7 +424,7 @@ async fn adm_28_without_a_view_one_warning_after_the_startup_wait_and_nothing_he
     let six: Vec<_> = (0..6).map(|_| spawn_call(&client, "/")).collect();
     tokio::time::sleep_until((t0 + Duration::from_millis(150)).into()).await;
     assert!(
-        lines(&logs, "admission contract unknown").await.is_empty(),
+        logs.messages("admission contract unknown").await.is_empty(),
         "no warning before the startup wait"
     );
     for answer in six {
@@ -505,12 +432,12 @@ async fn adm_28_without_a_view_one_warning_after_the_startup_wait_and_nothing_he
     }
     assert_eq!(app.counts.max_in_flight(), 6, "nothing is held");
     tokio::time::sleep_until((t0 + Duration::from_secs(1)).into()).await;
-    let warned = lines(&logs, "admission contract unknown").await;
+    let warned = logs.messages("admission contract unknown").await;
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert_eq!(warned[0]["level"], "WARN");
     assert_eq!(warned[0]["target"], "mesh");
     tokio::time::sleep_until((t0 + Duration::from_millis(1600)).into()).await;
-    assert_eq!(lines(&logs, "admission contract unknown").await.len(), 1);
+    assert_eq!(logs.messages("admission contract unknown").await.len(), 1);
     state.hold(contract(1, 1000), "\"1-a\"");
     app.counts.delay_ms.store(1000, Ordering::SeqCst);
     let mut client = client;
@@ -537,7 +464,7 @@ async fn adm_28_a_persisted_or_timely_view_writes_no_warning() {
     tokio::time::sleep_until((t0 + Duration::from_millis(100)).into()).await;
     other.hold(no_contract(), "\"1-a\"");
     tokio::time::sleep_until((t0 + Duration::from_millis(900)).into()).await;
-    assert!(lines(&logs, "admission contract unknown").await.is_empty());
+    assert!(logs.messages("admission contract unknown").await.is_empty());
 }
 
 #[tokio::test]

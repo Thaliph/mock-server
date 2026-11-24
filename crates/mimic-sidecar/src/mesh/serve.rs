@@ -26,6 +26,7 @@ use mimic_core::mesh::fault;
 use mimic_core::mesh::head::{Stop, leaves};
 use mimic_core::mesh::mirror::{self, Candidate};
 use mimic_core::mesh::outlier::Outcome as Counted;
+use mimic_core::mesh::reason::Reason;
 use mimic_core::mesh::retry::{
     Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
 };
@@ -55,8 +56,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The answer to a head the reader refuses (spec §4.1 limit 1).
 const REFUSED: &[u8] = b"HTTP/1.1 400 Bad Request\r\nx-mimic-error: invalid-request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-/// The `x-mimic-error` of an abort (spec §7.9 "Fault injection").
-const FAULT_INJECTED: &str = "fault-injected";
 /// How long the sidecar reads and discards what the client still sends after a refusal, so
 /// that closing the socket does not reset the connection before the client read the answer.
 const REFUSAL_LINGER: Duration = Duration::from_millis(250);
@@ -364,7 +363,7 @@ enum Selected<'a> {
         view: Option<&'a RouteView>,
         rule: usize,
         status: StatusCode,
-        reason: &'static str,
+        reason: Reason,
         backend: &'static str,
     },
 }
@@ -717,7 +716,7 @@ impl Serving {
             "none",
             &self.backend.label,
             StatusCode::BAD_REQUEST,
-            "invalid-request",
+            Some(Reason::InvalidRequest),
             Instant::now(),
         );
     }
@@ -751,15 +750,13 @@ impl Serving {
         if req.method() == Method::CONNECT || (http1 && req.headers().contains_key(header::UPGRADE))
         {
             let (tracker, _) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
-            self.count(
-                "none",
-                &self.backend.label,
-                StatusCode::NOT_IMPLEMENTED,
-                "unsupported",
+            return Ok(self.own_answer(
+                tracker,
+                ("none", &self.backend.label),
+                (StatusCode::NOT_IMPLEMENTED, Reason::Unsupported),
+                http1,
                 began,
-            );
-            tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16(), "unsupported");
-            return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", http1));
+            ));
         }
         let mut req = req;
         if http1 {
@@ -858,9 +855,13 @@ impl Serving {
                         route = &view.name;
                         tracker.matched(route, rule);
                     }
-                    self.count(route, backend, status, reason, began);
-                    tracker.synthetic(status.as_u16(), reason);
-                    return Ok(answer(status, reason, false));
+                    return Ok(self.own_answer(
+                        tracker,
+                        (route, backend),
+                        (status, reason),
+                        false,
+                        began,
+                    ));
                 }
             }
         } else if !direct {
@@ -1028,11 +1029,7 @@ impl Serving {
                     if http1 {
                         strip_hop_by_hop(answered.headers_mut(), false);
                     }
-                    let reason = refusal.map_or("none", |r| match r {
-                        Refusal::Overloaded => "overloaded",
-                        Refusal::QueueTimeout => "queue-timeout",
-                        Refusal::AppRefused => "app-refused",
-                    });
+                    let reason = refusal.map(Refusal::reason);
                     self.count(route, backend, answered.status(), reason, began);
                     return Ok(answered.map(|body| MeshBody {
                         upstream: Some(body),
@@ -1126,16 +1123,14 @@ impl Serving {
         backend: &Backend,
         began: Instant,
     ) -> Response<MeshBody> {
-        self.count(
-            route,
-            &backend.label,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "breaker-open",
-            began,
-        );
         tracker.backend(&backend.label);
-        tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "breaker-open");
-        answer(StatusCode::SERVICE_UNAVAILABLE, "breaker-open", false)
+        self.own_answer(
+            tracker,
+            (route, &backend.label),
+            (StatusCode::SERVICE_UNAVAILABLE, Reason::BreakerOpen),
+            false,
+            began,
+        )
     }
 
     /// The fault of the request (spec §7.9 "Fault injection"), with the faults of the drawn
@@ -1175,14 +1170,18 @@ impl Serving {
     ) -> Response<MeshBody> {
         // The view holds statuses 200 to 599 only.
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-        self.count(route, &backend.label, status, FAULT_INJECTED, began);
         self.mesh.router().metrics.fault(&backend.label, "abort");
         tracker.backend(&backend.label);
         tracker.fault(fault::Kind::Abort {
             status: status.as_u16(),
         });
-        tracker.synthetic(status.as_u16(), FAULT_INJECTED);
-        answer(status, FAULT_INJECTED, close)
+        self.own_answer(
+            tracker,
+            (route, &backend.label),
+            (status, Reason::FaultInjected),
+            close,
+            began,
+        )
     }
 
     /// Waits an injected delay (spec §7.9 "Fault injection"): `Err` with the route timeout that
@@ -1206,15 +1205,13 @@ impl Serving {
         backend: &str,
         began: Instant,
     ) -> Response<MeshBody> {
-        self.count(
-            route,
-            backend,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no-endpoint",
+        self.own_answer(
+            tracker,
+            (route, backend),
+            (StatusCode::SERVICE_UNAVAILABLE, Reason::NoEndpoint),
+            false,
             began,
-        );
-        tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "no-endpoint");
-        answer(StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", false)
+        )
     }
 
     /// The call ends on a route timeout before the response head: the `504`, counted and
@@ -1236,11 +1233,11 @@ impl Serving {
             route,
             backend,
             StatusCode::GATEWAY_TIMEOUT,
-            "timeout",
+            Some(Reason::Timeout),
             began,
         );
         tracker.timed_out(kind);
-        answer(StatusCode::GATEWAY_TIMEOUT, "timeout", close)
+        answer(StatusCode::GATEWAY_TIMEOUT, Reason::Timeout, close)
     }
 
     /// The rule of `routed` that matches the request and its drawn backend, or the answer of
@@ -1251,7 +1248,7 @@ impl Serving {
                 view: None,
                 rule: 0,
                 status: StatusCode::NOT_FOUND,
-                reason: "no-route",
+                reason: Reason::NoRoute,
                 backend: NO_BACKEND,
             };
         };
@@ -1265,8 +1262,8 @@ impl Serving {
             backend,
         };
         match draw(backends, self.mesh.router().random()) {
-            Pick::NoBackend => invalid("no-backend", NO_BACKEND),
-            Pick::Invalid => invalid("invalid-backend", INVALID_BACKEND),
+            Pick::NoBackend => invalid(Reason::NoBackend, NO_BACKEND),
+            Pick::Invalid => invalid(Reason::InvalidBackend, INVALID_BACKEND),
             Pick::Backend(i) => {
                 let b = &backends[i];
                 let found = b
@@ -1281,7 +1278,7 @@ impl Serving {
                         backend,
                     },
                     // A backend the view does not hold is as invalid as one it names so.
-                    None => invalid("invalid-backend", INVALID_BACKEND),
+                    None => invalid(Reason::InvalidBackend, INVALID_BACKEND),
                 }
             }
         }
@@ -1401,31 +1398,23 @@ impl Serving {
         match failure {
             Failure::Connect => {
                 tracing::debug!(%upstream, "connect failed");
-                self.count(
-                    route,
-                    backend,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "connect-failed",
-                    began,
-                );
-                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "connect-failed");
-                Ok(answer(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "connect-failed",
+                Ok(self.own_answer(
+                    tracker,
+                    (route, backend),
+                    (StatusCode::SERVICE_UNAVAILABLE, Reason::ConnectFailed),
                     false,
+                    began,
                 ))
             }
             Failure::Response => {
                 tracing::debug!(%upstream, "the pod's response head was refused");
-                self.count(
-                    route,
-                    backend,
-                    StatusCode::BAD_GATEWAY,
-                    "invalid-response",
+                Ok(self.own_answer(
+                    tracker,
+                    (route, backend),
+                    (StatusCode::BAD_GATEWAY, Reason::InvalidResponse),
+                    false,
                     began,
-                );
-                tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16(), "invalid-response");
-                Ok(answer(StatusCode::BAD_GATEWAY, "invalid-response", false))
+                ))
             }
             _ => {
                 tracing::debug!(%upstream, "the pod did not answer");
@@ -1441,12 +1430,27 @@ impl Serving {
         }
     }
 
+    /// One of the sidecar's own answers (`x-mimic-error`, no body): counted, logged and
+    /// written; with `close` the connection ends.
+    fn own_answer(
+        &self,
+        tracker: Tracker,
+        (route, backend): (&str, &str),
+        (status, reason): (StatusCode, Reason),
+        close: bool,
+        began: Instant,
+    ) -> Response<MeshBody> {
+        self.count(route, backend, status, Some(reason), began);
+        tracker.synthetic(status.as_u16(), reason);
+        answer(status, reason, close)
+    }
+
     fn count(
         &self,
         route: &str,
         backend: &str,
         status: StatusCode,
-        reason: &'static str,
+        reason: Option<Reason>,
         began: Instant,
     ) {
         self.mesh.router().metrics.request(
@@ -1469,7 +1473,7 @@ impl Serving {
                 route,
                 backend,
                 status_class: "none",
-                reason: "none",
+                reason: None,
             },
             began.elapsed(),
         );
@@ -1748,11 +1752,11 @@ fn request_parts<'a>(head: &'a Parts, fields: &'a [(&'a str, &'a [u8])]) -> Requ
 }
 
 /// An answer of the sidecar: `x-mimic-error` and no body. With `close` the connection ends.
-fn answer(status: StatusCode, reason: &'static str, close: bool) -> Response<MeshBody> {
+fn answer(status: StatusCode, reason: Reason, close: bool) -> Response<MeshBody> {
     let mut response = Response::new(MeshBody::empty());
     *response.status_mut() = status;
     let headers = response.headers_mut();
-    headers.insert("x-mimic-error", HeaderValue::from_static(reason));
+    headers.insert("x-mimic-error", HeaderValue::from_static(reason.as_str()));
     // A `204` or a `304` has no content and no `content-length` (RFC 9110 §8.6).
     if status != StatusCode::NO_CONTENT && status != StatusCode::NOT_MODIFIED {
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
@@ -1837,4 +1841,18 @@ fn head_end(buf: &[u8]) -> Option<usize> {
         start = at + 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REFUSED, Reason};
+
+    #[test]
+    fn adm_51_the_refused_head_answer_carries_the_invalid_request_reason() {
+        let field = format!("\r\nx-mimic-error: {}\r\n", Reason::InvalidRequest.as_str());
+        assert!(
+            REFUSED.windows(field.len()).any(|w| w == field.as_bytes()),
+            "REFUSED does not write Reason::InvalidRequest"
+        );
+    }
 }

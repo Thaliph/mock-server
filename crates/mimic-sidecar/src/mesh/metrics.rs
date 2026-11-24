@@ -14,6 +14,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::{Registry, Unit};
 
+use mimic_core::mesh::reason::Reason;
 use mimic_core::mesh::retry::Outcome;
 
 use crate::red::DURATION_BUCKETS;
@@ -668,6 +669,7 @@ impl MeshMetrics {
     /// One mesh-routed request that got a response (or none: `status_class` `none`).
     pub(crate) fn request(&self, call: &Call<'_>, elapsed: Duration) {
         let route = self.route_label(call);
+        let reason = call.reason.map_or("none", Reason::as_str);
         // The answers of the sidecar that name no backend have no series to evict.
         if !matches!(call.backend, NO_BACKEND | INVALID_BACKEND) {
             self.track(
@@ -676,7 +678,7 @@ impl MeshMetrics {
                     call.service.to_string(),
                     route.clone(),
                     call.status_class,
-                    call.reason,
+                    reason,
                 )),
             );
         }
@@ -686,7 +688,7 @@ impl MeshMetrics {
                 route,
                 backend: call.backend.to_string(),
                 status_class: call.status_class,
-                reason: call.reason,
+                reason,
             })
             .inc();
         self.durations
@@ -710,7 +712,7 @@ impl MeshMetrics {
             call.service.to_string(),
             call.backend.to_string(),
             call.status_class,
-            call.reason,
+            call.reason.map_or("none", Reason::as_str),
         );
         if !routes.map.contains_key(call.route) {
             let label = if routes.labelled < MAX_ROUTES {
@@ -814,7 +816,9 @@ pub(crate) struct Call<'a> {
     pub route: &'a str,
     pub backend: &'a str,
     pub status_class: &'static str,
-    pub reason: &'static str,
+    /// The `x-mimic-error` of an answer of the sidecar or a passed trusted refusal; `none`
+    /// when the answer is the pod's.
+    pub reason: Option<Reason>,
 }
 
 #[cfg(test)]

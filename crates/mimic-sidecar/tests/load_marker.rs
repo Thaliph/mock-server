@@ -1328,3 +1328,123 @@ async fn adm_26_h2c_the_marker_is_checked_before_admission() {
     assert_eq!(answer.status, 200);
     assert_eq!(answer.header("x-mimic-load"), vec!["ok"]);
 }
+
+// --- ADM-56: refused_admission ------------------------------------------------------------
+
+const LOAD_RESULTS: [&str; 5] = [
+    "forwarded",
+    "refused_admission",
+    "refused_mode",
+    "refused_ticket",
+    "refused_workload",
+];
+
+/// The ADM-26 set-up on `app`: contract 1/1000 held, a meshed inbound rig in mode `mock`.
+async fn admission_rig(app: SocketAddr, root: &Root) -> (Rig, mimic_sidecar::mesh::MeshState) {
+    let state = common::mesh_pods::meshed(Some("p"), |_| {});
+    state.hold(common::admission::contract(1, 1000), "\"1-a\"");
+    let rig = rig_meshed(
+        &app_at(app),
+        Mode::Mock,
+        Some(root),
+        true,
+        None,
+        Some(&state),
+    )
+    .await;
+    (rig, state)
+}
+
+fn assert_load_counts(rig: &Rig, forwarded: u64, refused_admission: u64, step: &str) {
+    assert_eq!(
+        (
+            rig.load_counter("forwarded"),
+            rig.load_counter("refused_admission")
+        ),
+        (forwarded, refused_admission),
+        "{step}"
+    );
+    for result in ["refused_mode", "refused_ticket", "refused_workload"] {
+        assert_eq!(rig.load_counter(result), 0, "{step}: {result}");
+    }
+}
+
+#[tokio::test]
+async fn adm_56_http1_a_load_request_refused_by_admission_counts_refused_admission() {
+    let root = root("deployment root");
+    let app = common::admission::App::http1(1000).await;
+    let (rig, _state) = admission_rig(app.addr, &root).await;
+    // (0) Every series exists at 0 from the start.
+    let scrape = rig.metrics.encode();
+    for result in LOAD_RESULTS {
+        let series = format!("mimic_load_inbound_total{{result=\"{result}\"}} 0");
+        assert!(scrape.lines().any(|l| l == series), "{series}");
+    }
+    // (1) R1 holds the slot: forwarded once admitted, before the app answers.
+    let mut a = TcpStream::connect(rig.addr).await.unwrap();
+    a.write_all(&get(Some(&valid(&root)))).await.unwrap();
+    common::until("the app holds R1", || app.counts.in_flight() == 1).await;
+    assert_load_counts(&rig, 1, 0, "R1 admitted");
+    // (2) R2 with a valid ticket is queued, then refused.
+    let r2 = call(rig.addr, &get(Some(&valid(&root)))).await;
+    assert_admission_refused(&r2, "queue-timeout", "R2");
+    assert_load_counts(&rig, 1, 1, "R2 refused");
+    // (3) A plain request refused by the contract is not a load request.
+    let (mut r3, _) = plain(rig.addr, "/p").await;
+    assert_admission_refused(
+        &read_answer(&mut r3, &mut Vec::new()).await,
+        "queue-timeout",
+        "R3",
+    );
+    assert_load_counts(&rig, 1, 1, "R3 refused");
+    // (4) R1's answer counts nothing more.
+    let r1 = read_answer(&mut a, &mut Vec::new()).await;
+    assert_eq!(r1.status, 200);
+    assert_eq!(r1.header("x-mimic-load"), vec!["ok"]);
+    assert_load_counts(&rig, 1, 1, "R1 answered");
+    // (5) The access lines are unchanged.
+    let access = rig.logs.access_exactly(3).await;
+    let refused: Vec<&serde_json::Value> = access
+        .iter()
+        .filter(|e| e["path"] == "/pay" && e["status"] == 503)
+        .collect();
+    assert_eq!(refused.len(), 1, "{access:?}");
+    assert_eq!(refused[0]["reason"], "queue-timeout", "{access:?}");
+    assert!(
+        !refused[0].as_object().unwrap().contains_key("load_run"),
+        "{access:?}"
+    );
+    let admitted: Vec<&serde_json::Value> = access.iter().filter(|e| e["status"] == 200).collect();
+    assert_eq!(admitted.len(), 1, "{access:?}");
+    assert_eq!(admitted[0]["load_run"], UID, "{access:?}");
+}
+
+#[tokio::test]
+async fn adm_56_h2c_a_load_stream_refused_by_admission_counts_refused_admission() {
+    let root = root("deployment root");
+    let app = common::admission::App::h2c(1000).await;
+    let (rig, _state) = admission_rig(app.addr, &root).await;
+    let ticket = valid(&root);
+    // (1) The first load stream holds the slot.
+    let mut first = h2c(rig.addr).await;
+    let held = tokio::spawn({
+        let ticket = ticket.clone();
+        async move { h2_call(&mut first, Some(&ticket)).await }
+    });
+    common::until("the app holds the first", || app.counts.in_flight() == 1).await;
+    assert_load_counts(&rig, 1, 0, "first admitted");
+    // (2) A second load stream on another connection is refused.
+    let mut other = h2c(rig.addr).await;
+    let answer = h2_call(&mut other, Some(&ticket)).await;
+    assert_admission_refused(&answer, "queue-timeout", "second");
+    assert_load_counts(&rig, 1, 1, "second refused");
+    // (3) A plain stream refused by the contract counts nothing.
+    let answer = h2_call(&mut other, None).await;
+    assert_admission_refused(&answer, "queue-timeout", "plain");
+    assert_load_counts(&rig, 1, 1, "plain refused");
+    // (4) The held stream answers.
+    let held = held.await.unwrap();
+    assert_eq!(held.status, 200);
+    assert_eq!(held.header("x-mimic-load"), vec!["ok"]);
+    assert_load_counts(&rig, 1, 1, "first answered");
+}

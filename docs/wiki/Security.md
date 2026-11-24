@@ -191,8 +191,14 @@ The main ones (full list: [the spec](https://github.com/Thaliph/mock-server/blob
 - **Mock.** Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of every
   Deployment there. A mock replays samples with no state across calls. Roll back mimic only out of mock.
 - **Load tests.** Requests in flight at a switch out of mock can reach real destinations; the
-  application's real datastores are loaded too; load and credentials travel in cleartext. See
+  application's real datastores are loaded too; load and credentials travel in cleartext. The generator trusts
+  an inbound admission refusal on its fields alone, as it trusts `x-mimic-load: ok`, so a server that passes the
+  probe can pass refusals off as its own, which gains it nothing more; a refusal never verifies a target. See
   [Load test](Load-test#limits).
+- **Admission signals.** `mimic_admission_utilization` counts refused demand and is not capped: any client that
+  can reach a pod IP, and a namespace writer that lowers the contract, raise it, and an HPA built on it can be
+  driven up to its `maxReplicas`. NetworkPolicy bounds who can reach the pods and `maxReplicas` bounds the cost.
+  See [Monitoring](Monitoring#limits).
 - **Release.** Images are rebuilt from the tagged commit; arm64 gets image checks and a scan but no kind
   e2e; repository admins can bypass the tag ruleset (a signature names its tag); signing depends on the public
   Sigstore service. This wiki is not versioned: `docs/wiki/` at a release tag documents that release.

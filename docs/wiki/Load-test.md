@@ -178,11 +178,19 @@ credential field. Placeholders are public constants, not secrets.
 - Each load request carries a signed ticket. A sidecar that is not in mock, or not of that deployment, answers
   `599` with `x-mimic-load: refused` and the application gets nothing. Load requests are not recorded in
   discovery.
-- The first refusal or unverified answer ends the run (`Aborted`, `ModeLeft` or `Unverified`), and so does the
-  deployment leaving mock. The controller then deletes the Job.
-- An admission refusal of the mesh (`503` `overloaded` or `queue-timeout`, [Mesh](Mesh)) has no `x-mimic-load`
-  field: a load test that exceeds a pod's admission contract stops `Unverified` at the first one, until #454
-  counts them. Check a contract with a client that is not a load test (see "Sizing a contract" in [Mesh](Mesh)).
+- The first refusal of the load marker or unverified answer ends the run (`Aborted`, `ModeLeft` or `Unverified`),
+  and so does the deployment leaving mock. The controller then deletes the Job.
+- One kind of answer without `x-mimic-load` does not end the run: an **inbound refusal** of the target's own
+  sidecar, which never reached the app ([admission contract](Mesh#admission-contract), or the app refusing the
+  connection). It is a `503` with no `x-mimic-load` field, exactly one `x-mimic-error` (`overloaded`,
+  `queue-timeout` or `connect-failed`), exactly one `x-mimic-origin: inbound; pod=<the target's pod name>` and
+  exactly one `x-mimic-endpoint` equal to the `<ip>:<port>` the generator dialled. It is counted in `mimicErrors`
+  ([Results](#results)) and the run goes on. Any other answer without `x-mimic-load: ok` (another pod's name,
+  another address, a repeated field, a `500`, `breaker-open`) is still `Unverified`.
+- A refusal never verifies a target: it proves that a mimic sidecar answered, not that the pod is in mock. On a
+  connection that already had an `x-mimic-load: ok` answer it is counted and the connection is kept. When it is
+  the first answer of a new connection, it is counted, the connection is dropped and the next request to that
+  target probes `:15100/load` again (PM decision of 2026-11-19 on #454).
 
 ## Results
 
@@ -197,9 +205,85 @@ its per-endpoint results (see [Reading the API](Reading-the-API)).
 A run goes `Pending` (`WaitingForMock` while the mode converges) to `Running` to `Succeeded`, or `Failed` or
 `Aborted` with a `reason`. `status.results` holds, in total and per endpoint, the requests, missed sends,
 statuses by class, errors by kind, requests per second and p50, p90, p99 and max latency in microseconds. They
-are also in Valkey (the last 20 runs per deployment, shown in the UI and served by the read API), in the
+also hold `mimicErrors` when the targets' sidecars refused requests: the inbound refusals by their `x-mimic-error`
+value (keys `connect-failed`, `overloaded`, `queue-timeout`; the field is absent when there was none). A refusal
+counts in `requests` and `rps`, not in `statuses` nor in the latency, which stay those of the app's answers, so
+`requests` is the sum of `statuses`, `errors` and `mimicErrors`:
+
+```bash
+kubectl -n demo get mimicloadtest front-1 -o json | jq '.status.results.total | {requests, statuses, mimicErrors}'
+```
+
+On the generator's `/metrics`, `mimic_load_requests_total{result}` has the same three reasons as values of
+`result`, and a refusal is not observed in `mimic_load_request_duration_seconds`. No log line is written per
+refusal. They are also in Valkey (the last 20 runs per deployment, shown in the UI and served by the read API), in the
 generator's `/metrics`, and in the [Mock mode and load tests dashboard](Monitoring#dashboards). Latencies are bucket bounds, at most 4.4 %
 high, and measured by the client, so they include the network and the generator.
+
+## Finding and setting the contract
+
+An [admission contract](Mesh#admission-contract) (`concurrency` and `rps` per pod) should sit a little below what
+one pod serves before its latency breaks. A load test finds that point and then checks the contract: its requests
+go to the pod addresses and through the contract like any other request. It needs the mesh on (`MIMIC_MESH=on`)
+and the deployment in mock, as every run. Scale the deployment to one replica first, so that the numbers of a run
+are those of one pod (`kubectl -n demo scale deploy/front --replicas=1`).
+
+1. **Find where latency breaks, without a contract.** Run the open model (`rate` set) at rising rates, with a
+   `concurrency` high enough that few sends are `missed`. A new name for each run, since the spec is immutable:
+
+   ```bash
+   for rate in 50 100 200 400; do
+     kubectl apply -f - <<EOF
+   apiVersion: mimic.platform.io/v1alpha1
+   kind: MimicLoadTest
+   metadata: {name: front-r$rate, namespace: demo}
+   spec: {deployment: front, duration: 2m, concurrency: 64, rate: $rate}
+   EOF
+     kubectl -n demo wait mimicloadtest/front-r$rate --for=jsonpath='{.status.phase}'=Succeeded --timeout=10m
+     kubectl -n demo get mimicloadtest front-r$rate -o json \
+       | jq -c --arg rate "$rate" '.status.results.total | {rate: $rate, rps, missed, latencyMicros}'
+   done
+   ```
+
+   The open model sends on its schedule whatever the answers, so past the pod's capacity the p99 grows fast and
+   `missed` rises (every concurrency slot is busy). Note the last rate before that, and its latency: the app then
+   has about `rate × p50` requests in flight.
+
+2. **Set a contract below it**, for example 80 % of that rate and of those requests in flight, in the Deployment's
+   `MimicConfig`. The oldest config of a Deployment wins as a whole, so add `admission` to its existing config:
+
+   ```yaml
+   apiVersion: mimic.platform.io/v1alpha1
+   kind: MimicConfig
+   metadata: {name: front, namespace: demo}
+   spec:
+     targetRefs: [{group: apps, kind: Deployment, name: front}]
+     admission: {concurrency: 8, rps: 80}
+   ```
+
+   Each sidecar writes one INFO `admission contract changed` with the new `concurrency` and `rps` when it applies
+   it (`kubectl -n demo logs deploy/front -c mimic-sidecar | grep 'admission contract changed'`). Count the
+   long-lived responses of the app (SSE, gRPC streams): each holds a slot for its whole life.
+
+3. **Run again above the contract.** The same open-model run at the rate where latency broke now ends
+   `Succeeded` with `mimicErrors` in its results instead of the latency collapse: the requests over the contract
+   are refused `overloaded` or `queue-timeout` by the pod's sidecar, and `statuses` and `latencyMicros` are those of
+   the admitted requests. The app never has more than `concurrency` requests in flight and an admitted request
+   waits at most 150 ms in the queue, so their latency should stay close to that of step 1 below the break. On the pod,
+   `mimic_admission_requests_total{result}` shows the same refusals, and `mimic_load_inbound_total` counts them
+   `refused_admission` ([Monitoring](Monitoring#admission-metrics)).
+
+4. **Read the utilisation at the planned load.** Run at the load you expect in production and read
+   `mimic_admission_utilization` on each pod (the *Admission* row of the `mimic-sidecar` dashboard): `0.7` means
+   70 % of the contract in use, smoothed over 15 s. The autoscaling of #455 targets `averageValue: 700m`, which is
+   that 70 %. A value above 1 means demand over the contract was refused. Then scale back: the capacity is
+   `replicas × contract`.
+
+**Why not the closed model.** In the closed model (no `rate`) a worker sends its next request as soon as it has an
+answer, and an `overloaded` refusal comes at once. Over the contract the workers then spin: the pod receives
+refusals as fast as its sidecar writes them, within the run's concurrency, and the results fill with
+`mimicErrors`. The load stays on the deployment under test and its sidecar, but it says nothing about the
+contract. Use the open model, whose sends do not depend on the answers.
 
 ## Limits
 
@@ -217,6 +301,22 @@ destinations (at most the concurrency); the application's real datastores and `s
 destinations are loaded too; load and credentials cross the network in cleartext; a secret that redaction
 misses is replayed, so add `spec.discovery.redact`; the namespace is the trust domain of a run. See
 [Security](Security#accepted-limits).
+
+Admission refusals (from #454):
+
+- **A load test no longer stops at the first admission refusal.** Until #454 a refusal of the
+  [admission contract](Mesh#admission-contract) ended the run `Unverified`; the generator now counts the inbound
+  refusals of its targets in `mimicErrors` under their reason.
+- **A server that passes the probe can pass refusals off as its own.** The generator trusts an inbound refusal on
+  its fields alone, as it trusts `x-mimic-load: ok`: no signature binds either to the sidecar. A server at a target
+  address that answers the `/load` probe as the right pod can already return `x-mimic-load: ok`, so a forged
+  refusal gains it nothing more: the load it receives stays within the run's rate and concurrency, and the forged
+  answers are counted in `mimicErrors`. The app behind a real sidecar cannot forge one: its answers carry
+  `x-mimic-load: ok` and are counted by status.
+- **A closed-model load test against a refusing pod spins.** An `overloaded` answer comes at once and a closed-model
+  worker sends its next request as soon as it has an answer, so a pod over its contract receives refusals as fast
+  as its sidecar writes them, within the run's concurrency. There is no pause after a refusal. To check a contract,
+  use the open model ([Finding and setting the contract](#finding-and-setting-the-contract)).
 
 ## Next
 

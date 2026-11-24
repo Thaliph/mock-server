@@ -3,6 +3,7 @@
 //! the schedule, the results, the gate and the Job are functions of numbers and names.
 //! No I/O, no clock and no random source: the caller hands them in.
 
+pub mod answer;
 pub mod gate;
 pub mod histogram;
 pub mod job;
@@ -13,6 +14,8 @@ pub mod summary;
 pub mod ticket;
 pub mod validate;
 
+#[cfg(test)]
+mod answer_tests;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]

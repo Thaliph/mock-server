@@ -362,7 +362,30 @@ would see without mimic, except for the limits listed at the end of this section
     `x-mimic-error` value, no `upstream`). It counts in `mimic_http_requests_total` like any
     exchange. Discovery does not record it, and counts it in
     `mimic_discovery_exchanges_total{result="synthetic"}`. No component line is written per
-    refusal. The admission metrics and the line `admission contract changed` are #454.
+    refusal. From #454 the sidecar also exposes the `mimic_admission_*` metrics of §9 and
+    writes the INFO line `admission contract changed` of §7.9 "Admission".
+  - **Signals (M5, #454).** The sidecar reads the counts of `mesh::admission` (ADM-07) once
+    every **100 ms**, on one timer, never on the request path. From them it advances the
+    counters of `mimic_admission_requests_total` and `mimic_admission_in_flight_seconds_total`
+    by their deltas, sets the gauges, and feeds the **utilisation**, the pure
+    `mimic-core` `mesh::utilization`:
+    - Each tick gives two samples over the time `Δt` since the previous tick: the mean in
+      flight (the delta of the in-flight integral over `Δt`) and the demand rate (the delta of
+      the offers that ended admitted, `overloaded` or `queue-timeout`, over `Δt`, per second).
+      A request whose client left while it was queued is not demand.
+    - Each sample moves its average by `α = 1 − e^(−Δt / 15 s)` of the gap: an exponentially
+      weighted moving average with a 15 s time constant whose weight follows the real `Δt`, so
+      a late tick gives the same curve. A tick whose instant is not after the previous one does
+      nothing.
+    - `utilization = max(avg(in flight) / concurrency, avg(demand) / rps)`, with the contract in
+      force at the tick. It is **not capped**: at twice the contract's `rps` it tends to 2. The
+      in-flight term never exceeds 1, since in-flight never exceeds `concurrency`.
+    - The averages start at 0 when a contract starts (none before), are kept when its values
+      change, and are dropped when it is removed.
+
+    The scraped values therefore lag the requests by at most 100 ms. The gauges exist only
+    while a contract is in force, so a pod without a contract has no utilisation series
+    (an HPA reading it sees no metric rather than 0, #455).
   - **Contract changes.** The contract follows the view, without a restart (§7.9 "Admission"):
     - A lower `concurrency` cuts nothing: the requests in flight finish, and new requests wait
       until fewer than the new limit are in flight.
@@ -2579,7 +2602,12 @@ no `MimicLoadTest` and creates no Job).
     byte, is `mock` and the header holds a ticket that verifies, is not expired, and names the
     sidecar's own namespace and deployment; it is then forwarded without that header, every
     `x-mimic-load` header of the app's answer is removed and `x-mimic-load: ok` added, and it
-    is not recorded (`mimic_discovery_exchanges_total{result="load"}`). Otherwise it is
+    is not recorded (`mimic_discovery_exchanges_total{result="load"}`). From #454 such a
+    request that the admission contract then refuses (§4.1 "Admission contract") is counted
+    `refused_admission` in `mimic_load_inbound_total` instead of `forwarded`, which counts
+    only the requests that reached the app; a request whose client leaves while it waits in
+    the admission queue reached neither and is counted under no `result` (the admission's own
+    `cancelled` counts it, §9). Otherwise it is
     answered by the sidecar `599`, `x-mimic-load: refused; reason=<reason>`, `content-length:
     0`, the app receiving nothing (not one byte: an `h2` sidecar opens its connection to the app
     only for the first stream it forwards); `reason` is `mode`, `workload` (another namespace or
@@ -2590,7 +2618,22 @@ no `MimicLoadTest` and creates no Job).
     the pod at once (`ModeLeft`); any other refusal and an answer without `x-mimic-load: ok`
     do the same with `Unverified`; the pod posts its final results with that reason; the
     controller then ends the run (`Aborted`) and the next poll of every other pod answers
-    `stop`.
+    `stop`. From #454 one kind of answer without `x-mimic-load` is not `Unverified`: an
+    **inbound refusal** of the target's sidecar (§4.1 "Admission contract" and "Refused app
+    connections"), which never reached the app. It is an answer with no `x-mimic-load` field,
+    status `503`, exactly one `x-mimic-error` whose value is `overloaded`, `queue-timeout` or
+    `connect-failed`, exactly one `x-mimic-origin` equal to `inbound; pod=<the target's pod
+    name>` (from the targets answer), and exactly one `x-mimic-endpoint` equal to the
+    `<ip>:<port>` the generator dialled (field names in any case). It is counted under its
+    reason (Results, below) and the run goes on. The pure `mimic-core` `load::answer` decides
+    it. **A refusal never verifies a target** (PM decision of 2026-11-19 on #454): only an
+    `x-mimic-load: ok` answer proves the pod is in mock. On a pooled connection, which already
+    had an `ok` answer, a refusal keeps the connection; on a new connection the generator drops
+    the connection and the next request to that target is a probe again, so a target that only
+    refuses never receives unprobed load (ADM-59). An answer that carries `x-mimic-load: ok` is the app's, counted by its status class
+    whatever its other fields (the sidecar replaces any `x-mimic-load` of the app, and from M2
+    removes its `x-mimic-*` fields). In the closed model a refused worker sends its next
+    request at once, as after any answer (§11.1).
   - *Controller*: the effective mode leaving `mock` ends the run (`Aborted`/`ModeLeft`) as in
     step 5.
 - **Generator** `mimic-load` (in the `mimic` image), one Job per run in the deployment's
@@ -2650,7 +2693,14 @@ no `MimicLoadTest` and creates no Job).
   ms of the run, rounded) and `latencyMicros` `{p50, p90, p99, max}`: time from the first
   byte written to the response head, in a histogram of 16 buckets per doubling from 1 µs to
   300 s plus overflow (a percentile is the upper bound of its bucket: at most 4.43 % above the
-  exact value, 2^(1/16) − 1), merged over pods by addition (commutative, associative). They hold method,
+  exact value, 2^(1/16) − 1), merged over pods by addition (commutative, associative). From
+  #454 also `mimicErrors`: the inbound refusals of "Generator" above, counted by their
+  `x-mimic-error` value (keys `connect-failed`, `overloaded`, `queue-timeout`, in that order;
+  the field is left out when it is empty, and a document without it reads as empty, so the
+  results of a run without refusal keep their bytes). A refusal counts in `requests` and in
+  `rps`, and not in `statuses` nor in `latencyMicros`: the statuses and the latency stay those
+  of the app's answers, and `requests` is the sum of `statuses`, `errors` and `mimicErrors`.
+  They hold method,
   port, template and numbers only: no header, query, body, address or error text.
   Stored under `:load:<uid>` (§7.3); every `MIMIC_STATUS_INTERVAL` and at each phase change the
   controller applies `status` (server-side apply, field manager `mimic-controller`):
@@ -2665,8 +2715,8 @@ no `MimicLoadTest` and creates no Job).
     pods: 1                   # generator pods that posted
     skipped: {credentials: 1, grpc: 2}
     results:
-      total: {requests, missed, statuses, errors, rps, latencyMicros}
-      endpoints: [{method, port, template, requests, missed, statuses, errors, rps, latencyMicros}]  # plan order, ≤ MIMIC_LOAD_MAX_ENDPOINTS
+      total: {requests, missed, statuses, errors, mimicErrors, rps, latencyMicros}   # mimicErrors from #454, when not empty
+      endpoints: [{method, port, template, requests, missed, statuses, errors, mimicErrors, rps, latencyMicros}]  # plan order, ≤ MIMIC_LOAD_MAX_ENDPOINTS
   ```
 - **Consumers.** From the F11 UI step the read API lists a deployment's runs (§7.5:
   `GET /v1/workloads/<ns>/<dep>/loadtests` and `…/loadtests/<uid>`, the stored summaries) and the deployment page shows them. Scripted multi-step scenarios, gRPC and
@@ -2887,6 +2937,11 @@ no insignificant whitespace):
   - **Before the first view** there is no contract. When `MIMIC_MESH_STARTUP_WAIT` passes
     without a view, held or persisted, the sidecar writes one WARN `admission contract unknown`
     (design §13). Its inbound side holds nothing until a view arrives.
+  - **`admission contract changed`** (#454). The sidecar writes one INFO line each time the
+    contract in force changes: set, given new values, or removed, also when it comes from the
+    persisted view at start. Fields: `concurrency` and `rps` of the new contract (absent when it
+    was removed), `previous_concurrency` and `previous_rps` (absent when there was none) and the
+    view's `etag`. A view that keeps the same contract writes no line.
 - **Persisted view.** Each accepted view is written to `<MIMIC_TRUST_DIR>/state/mesh.json`,
   `{"fetchedAt":<unix seconds>,"view":<the view>}`, through a temporary file and a rename. At
   start the file is read (regular file, at most `MIMIC_MESH_MAX_VIEW_BYTES` plus 1 KiB, the view
@@ -3881,19 +3936,40 @@ random numbers it hands to the draw.
   | `mimic_mock_miss_total` | counter (F10), misses answered `599` | `reason` (`authority`, `endpoint`, `connect`, `upgrade`, `overload`) |
   | `mimic_mock_pending` | gauge (F10), mocked requests pending (§8 "Bounds") | — |
   | `mimic_mock_connections_total` | counter (F10), outbound connections whose kind was decided in mock | `decision` (`mocked`, `tunnel`: non-HTTP relayed, `passthrough`, `closed`) |
-  | `mimic_load_inbound_total` | counter (F11, sidecar), inbound requests carrying `mimic-load-run` (§7.8) | `result` (`forwarded`, `refused_mode`, `refused_workload`, `refused_ticket`) |
+  | `mimic_load_inbound_total` | counter (F11, sidecar), inbound requests carrying `mimic-load-run` (§7.8) | `result` (`forwarded`, `refused_mode`, `refused_workload`, `refused_ticket`, from #454 `refused_admission`) |
   | `mimic_mesh_view_pulls_total` | counter (M1, sidecar), mesh view requests (§7.9) | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
   | `mimic_mesh_view_age_seconds` | gauge (M1, sidecar), seconds since the last `200` or `304` of the mesh view, 0 without a view | — |
   | `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge (M1, sidecar), Services and endpoints of the view held, 0 without one | — |
   | `mimic_mesh_unscoped_connections_total` | counter (M1, sidecar), outbound connections whose destination is not a Service port of the view | — |
-  | `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`, `mimic_mesh_endpoint_in_flight` | (M1, #443, sidecar) mesh-routed requests, in total, their duration, and per pod; labels, bounds and eviction in §7.9 "Load balancing" | `service`, `route`, `backend`, `endpoint`, `status_class`, `reason` |
+  | `mimic_mesh_requests_total` | counter (M1, #443, sidecar), one per mesh-routed request; labels, bounds and eviction in §7.9 "Metrics" | `service`, `route`, `backend`, `status_class`, `reason` (`none` or a reason of the table below) |
+  | `mimic_mesh_request_duration_seconds` | histogram (M1, #443, sidecar), until the response head, buckets of `mimic_http_request_duration_seconds` | `service`, `backend`, `status_class` |
+  | `mimic_mesh_endpoint_requests_total` | counter (M1, #443, sidecar), per pod | `backend`, `endpoint`, `status_class` |
+  | `mimic_mesh_endpoint_in_flight` | gauge (M1, #443, sidecar), per pod | `backend`, `endpoint` |
+  | `mimic_mesh_reconnects_total`, `mimic_mesh_fallbacks_total` | (M1, #443, sidecar) requests sent again on a new connection, requests and L4 connections sent to the original destination; §7.9 "Metrics" | `backend` |
   | `mimic_mesh_mirrored_total` | (M3, #450, sidecar) copies of routed requests for the rule's mirrors, by outcome; §7.9 "Routing" "Mirrors" and "Metrics" | `backend`, `result` |
-  | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total`, `mimic_mesh_retry_budget_exhausted_total` | (M2, #445, #518 and #446, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses, connections closed on an unframeable response, retries refused by the budget; §7.9 "Retries" and "Metrics" (from #449 `result="timeout"` and, in `mimic_mesh_requests_total`, `reason="timeout"`: route timeouts, §7.9 "Routing") | `backend`, `result`, `reason` |
+  | `mimic_mesh_attempts_total` | counter (M2, #445, sidecar), every try; §7.9 "Retries" and "Metrics" (from #449 `result="timeout"`: route timeouts, §7.9 "Routing") | `backend`, `result` (an attempt outcome, below) |
+  | `mimic_mesh_retries_total` | counter (M2, #445, sidecar), tries after the first | `backend`, `reason` (an attempt outcome, below) |
+  | `mimic_mesh_retries_skipped_total` | counter (M2, #445, sidecar), retryable failures not retried | `backend`, `reason` (`exhausted`, `method`, `buffer`) |
+  | `mimic_mesh_retry_budget_exhausted_total` | counter (M2, #446, sidecar), retries refused by the budget | `backend` |
+  | `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total` | (M2, #445 and #518, sidecar) body bytes held for replay, `x-mimic-*` fields removed from app responses, connections closed on an unframeable response, inbound `connect-failed` answers; §7.9 "Metrics" | — |
+  | `mimic_mesh_ejections_total` | counter (M4, #451, sidecar), one per ejection; §7.9 "Outlier detection" | `backend`, `reason` (`consecutive_failures`, `consecutive_5xx`) |
+  | `mimic_mesh_ejected_endpoints` | gauge (M4, #451, sidecar), endpoints of the Service port ejected now | `backend` |
   | `mimic_mesh_faults_total` | (M4, #452, sidecar) faults injected into the calls to a Service by its policy; §7.9 "Fault injection" and "Metrics" | `service`, `kind` |
+  | `mimic_admission_requests_total` | counter (M5, #454, sidecar), "Requests offered to the admission contract, by result": each offer counts once, when it ends, in one of `admitted` (at once or from the queue), `overloaded`, `queue-timeout` and `cancelled` (its client left while it was queued); `queued` counts the offers that had to wait, which also end in one of the other four. Demand is `admitted` + `overloaded` + `queue-timeout`. The five series exist from the first contract applied, at 0, and stay after it is removed | `result` (`admitted`, `queued`, `overloaded`, `queue-timeout`, `cancelled`) |
+  | `mimic_admission_in_flight_seconds_total` | counter (M5, #454, sidecar), "Integral of the admitted requests in flight over time, in seconds": its `rate()` is the mean in flight; exists from the first contract applied | — |
+  | `mimic_admission_in_flight` | gauge (M5, #454, sidecar), "Admitted requests in flight"; only while a contract is in force | — |
+  | `mimic_admission_queue_depth` | gauge (M5, #454, sidecar), "Requests waiting in the admission queue"; only while a contract is in force | — |
+  | `mimic_admission_limit` | gauge (M5, #454, sidecar), "Admission contract in force, by kind": its `concurrency` and `rps`; only while a contract is in force | `kind` (`concurrency`, `rps`) |
+  | `mimic_admission_utilization` | gauge (M5, #454, sidecar), "Share of the admission contract used, smoothed over 15 s, refused demand included": §4.1 "Signals"; not capped at 1; only while a contract is in force | — |
 
-  **`x-mimic-error` reasons** of the answers the sidecars generate (§4.1, §7.9; the same value is
-  the access line's `reason` and the `reason` label of `mimic_mesh_requests_total`). None is ever
-  recorded by discovery; only the two trusted refusals, bound to the pod of the try, are retried:
+  **`x-mimic-error` reasons** of the answers the sidecars generate (§4.1, §7.9). From #454 this
+  table is the only list of them: `mimic-core` `mesh::reason::Reason` enumerates exactly its
+  values, with their status, and every writer of a reason takes a `Reason`, so the same string
+  is the `x-mimic-error` value, the access line's `reason`, the `reason` label of
+  `mimic_mesh_requests_total`, the refusal values of `mimic_admission_requests_total{result}`
+  and of `mimic_load_requests_total{result}`, and the keys of a load test's `mimicErrors`
+  (§7.8). None is ever recorded by discovery; only the two trusted refusals, bound to the pod
+  of the try, are retried:
 
   | Reason | Status | Who answers | Retried by the caller's sidecar |
   |---|---|---|---|
@@ -3907,6 +3983,16 @@ random numbers it hands to the draw.
   | `invalid-response` | 502 | caller's sidecar, a response head `hyper` rejects | no |
   | `invalid-request` | 400 | caller's sidecar, a request head `hyper` rejects (§4.1) | no |
   | `unsupported` | 501 | sidecar, an `Upgrade` or `CONNECT` it cannot relay (§4.1 limit 8) | no |
+
+  **Attempt outcomes** are another enumeration, in snake case like every `result` label: the
+  `result` of `mimic_mesh_attempts_total` and the `reason` of `mimic_mesh_retries_total` (`ok`,
+  `connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`,
+  `timeout`) say how one try ended, not what the client was answered. `overloaded` and
+  `queue_timeout` are a received trusted refusal of reason `overloaded` or `queue-timeout`
+  (`_` for `-`), `app_refused` a received inbound `connect-failed`, and `connect_failed` a
+  connect of the caller's own that failed (after the last try the caller answers
+  `connect-failed`). They keep their M2 spelling (#454: renaming them would break the queries
+  written since M2); `mesh::reason` holds this mapping and ADM-50 tests it.
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -3944,8 +4030,9 @@ random numbers it hands to the draw.
 | `mimic_load_active_runs` | gauge (F11, controller), members of `mimic:v1:loads:active` at the last status pass | — |
 
   `mimic-load` (F11) exposes on its admin port, besides the common metrics:
-  `mimic_load_requests_total{endpoint,result}` (`result`: `2xx` … `5xx` or an error kind of
-  §7.8), `mimic_load_request_duration_seconds{endpoint}` (histogram, buckets as
+  `mimic_load_requests_total{endpoint,result}` (`result`: `2xx` … `5xx`, an error kind of
+  §7.8, or from #454 the reason of an inbound refusal, `connect-failed`, `overloaded` or
+  `queue-timeout`, §7.8 "Generator"; a refusal is not observed in the duration histogram), `mimic_load_request_duration_seconds{endpoint}` (histogram, buckets as
   `mimic_http_request_duration_seconds`), `mimic_load_in_flight`, `mimic_load_missed_total`
   and `mimic_load_targets` (verified targets). `endpoint` is `<METHOD> <template>` of the plan,
   at most `MIMIC_LOAD_MAX_ENDPOINTS` values; one process serves one run.
@@ -4062,8 +4149,8 @@ They hold no data, no secret and no value of a deployment: only queries.
   `label_replace` or `label_join`, no regex matcher on `authority` (its values come from traffic).
 - Units (Grafana unit ids): `s` for durations and ages, `bytes` for sizes, `Bps` for byte rates,
   `reqps` for request rates, `ops` for other event rates, `percentunit` for ratios, `short` for
-  counts and CPU cores. A limit drawn next to a gauge is a second query on `mimic_limit`, shown as
-  a dashed red series named `limit`.
+  counts and CPU cores. A limit drawn next to a gauge is a second query on `mimic_limit` (from
+  #454 also `mimic_admission_limit`), shown as a dashed red series named `limit`.
 - Panels are of the core types `timeseries`, `stat`, `table`, `bargauge` and `text` (markdown
   mode only); no plugin, no HTML, no link to a URL outside Grafana, no alert rule.
 - Annotations: `Process started` (`count(time() - process_start_time_seconds{S} < 60) > 0`, step
@@ -4165,6 +4252,18 @@ The restarts come from `process_start_time_seconds`, so no kube-state-metrics se
 | TLS | Intermediate expires in | s | `min(mimic_tls_intermediate_expiry_timestamp_seconds{S} > 0) - time()` |
 | TLS | Intermediate requests by result | ops | `sum by (result) (rate(mimic_tls_intermediate_requests_total{S}[$__rate_interval]))` |
 | Load | Load requests received by result | reqps | `sum by (result) (rate(mimic_load_inbound_total{S}[$__rate_interval]))` |
+| Mesh | Calls by Service and status class | reqps | `sum by (service, status_class) (rate(mimic_mesh_requests_total{S}[$__rate_interval]))` |
+| Mesh | Call latency p50, p99 by Service | s | `histogram_quantile(0.99, sum by (le, service) (rate(mimic_mesh_request_duration_seconds_bucket{S}[$__rate_interval])))` |
+| Mesh | Answers of the sidecar by reason | reqps | `sum by (reason) (rate(mimic_mesh_requests_total{S, reason!="none"}[$__rate_interval]))` |
+| Mesh | Attempts by backend and result | ops | `sum by (backend, result) (rate(mimic_mesh_attempts_total{S}[$__rate_interval]))` |
+| Mesh | Retries by reason, budget exhausted | ops | `sum by (reason) (rate(mimic_mesh_retries_total{S}[$__rate_interval]))`; `sum by (backend) (rate(mimic_mesh_retry_budget_exhausted_total{S}[$__rate_interval]))` |
+| Mesh | Ejections, ejected endpoints (most per pod) | ops, short | `sum by (backend) (rate(mimic_mesh_ejections_total{S}[$__rate_interval]))`; `max by (backend) (mimic_mesh_ejected_endpoints{S})` |
+| Admission | Utilisation per pod | percentunit | `max by (pod) (mimic_admission_utilization{S})` (thresholds: orange 0.7, red 1; above 1 is refused demand) |
+| Admission | Requests by result | reqps | `sum by (result) (rate(mimic_admission_requests_total{S}[$__rate_interval]))` |
+| Admission | Refusals by reason | reqps | `sum by (result) (rate(mimic_admission_requests_total{S, result=~"overloaded\|queue-timeout"}[$__rate_interval]))` |
+| Admission | In flight (busiest pod), limit | short | `max(mimic_admission_in_flight{S})`; `max(mimic_admission_limit{S, kind="concurrency"})` |
+| Admission | Mean in flight per pod | short | `sum by (pod) (rate(mimic_admission_in_flight_seconds_total{S}[$__rate_interval]))` |
+| Admission | Queue depth (busiest pod) | short | `max(mimic_admission_queue_depth{S})` |
 
 **`mimic-discovery`** (#382; variables `datasource`, `controller`, `namespace`, `deployment`).
 
@@ -4215,6 +4314,7 @@ The restarts come from `process_start_time_seconds`, so no kube-state-metrics se
 | Load (generator) | In flight, missed, targets | short, ops | `sum by (load_test) (mimic_load_in_flight{L})`; `sum by (load_test) (rate(mimic_load_missed_total{L}[$__rate_interval]))`; `max by (load_test) (mimic_load_targets{L})` |
 | Load (generator) | Generator memory and CPU per pod | bytes, short | `max by (pod) (process_resident_memory_bytes{L})`; `sum by (pod) (rate(process_cpu_seconds_total{L}[$__rate_interval]))` |
 | Load (sidecar) | Load requests received by result | reqps | `sum by (result) (rate(mimic_load_inbound_total{S}[$__rate_interval]))` |
+| Load (sidecar) | Admission by result | reqps | `sum by (result) (rate(mimic_admission_requests_total{S}[$__rate_interval]))` (#454: a load test above the contract shows its refusals here) |
 
 ## 10. Configuration and runtime (12-factor)
 
@@ -5263,11 +5363,33 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   before the app can answer `100 Continue`. Bytes are not changed. A refused request's body,
   up to 64 KiB within 1 s, is read and discarded. The requests pipelined behind it wait for
   that read.
-- (M5, #453) **A load test stops at the first admission refusal.** A refusal has no
-  `x-mimic-load` field (ADM-26), and the generator reads an answer without `x-mimic-load: ok` as
-  `Unverified` (§7.8 "Generator"). A load test against a pod whose contract it exceeds stops
-  `Unverified` at the first refusal, until #454 makes the generator count `x-mimic-error`. A
-  contract is checked with a client that is not a load test.
+- (M5, #453, lifted by #454) A load test no longer stops at the first admission refusal: the
+  generator counts the inbound refusals of its targets under their reason (§7.8 "Generator",
+  ADM-57 to ADM-61).
+- (M5, #454) **A server that passes the probe can pass refusals off as its own.** The
+  generator trusts an inbound refusal on its fields alone, as it trusts `x-mimic-load: ok`: no
+  signature binds either to the sidecar. A server at a target address that answers the `/load`
+  probe as the right pod can already return `x-mimic-load: ok`, so a forged refusal gains it
+  nothing more: the load it receives stays within the run's rate and concurrency, and the
+  forged answers are counted in `mimicErrors`. The app behind a real sidecar cannot forge one:
+  its answers carry `x-mimic-load: ok` and are counted by status (ADM-57).
+- (M5, #454) **A closed-model load test against a refusing pod spins.** An `overloaded` answer
+  comes at once, and a closed-model worker sends its next request as soon as it has an answer,
+  so a pod over its contract receives refusals as fast as its sidecar writes them, within the
+  run's concurrency. The load stays on the deployment under test and its sidecar, which is
+  what the run asked for. To check a contract, use the open model (`rate`), whose sends do not
+  depend on the answers (`Load-test.md`).
+- (M5, #454) **Callers drive the utilisation.** `mimic_admission_utilization` counts refused
+  demand and is not capped, by design (#455 scales on it). Any client that can reach a pod IP,
+  meshed or not, and a namespace writer that lowers the contract, raise it. An HPA built on it
+  (#455) can then be driven up to its `maxReplicas`. NetworkPolicy bounds who can reach the
+  pods, `maxReplicas` bounds the cost, and the contract is the namespace's own configuration.
+  The app can move only its own pod's signal, by answering slowly or by calling itself.
+- (M5, #454) **The admission metrics lag by up to 100 ms and miss the last tick at exit.**
+  They are taken from the admission counts every 100 ms (§4.1 "Signals"), so a scrape can miss
+  the latest 100 ms of requests, and the requests of the last 100 ms before the process exits
+  are never exported. The access lines and `mimic_http_requests_total` count every refusal
+  at once.
 - (M5, #453) **The refusal names the pod.** `x-mimic-endpoint` and `x-mimic-origin` give the pod
   address the caller dialled and the pod name, as the `connect-failed` answer of #518 does. A
   caller that reached the pod already knows its address. The pod name is not a secret
@@ -5679,7 +5801,7 @@ with no `mimic-load-run` header unchanged).
 | LDT-01 | **U.** Plan (§7.8): only inbound endpoints; a `grpc` endpoint, a `101` one, one without sample and one whose samples all have an unkept request body are skipped `grpc`, `upgrade`, `no_sample`, `opaque_body`; `include` keeps only the listed endpoints and `exclude` wins over it (`excluded`); 2xx/3xx samples are the only usable ones when present, else 4xx/5xx; an endpoint whose only samples carry `Authorization: Bearer mimic-token` is planned with and without a `header/authorization` field (PLH-09); a path segment holding a placeholder or the legacy marker is always `credentials`; with 70 usable endpoints the 64 with the most exchanges are kept (ties in key order), the others `limit`; over `MIMIC_LOAD_MAX_PLAN` the samples with the highest content hash go first and emptied endpoints are `plan_size`; weights equal exchange counts. Same report and spec → byte-identical plan; the plan holds no Secret value. |
 | LDT-02 | **U.** Request building (§7.8): method, path, query and body of the sample; `host`, `content-length` (recomputed), `content-encoding`, hop-by-hop, `expect` and `proxy-*` headers handled as listed; `host` the endpoint's first host, else `<ip>:<port>`; `mimic-load-run` present, holding the run's ticket exactly as supplied (§7.8, LDT-11, LDT-20). Volatile fields: a `date-time` gets the supplied time in RFC 3339, `550e8400-e29b-41d4-a716-446655440000` keeps the UUID shape with hex letters only, `00-4bf92f…-01` keeps its dashes, an integer keeps its digit count; two random inputs give different values for every volatile field, the same inputs the same request. Credentials replace the whole value of `header/authorization`, `query/api_key` and `body/card/token` with the key's bytes, a trailing newline removed. Property (`proptest`, ≥ 10 000 cases, any recorder-built report and spec): no request holds the legacy marker `<redacted>`, a credential field not supplied holds its placeholder unchanged, every non-volatile, non-credential value comes from the drawn sample, and endpoint draws follow the weights (χ² at 1 %). |
 | LDT-03 | **U.** Schedule (§7.8): open model, rate 100, `rampUp` 10 s, duration 20 s: 500 sends in the first 10 s and 1000 in the next 10 (± 1), none after 20 s; a send due with the pod's concurrency in flight is `missed`, never delayed; closed model: workers rise from 1 to the concurrency over `rampUp`; concurrency 300 and rate 1001 with `MIMIC_LOAD_POD_CONCURRENCY=128` give 3 pods with concurrencies 100/100/100 and rates 334/334/333; a rate lower than the pod count (rate 1 for 2 pods) is `Invalid` naming `spec.rate`. |
-| LDT-04 | **U.** Results (§7.8): a value in bucket `b` gives a percentile at most 4.43 % above it; on 100 000 random latencies p50, p90, p99 are within 4.43 % of the exact ones; `max` is the highest bucket bound; merging per-pod results is commutative and associative and equals the results of the union; `rps` is requests × 1000 / elapsed ms rounded; statuses and errors fall in the listed classes only; the serialisation is deterministic (`BTreeMap`) and holds method, port, template and numbers only. |
+| LDT-04 | **U.** Results (§7.8): a value in bucket `b` gives a percentile at most 4.43 % above it; on 100 000 random latencies p50, p90, p99 are within 4.43 % of the exact ones; `max` is the highest bucket bound; merging per-pod results is commutative and associative and equals the results of the union; `rps` is requests × 1000 / elapsed ms rounded; statuses and errors fall in the listed classes only (from #454 also `mimicErrors` in its three reasons, ADM-58); the serialisation is deterministic (`BTreeMap`) and holds method, port, template and numbers only. |
 | LDT-05 | **U.** Validation, gate and Job (§7.8): a field above its `MIMIC_LOAD_*` limit or `rampUp` > `duration` is `Invalid` with the field's name; the gate opens only with effective mode `mock`, at least one target and every target pod's `:pulls` field `mock` within the window (a pod in `discovery`, an expired field, a field more than 60 s in the future or no field keeps it closed); targets keep ready endpoints of pods the §7.2 check accepts for the deployment (`a-b-6d4c8f9b7-xxxxx` is not a target of `a`), one per pod. The Job for concurrency 300: name `mimic-load-<12 hex>`, Indexed, `parallelism` = `completions` = 3, `backoffLimit` 0, the `activeDeadlineSeconds` and `ttlSecondsAfterFinished` of §7.8, owner reference with `blockOwnerDeletion: false`, pod labels and security context of §7.8, `automountServiceAccountToken: false`, the projected token of audience `mimic.platform.io/load`, the Secret volume and the annotation `mimic.platform.io/credentials-secret` (equal to its `secretName`) only when `credentials` is set, image `MIMIC_INJECT_SIDECAR_IMAGE` with command `/usr/local/bin/mimic-load` and no `args`, one container and no init container, `env` of literal §10.6 values only (no `valueFrom`); with `loadTest.networkPolicy` the NetworkPolicy of §7.8 (no ingress rule but the metrics source, egress to `mimic.platform.io/deployment: <dep>` on the plan's ports and 15100, the controller on 8444 and DNS on 53); same input → identical objects. Both pass the LDT-17 policy expressions evaluated in the unit test. |
 | LDT-06 | **E.** CRD and admission (§7.8): `deployment` and `duration` are required; `concurrency` defaults to 10, `rampUp` to `0s`, `timeout` to `10s`; `concurrency` 0 and 4097, `rate` 0, `duration` `5s` and `25h`, 65 `include` entries, 33 credential fields and a credential field without a `header/`, `query/` or `body/` prefix are rejected; any change of `spec` but `stop` false → true is rejected, and so is `stop` true → false. A user allowed to create `mimicloadtests` but not to `get` the Secret is refused a `MimicLoadTest` naming it; with `get` it is admitted. Printer columns as §7.8. With `loadTest.enabled=false` (the default) the chart installs no `MimicLoadTest` CRD, no Job, `EndpointSlice` or NetworkPolicy RBAC and neither policy; with `loadTest.enabled=true` and an image given by tag only, `helm template` fails with a message naming `image.digest`. |
 | LDT-07 | **I** (controller). Lifecycle (§7.8): a run on a deployment in `discovery` is `Pending`/`WaitingForMock` with no Job, then `Failed`/`NotMock` after `MIMIC_LOAD_START_TIMEOUT` (set to 5 s); once the `MimicWorkload` says `mock` and the target pods' `:pulls` say `mock`, the Job of LDT-05 is created and the run is `Running`; a second run on the same deployment is `Failed`/`Busy`; a third active run in one namespace (`MIMIC_LOAD_MAX_NAMESPACE_RUNS=2`) `Failed`/`NamespaceBusy`; past `MIMIC_LOAD_MAX_RUNS` `Failed`/`ClusterBusy`; with `MIMIC_LOAD_STORE_BUDGET=2Mi` and a 1.5 MiB plan, the second such run on another deployment is `Failed`/`StoreFull` and is admitted once the first ended; with `MIMIC_LOAD_MAX_PENDING=2`, the third `Pending` run of a namespace (by `creationTimestamp`) is `Failed`/`TooManyPending` while the first two keep waiting; two controller processes on one Valkey create one Job per run and never admit more than `MIMIC_LOAD_MAX_RUNS` runs; a value above a limit is `Failed`/`Invalid`; no stored report `NoReport`; no plannable endpoint `NoEndpoints` with `status.skipped`; `MIMIC_LOAD_MAX_RUNS=0` `Disabled`. One INFO `load test started` (namespace, name, deployment, uid, concurrency, rate, duration, targets) and one INFO `load test ended` (phase, reason, requests, errors) per run; `mimic_load_runs_total{phase,reason}` counts each end. |
@@ -5688,7 +5810,7 @@ with no `mimic-load-run` header unchanged).
 | LDT-10 | **I** (controller). Stop (§7.8): while `Running`, setting the `MimicWorkload` to `discovery` deletes the Job within 2 s of the watch event and makes the run `Aborted`/`ModeLeft`; `spec.stop: true` does the same with `Stopped`; in both cases the stop flag is set (and kept) before the Job is deleted, and the run ends in the same pass: the slot is free (a new run on the deployment is admitted) and the generators' next `targets` and `results` calls get `404`, which `mimic-load` treats as a stop (`Stopped`, exit 1, no further post, no retry). |
 | LDT-11 | **I** (sidecar). Load marker (§7.8), tickets signed with the root of the test's `MIMIC_TLS_CA`: in `mock`, an inbound HTTP/1 request and an `h2c` stream with a valid ticket naming the sidecar's deployment reach the app without the header, their answers carry exactly one `x-mimic-load` header, `ok`, also when the app's answer sets `x-mimic-load: ok` or `refused` itself, they are counted in `mimic_http_requests_total{direction="inbound"}`, `mimic_load_inbound_total{result="forwarded"}` and `mimic_discovery_exchanges_total{direction="inbound",result="load"}`, their access lines carry `load_run`, and `/discovery` does not change. In `discovery` (`reason=mode`), with a ticket of another deployment or namespace (`workload`), and with a ticket whose payload was changed (another `uid`), whose signature is by another deployment's root, that is expired, malformed, or sent to a sidecar without `MIMIC_TLS_CA` (`ticket`), they get `599`, `x-mimic-load: refused; reason=<reason>`, `content-length: 0`, the app receives no byte, `mimic_load_inbound_total{result="refused_mode"}`, `refused_workload` or `refused_ticket` counts them and one WARN `load request refused` is written per reason per mode period. After a pull switches to `discovery`, the next request on the same keep-alive connection is refused. Requests without the header behave as before. `GET /load` on the admin port answers `{"deployment","mode","namespace","pod"}`; other methods `405`. On HTTP/1 the app receives no byte of a refused request (also none on `h2c`: the connection to the app is opened by the first forwarded stream), the refused connection is closed after the `599`, and the rest is relayed in place: header case and order, bodies, an unmarked or marked request with `Upgrade` (the later `101` tunnel included) are untouched, and a marked request after plain ones, or before an `Upgrade` one, on the same connection is judged on its own. Heads that are forwarded unchanged as non-load: 64 KiB or more without their end (the existing limit behaviour), cut by the client's close (the held bytes are forwarded), never completed (released after the 30 s detection stall), and `mimic-load-run : t` (space before the colon, which the codec does not frame). Without `MIMIC_LOAD_ENABLED=1` (a pod injected while `loadTest.enabled` is false) the header is relayed unchanged, nothing is held back, and `GET /load` answers `404`. |
 | LDT-12 | **I** (`mimic-load`). Generation (§7.8), 2 fake targets: rate 200 for 10 s sends between 1900 and 2100 requests spread over both (counted by the fake targets; the run's own clock bounds it, so a slow runner gives fewer sends counted `missed`, never more); closed model with concurrency 8 never has more than 8 in flight; every request carries the marker and fresh volatile values; credentials come from `MIMIC_LOAD_CREDENTIALS_DIR`; results are posted every `MIMIC_LOAD_REPORT_INTERVAL`, cumulative, then once with `final` and `Completed`, and the process exits 0. No connection is opened to any address but the controller and the targets' probe and request ports; a target whose probe answers another deployment, the right deployment with another pod name, `mode: discovery`, `404` or nothing within 2 s receives no connection on its request port, and when every listed target fails the probe in 3 consecutive rounds the final post carries `NoTargets` (exit 1) without waiting for `MIMIC_LOAD_START_TIMEOUT`; a target whose probe passes but whose request port answers `x-mimic-load: refused; reason=workload` or `reason=ticket` (a connection that landed on another pod) stops the run with `Unverified`. `/metrics` exposes `mimic_load_requests_total{endpoint,result}`, `mimic_load_request_duration_seconds{endpoint}`, `mimic_load_in_flight`, `mimic_load_missed_total` and `mimic_load_targets`, `endpoint` being `<METHOD> <template>` of the plan. |
-| LDT-13 | **I** (`mimic-load`). Stop (§7.8): one answer with `x-mimic-load: refused; reason=mode` stops all requests within 2 s of that answer (measured by the fake target: no request arrives later than that, on any target), the final post carries `ModeLeft` and the exit code is 1; an answer without `x-mimic-load` does the same with `Unverified`; a targets answer with `stop: true` stops within one interval; `SIGTERM` sends the final post within `MIMIC_SHUTDOWN_GRACE`; with the controller unreachable for 3 intervals the generator stops (no load without control) with exit 1. FND-01, FND-02 and FND-03 hold for `mimic-load` and its variables of §10.6. |
+| LDT-13 | **I** (`mimic-load`). Stop (§7.8): one answer with `x-mimic-load: refused; reason=mode` stops all requests within 2 s of that answer (measured by the fake target: no request arrives later than that, on any target), the final post carries `ModeLeft` and the exit code is 1; an answer without `x-mimic-load` does the same with `Unverified` (from #454 except an inbound refusal of the target's sidecar, which is counted and stops nothing, ADM-59); a targets answer with `stop: true` stops within one interval; `SIGTERM` sends the final post within `MIMIC_SHUTDOWN_GRACE`; with the controller unreachable for 3 intervals the generator stops (no load without control) with exit 1. FND-01, FND-02 and FND-03 hold for `mimic-load` and its variables of §10.6. |
 | LDT-14 | **I** (`mimic-load` and controller). No secret in outputs: with a canary in the credentials Secret, in the fake targets' answer headers and bodies, and in the report's samples where a detector catches it, the requests carry the credential canary exactly in its field, and no stdout line of `mimic-load` or the controller, `/metrics` series, results post, `status` or Valkey value holds a canary, and no stdout line, series, status or read API answer holds the run's load ticket. |
 | LDT-15 | **I** (`mimic-load`). Bounds: a plan over `MIMIC_LOAD_MAX_PLAN` is refused (exit 1, no request); with a plan of 64 endpoints whose samples carry 256 KiB bodies and concurrency 128 against slow targets, the peak RSS (`VmHWM`) stays under 200 MiB (the default memory limit is 256 Mi). |
 | LDT-16 | **E.** On kind, with `loadTest.enabled=true` and the MCK-19 setup in `mock`: a `MimicLoadTest` on `front` (concurrency 8, rate 50, 60 s, `rampUp` 10 s) runs as a Job in `front`'s namespace whose pod passes Pod Security `restricted`, next to its NetworkPolicy (both gone after the CR is deleted), reaches `Succeeded` with, for each planned endpoint, requests > 0 and `latencyMicros.p99` > 0; during it the `users` and provider pods log no request and `front`'s `status.discovery.exchanges` does not grow. A second run, with `spec.mode: discovery` set 20 s after it started, is `Aborted`/`ModeLeft`, its Job is gone within 10 s, and `users` and the provider receive at most 8 (the concurrency) requests from `front` from then until the end of the check. A run on a deployment in `discovery` stays `Pending` and ends `Failed`/`NotMock` without a pod. No canary of the credentials Secret is in any log line of the cluster. |
@@ -6532,7 +6654,7 @@ contract changes.
   when the startup wait passes without a view.
 
 **Out of scope:** the metrics, the reasons table shared with logs and labels, the dashboards and
-`mimic-load` (#454); autoscaling (#455); a configurable queue or timeout (owner decision); a
+`mimic-load` (#454, below); autoscaling (#455); a configurable queue or timeout (owner decision); a
 contract per caller, per route or shared between pods; inbound TLS. Mesh traffic management
 beyond the milestones of the design is v2.
 
@@ -6580,6 +6702,66 @@ time, and stay below the time the wrong behaviour would give (as RTE-63).
 | ADM-32 | **M** (benchmark, design §14 M5 row). Setup `mesh-admission` of `scripts/bench.sh`, accepted by BEN-02 and BEN-11 and not in the default matrix. A 50 ms fortio backend runs behind a contract: <ul><li>the cost of admission: for each protocol (http1, h2c) and rate (50, 100, 200 rps), runs without any contract and under one that never binds alternate in ABBA order with every request's latency logged; at each rate the delta is the mean over the two runs under the contract of the exact p90 minus that mean over the two runs without; per protocol the median of the deltas over the rates is at most +0.5 ms, with no error under the contract. The p50 and p99 deltas are recorded, not judged. The p90 replaces the p99 of the first version ("at most 0.5 ms of p99 over the M4 run"), backed by data: in three quiet runs, even paired in ABBA order with exact percentiles, the p99 delta ranged from −10.5 to +8.3 ms with both signs, while the p50 and p90 deltas stayed within ±0.5 ms (p90 at most +0.48 ms, medians −0.02 and −0.01 ms) and a decision costs about 23 ns (ADM-08): over a 50 ms backend the p99 measures scheduling, not admission, whereas a cost paid by one request in ten or more still moves the p90;</li><li>the p99 of the time from the decision to the refusal written is at most 1 ms (the access `duration_ms` of the `overloaded` lines);</li><li>the longest `queue-timeout` wait is at most 160 ms;</li><li>at 2× `rps` the admitted rate is within ±5 % of `rps`.</li></ul> The report goes in `docs/bench/` and on #453. |
 | ADM-33 | **D** (documentation review). The spec text of §4.1, §7, §7.9 and §11.1 above. `docs/wiki/Mesh.md` has "Admission contract": the fields, per pod, the queue and its 150 ms, what is and is not metered, slots held by long-lived responses, how to size a contract with a load test, refusals retried by meshed callers and not by others. `Troubleshooting.md` has `overloaded` and `queue-timeout`. `Access-logs.md` has the inbound `reason`. |
 | ADM-34 | **D** (security review). <ul><li>The queue is bounded by `⌈concurrency / 10⌉` entries of a waker each (ADM-02, ADM-05).</li><li>A held head is bounded by 64 KiB, the stall and `MIMIC_MAX_CONNECTIONS`, and holds no slot (ADM-22). A held `h2c` stream is bounded by the 200 streams and the 16 KiB header list of the `h2` server per connection.</li><li>A refusal costs one write and no allocation proportional to the request (ADM-08).</li><li>An app cannot forge a refusal through its own sidecar (ADM-25). A namespace writer sets the contract of its own Deployments only (ADM-13, `targetRefs`).</li><li>A refusal and its access line carry no header value, body or query (ADM-15, ADM-27).</li><li>`mimic-core` `mesh::admission` has no clock, I/O or random source.</li><li>The §11.1 limits of #453 are written. No RBAC, capability or `MIMIC_*` variable is added.</li></ul> |
+
+#### M5 signalling (#454)
+
+Design: `docs/design/mimic-mesh.md` §9 (reasons), §10, §11 (the signal #455 scales on), §12 and
+§14 (M5 row). The spec text is in §4.1 ("Admission contract": "Observability", "Signals"), §7.8
+("Sidecar", "Generator", "Results"), §7.9 ("Admission": `admission contract changed`), §9 (the
+reasons table, attempt outcomes, the `mimic_admission_*` rows, the M1 to M4 mesh rows given one
+row each so that MON-22 reads them), §9.1 (`mimic-sidecar` rows *Mesh* and *Admission*,
+`mimic-mock-load` "Admission by result") and §11.1 (M5 #454). It amends LDT-04 and LDT-13
+(§12.12). Levels are as above. The **I** set-up of the sidecar is that of #453 above; the
+`mimic-load` one is the *fake targets* of §12.12, which can answer a request with a refusal of
+their choice. Every earlier row must still pass.
+
+**Already covered.** `mimic_mesh_stripped_headers_total` and the removal of the app's `x-mimic-*`
+fields are RTY-06, RTY-07, RTY-18 and ADM-25. The access line and RED counts of a refusal are
+ADM-27. No `MIMIC_*` variable, RBAC rule, capability or chart value is added (the dashboards are
+files of the chart).
+
+**Decisions recorded on #454** (taken with the recommended option while the maintainer is away):
+- **Load results.** Inbound refusals go to a new `mimicErrors` map by reason. They count in
+  `requests` and `rps`, not in `statuses` or `latencyMicros`, which stay those of the app.
+- **What the generator trusts.** Only an inbound refusal bound to the target's pod and address
+  (`overloaded`, `queue-timeout`, `connect-failed`). Any other answer without
+  `x-mimic-load: ok` is still `Unverified`.
+- **Closed model.** No pause after a refusal (§11.1); the wiki points to the open model.
+- **No contract, no gauge.** The gauges are absent without a contract (not 0), and the averages
+  restart at 0 with a new contract.
+- **`mimic_admission_requests_total{result}`.** `admitted` is every admission and `queued` the
+  offers that waited, so demand is `admitted + overloaded + queue-timeout`. `cancelled` is added
+  so that the four end results add up to the offers (ADM-05).
+- **Attempt outcomes keep their M2 spelling** (`queue_timeout`), mapped and tested (§9).
+- **`mimic_load_inbound_total`** gains `refused_admission`; `forwarded` counts only what
+  reached the app.
+- **Metrics from a 100 ms tick**, not from the request path (ADM-32 headroom).
+
+**Out of scope:** the HPA, prometheus-adapter and its rule (#455, which reads
+`mimic_admission_utilization` per pod, or the `rate()` of `mimic_admission_requests_total`
+over `mimic_admission_limit{kind="rps"}`); alert rules; showing `mimicErrors` in the explorer
+UI (the read API returns it with the stored summary); a printer column for refusals. Mesh
+traffic management beyond the milestones of the design is v2.
+
+| ID | Criterion |
+|---|---|
+| ADM-50 | **U** (`mimic-core` `mesh::reason`). `Reason::ALL` holds exactly the reasons of the §9 table, read from `docs/SPEC.md` at compile time (`include_str!`), each with the table's status (`fault-injected`: none, it is configured). `as_str` and `Reason::parse` are inverse over `ALL`; `parse` refuses every other byte string, the empty one, a different case and a value with spaces. The attempt-outcome mapping of §9 holds: `overloaded` and `queue_timeout` give `overloaded` and `queue-timeout`, `app_refused` gives `connect-failed`, and the other outcomes give none. `Reason::trusted_inbound()` is exactly `connect-failed`, `overloaded` and `queue-timeout`. |
+| ADM-51 | **I** (one reason, three places). In one test, the sidecar answers each of `overloaded` and `queue-timeout` (inbound, contract 1/1000 with the slot held), `no-endpoint` (a Service port without endpoints), `breaker-open` (`maxRequests` 1, held), `fault-injected` (abort 100 %, status 418) and `connect-failed` (every pod refusing connections). For each answer, the `x-mimic-error` value, the access line's `reason` and the label of its metric are the same string, `Reason::as_str` of it. That label is `mimic_mesh_requests_total{reason}` outbound and `mimic_admission_requests_total{result}` inbound. **D** (review): no reason is written as a string literal outside `mesh::reason` and the tests. |
+| ADM-52 | **U** (`mimic-core` `mesh::utilization`, the EWMA). <ul><li>From 0, a steady mean in flight `c/2` under contract `c` sampled every 100 ms gives `0.5 × (1 − e^(−t/15 s))` at `t` = 1, 15 and 60 s, within 1e-9 relative.</li><li>Ticks of 50 ms, 250 ms and 1 s, and one gap of 10 s, give at the same instants the value of 100 ms ticks within 1 %.</li><li>A steady demand of `2 × rps`, made of admitted, `overloaded` and `queue-timeout` offers, tends to 2.0 (not capped). `cancelled` offers add nothing.</li><li>The value is the larger of the two terms. The in-flight term never exceeds 1.</li><li>New contract values keep both averages and divide them by the new values. A contract that starts after none, or after a removal, starts at 0.</li><li>A tick at an instant not after the previous one changes nothing.</li><li>`proptest`: for any sequence of counts that never decrease, contracts in the §7 ranges and instants, the value is finite and at least 0.</li></ul> |
+| ADM-53 | **I** (`/metrics` after refusals). Contract 2/1000, the app answering after 300 ms. Two requests are admitted, a third is queued and refused `queue-timeout`, a fourth finds the queue full (`overloaded`). Once the third is refused and while the slots are still held, a fifth, an `h2c` stream, is queued and reset by its client within 50 ms. After the slots are free, a sixth is admitted. 200 ms after the last answer, `mimic_admission_requests_total` is exactly 3 `admitted`, 2 `queued`, 1 `overloaded`, 1 `queue-timeout` and 1 `cancelled`. `mimic_admission_in_flight_seconds_total` is 0.9 s ± 0.15 s. While the two slots are held, `mimic_admission_in_flight` is 2, `mimic_admission_queue_depth` 1, and `mimic_admission_limit` is 2 for `concurrency` and 1000 for `rps`. Each family has its §9 type and help text, and no label but `result` and `kind`. Before any contract none of the families exists. After the contract is removed, the four gauges are gone within 200 ms, and the counters stay with their values. With `MIMIC_MESH=off` no `mimic_admission_*` family exists. |
+| ADM-54 | **I** (utilisation over 15 s). Contract 1000/20, the app answering at once. Clients send 40 requests/s, spread evenly, for 20 s. `mimic_admission_utilization` scraped each second from 10 s on is non-decreasing within 0.02, and two scrapes 1 s apart differ by at most 0.1. At 20 s it is above 1 and at most 1.6, the expected value being 2 × (1 − e^(−20/15)) ≈ 1.47. The load then stops, and 5 s later the gauge is between 0.6 and 0.85 times its value at the stop (e^(−1/3) ≈ 0.72). With contract 4/100000, the app answering after 200 ms and 8 closed-loop clients for 5 s, the gauge stays at most 1.0: the in-flight term is capped by `concurrency`, and the demand term stays small. |
+| ADM-55 | **I** (`admission contract changed`). A view that adds 2/100 writes exactly one INFO `admission contract changed` with `concurrency` 2, `rps` 100, the view's `etag` and no `previous_*` field. A new view with the same contract writes none. 4/100 writes one line with `previous_concurrency` 2 and `previous_rps` 100. Removing the contract writes one line without `concurrency` and `rps`. A sidecar restarted with a persisted view holding a contract writes one line at start. 1000 refusals write no other component line. ADM-28's WARN is unchanged. |
+| ADM-56 | **I** (load marker and admission). With `MIMIC_LOAD_ENABLED=1`, mode `mock` and contract 1/1000, a request with a valid ticket holds the slot. A second one with a valid ticket is refused `queue-timeout`. `mimic_load_inbound_total` then has `forwarded` 1 and `refused_admission` 1, and its series exist at 0 from the start, as the other results do. The access line and ADM-26 are unchanged. |
+| ADM-57 | **U** (`mimic-core` `load::answer`). For a target `{pod: "p-1", ip: 10.0.0.7}` dialled on port 8080, the answer is classified: <ul><li>A `503` with no `x-mimic-load`, one `x-mimic-error` (`overloaded`, `queue-timeout` or `connect-failed`), one `x-mimic-origin: inbound; pod=p-1` and one `x-mimic-endpoint: 10.0.0.7:8080` is a refusal of that reason, whatever the case of the field names. The same holds with an IPv6 target as `[fd00::7]:8080`.</li><li>It is `Unverified` when any of these changes: the pod is `p-2` or absent (bare `inbound`), the endpoint is another address or port, a field is repeated, the status is `500`, the reason is `breaker-open` or unknown.</li><li>An answer with `x-mimic-load: ok` is the app's and is counted by its status class, even when it also carries a well-formed refusal's fields.</li><li>The `x-mimic-load: refused; reason=…` answers keep their §7.8 outcomes.</li></ul> |
+| ADM-58 | **U** (`load::summary`). `mimicErrors` is kept per endpoint and in total, with the keys of §7.8 only, and merging pods' results stays commutative and associative with it. `requests` equals the sum of `statuses`, `errors` and `mimicErrors`. A refusal adds nothing to `statuses` or to the latency histogram. The field is left out when empty, so the LDT-04 fixtures serialise to the same bytes. A document without it reads as empty. A document with an unknown key (`breaker-open`) or a value that is not an unsigned integer is refused. A summary of 64 endpoint rows with the three keys at `u64::MAX` on every row stays within the 192 KiB of §7.8. |
+| ADM-59 | **I** (`mimic-load`, fake targets). Two fake targets answer with their own pod name and address. One answers every third request `503 overloaded`, the other every fifth `503 queue-timeout`, and both answer the rest `200` with `x-mimic-load: ok`. A run at rate 100 for 5 s then ends `Completed` with exit code 0. In its final post, the refusals counted by each fake target equal `mimicErrors` by reason, and `statuses` holds only the `ok` answers. `/metrics` has `mimic_load_requests_total{result="overloaded"}` and `{result="queue-timeout"}` equal to them. The `_count` of `mimic_load_request_duration_seconds` equals the `ok` answers. No stdout line is written per refusal. A second run, whose target answers one refusal with `pod=` of the other target, stops `Unverified` as in LDT-13. |
+| ADM-60 | **I** (controller). Posts from 2 pods with `mimicErrors` are merged into `status.results` (total and endpoint rows) and into the stored summary as `load::summary` computes. A post whose `mimicErrors` has an unknown key is answered `400` and changes nothing. A summary stored without the field (an F11 run) is still answered by `GET …/loadtests/<uid>` (LDT-19) with the same body. |
+| ADM-61 | **E** (kind, `scripts/e2e-load.sh --suite`, after LDT-16, `front` in mock). A `MimicConfig` with `admission: {concurrency: 1, rps: 5}` on `front` (3 pods) is applied and every `front` sidecar's view holds it. A `MimicLoadTest` at rate 40, concurrency 16, for 30 s then reaches `Succeeded`/`Completed`. Its `status.results.total` has `mimicErrors.overloaded` above 0 and `statuses.2xx` above 0. At the end of the run, every `front` sidecar has `mimic_admission_requests_total{result="admitted"}` above 0, at least one has `mimic_admission_utilization` above 1, and the sum of `mimic_load_inbound_total{result="refused_admission"}` is above 0. After the `MimicConfig` is deleted and the views updated, no `front` sidecar exposes `mimic_admission_utilization`. The objects are removed by the suite's trap. |
+| ADM-62 | **E** (`scripts/check-dashboards.py` and MON-24). The dashboard files hold the §9.1 rows *Mesh* and *Admission* of `mimic-sidecar` and the panel "Admission by result" of `mimic-mock-load`, and MON-22 passes with the §9 rows above. `scripts/test_check_dashboards.py` adds two failing copies: `by (reason)` over `mimic_admission_requests_total` (its label is `result`), and `mimic_admission_utilisation` (unknown metric). In the bundled Grafana, MON-24 holds: every new expression answers `status: success`, and the five dashboards are still listed. |
+| ADM-63 | **D** (`scripts/test_bench.sh`, the bench improvements of #453's review). In the JSON of `mesh-admission`, `runs[].admission.pods[].refusals` holds, per reason, the counts per millisecond `[{"ms", "n"}]` sorted by `ms`, never one entry per refusal. The test feeds a fixture of access lines (`overloaded` at 0, 0, 1 and 3 ms; `queue-timeout` at 150, 150 and 152 ms) to the script's own jq program. It gets `[{"ms":0,"n":2},{"ms":1,"n":1},{"ms":3,"n":1}]` and `[{"ms":150,"n":2},{"ms":152,"n":1}]`, and the verdict program reads p99 3 ms and largest 152 ms from these counts, the values of the expanded lists. In `docs/bench/README.md` the M5 runs are in a table of their own, under `### M5 runs (mesh-admission)` at the end of the M5 section, which is the last of the file, so BEN-07's appended rows land there. The 2026-11-19 rows are moved there from the M4 table. |
+| ADM-64 | **M** (ADM-32 again, after the steps above). `SETUPS=mesh-admission scripts/bench.sh` on a quiet machine meets every ADM-32 check: the median p90 delta per protocol at most +0.5 ms with no error under the contract, the 2× load sent, the admitted rate within 5 %, the `overloaded` p99 and the longest `queue-timeout`. Its JSON is in `docs/bench/`, with the refusal durations as counts (ADM-63). Its rows and verdict table are in the M5 section, and the numbers are posted on #454. If the 200 rps p90 delta exceeds +0.5 ms, the run is repeated once and both runs are reported. The verdict stays the median of ADM-32. |
+| ADM-65 | **D** (documentation review). `docs/wiki/Monitoring.md`: the `mimic_admission_*` metrics, what the utilisation means (in flight and demand, 15 s, above 1 is refused demand, absent without a contract), the *Mesh* and *Admission* rows. `Load-test.md`: "Finding and setting the contract", in four steps. First, an open-model run without a contract, with rising `rate`, finds where latency breaks. Then a contract is set below it. A second run shows `mimicErrors` instead of the latency collapse. Then `utilization` at the planned load is read (the #455 `averageValue` of 700m is 70 %). It also says why the closed model spins on refusals. `Troubleshooting.md`: `mimicErrors` in a run's results, the utilisation above 1, `refused_admission`, `admission contract changed`. |
+| ADM-66 | **D** (security review). <ul><li>Every new label value is a fixed enumeration (`result`: 5 values, `kind`: 2, `mimic_load_requests_total{result}`: 3 more per endpoint, within `MIMIC_LOAD_MAX_ENDPOINTS`). No label, log field or results key comes from a header value, a path or a pod name.</li><li>The INFO line carries two integers, their previous values and the ETag.</li><li>The generator's trust of a refusal needs the target's pod and address (ADM-57). The app cannot forge one (ADM-57, ADM-25).</li><li>The controller refuses unknown `mimicErrors` keys (ADM-60).</li><li>`mesh::utilization` and `load::answer` have no clock, I/O or random source.</li><li>The request path gains no lock, counter or allocation: the metrics come from the 100 ms tick (§4.1 "Signals"), and ADM-64 measures it.</li><li>The §11.1 limits of #454 are written.</li><li>No `MIMIC_*` variable, RBAC rule, capability or chart value is added.</li></ul> |
 
 ## 13. Test strategy
 

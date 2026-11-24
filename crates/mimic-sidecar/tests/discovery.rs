@@ -486,9 +486,8 @@ async fn dsc_16_discovery_never_slows_or_alters_traffic() {
 /// The `discovery` lines so far, once the log queue had time to write them.
 async fn log_lines(logs: &common::Logs) -> Vec<serde_json::Value> {
     logs.settled().await;
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    logs.json()
+        .into_iter()
         .filter(|v| v["target"] == "discovery")
         .collect()
 }

@@ -245,8 +245,48 @@ kubectl -n <ns> get mimicconfig -o json \
 
 Then raise `concurrency` or `rps`, add replicas, or find what holds the slots: a slow app, long-lived responses (SSE,
 gRPC streams hold a slot for their whole life), or clients that send or read slowly. One caller can take every slot
-of a pod: the contract does not tell callers apart. Size it with a load test ([Mesh](Mesh#sizing-a-contract-with-a-load-test)).
-The queue size and the 150 ms are not configurable.
+of a pod: the contract does not tell callers apart. Size it with a load test
+([Load test](Load-test#finding-and-setting-the-contract)). The queue size and the 150 ms are not configurable.
+On the pod, `mimic_admission_requests_total{result="overloaded"}` and `{result="queue-timeout"}` count them
+([Monitoring](Monitoring#admission-metrics)).
+
+**A load test's results have `mimicErrors`.** The targets' sidecars refused some of its requests before they
+reached the app: `overloaded` and `queue-timeout` are the pod's [admission contract](Mesh#admission-contract),
+`connect-failed` is the app refusing the connection (above). The run goes on and these requests count in
+`requests` and `rps`, not in `statuses` nor in `latencyMicros`, so `requests` is the sum of `statuses`, `errors`
+and `mimicErrors`:
+
+```bash
+kubectl -n <ns> get mimicloadtest <name> -o json | jq '.status.results | {total: .total.mimicErrors, endpoints: [.endpoints[] | {method, template, mimicErrors}]}'
+```
+
+The run asked for more than the contract admits (`replicas × contract`). That is the expected result of a run
+above the contract ([Load test](Load-test#finding-and-setting-the-contract)); otherwise lower the run's `rate`,
+or raise the contract. A closed-model run (no `rate`) over the contract is mostly refusals: its workers send again
+as soon as a refusal comes back. A refusal bound to another pod or address is not counted: the run stops
+`Unverified`.
+
+**`mimic_admission_utilization` above 1.** Demand over the contract's `rps` was refused, averaged over 15 s. The
+gauge counts refused demand and is not capped: at twice `rps` it tends to 2, and its in-flight term never exceeds 1.
+Compare `sum by (result) (rate(mimic_admission_requests_total{pod="<pod>"}[5m]))` with
+`mimic_admission_limit{kind="rps"}`. Any client that can reach the pod IP raises it, as does a lower contract. **No
+`mimic_admission_utilization` series at all**: the pod has no contract in force (the gauges are absent without
+one, never 0), or `MIMIC_MESH=off`; see "An admission contract does not apply" below. The metrics lag the requests
+by up to 100 ms.
+
+**`mimic_load_inbound_total{result="refused_admission"}` rises.** Load-test requests with a valid ticket were
+refused by the pod's admission contract. `forwarded` counts only the load requests that reached the app. The
+generator counts these refusals in the run's `mimicErrors` (above).
+
+**Log line `admission contract changed`.** INFO, one each time the contract in force on the pod changes: set, given
+new values, or removed, also at start from the persisted view. `concurrency` and `rps` are the new contract (absent
+when it was removed), `previous_concurrency` and `previous_rps` the one before (absent when there was none), `etag`
+the view's. A view that keeps the same contract writes none, so a line you did not expect is a `MimicConfig` change
+of the Deployment (or its winning config changing):
+
+```bash
+kubectl -n <ns> logs <pod> -c mimic-sidecar | jq -c 'select(.message == "admission contract changed")'
+```
 
 **An admission contract does not apply: requests are never refused.** Check that the `MimicConfig` with
 `admission` targets the **Deployment** (not only a Service) and is its winning one (`Accepted: True`; `Conflicted`

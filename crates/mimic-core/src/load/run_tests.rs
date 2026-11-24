@@ -378,6 +378,279 @@ mod results_tests {
             Some(sum)
         );
     }
+    use crate::load::summary::{EndpointRow, Latency, MimicError, Row, Summary};
+    use crate::mesh::reason::Reason;
+
+    // --- ADM-58: mimicErrors -------------------------------------------------------------
+
+    fn key(reason: Reason) -> MimicError {
+        MimicError::new(reason).expect("a trusted reason")
+    }
+
+    #[test]
+    fn adm_58_mimic_error_keys_are_the_three_trusted_reasons_in_spec_order() {
+        for r in Reason::ALL {
+            assert_eq!(
+                MimicError::new(r).is_some(),
+                Reason::trusted_inbound().contains(&r),
+                "{r:?}"
+            );
+        }
+        let map = BTreeMap::from([
+            (key(Reason::Overloaded), 1u64),
+            (key(Reason::QueueTimeout), 2),
+            (key(Reason::ConnectFailed), 3),
+        ]);
+        assert_eq!(
+            serde_json::to_string(&map).unwrap_or_default(),
+            r#"{"connect-failed":3,"overloaded":1,"queue-timeout":2}"#
+        );
+        assert_eq!(key(Reason::Overloaded).as_str(), "overloaded");
+        assert_eq!(key(Reason::QueueTimeout).reason(), Reason::QueueTimeout);
+    }
+
+    /// The same responses and errors, the second with refusals too.
+    fn twins() -> (Stats, Stats) {
+        let mut plain = Stats::default();
+        for status in [200, 503, 404] {
+            plain.response(status, 1_000);
+        }
+        plain.error(ErrorKind::Timeout);
+        plain.error(ErrorKind::Timeout);
+        let mut refused = plain.clone();
+        for (reason, n) in [
+            (Reason::Overloaded, 4),
+            (Reason::QueueTimeout, 1),
+            (Reason::ConnectFailed, 2),
+        ] {
+            for _ in 0..n {
+                refused.refusal(key(reason));
+            }
+        }
+        (plain, refused)
+    }
+
+    fn sum_identity(requests: u64, value: &Value) {
+        let total = |field: &str| -> u64 {
+            value[field]
+                .as_object()
+                .map_or(0, |m| m.values().filter_map(Value::as_u64).sum())
+        };
+        assert_eq!(
+            requests,
+            total("statuses") + total("errors") + total("mimicErrors"),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn adm_58_refusals_count_in_requests_and_mimic_errors_only() {
+        let (plain, refused) = twins();
+        assert_eq!(
+            (&plain.statuses, &plain.errors, &plain.latency, plain.missed),
+            (
+                &refused.statuses,
+                &refused.errors,
+                &refused.latency,
+                refused.missed
+            )
+        );
+        assert_eq!(refused.requests, 12);
+        let want = BTreeMap::from([
+            (key(Reason::ConnectFailed), 2),
+            (key(Reason::Overloaded), 4),
+            (key(Reason::QueueTimeout), 1),
+        ]);
+        assert_eq!(refused.mimic_errors, want);
+        let stats = serde_json::to_string(&refused).unwrap_or_default();
+        let (errors, mimic, latency) = (
+            stats.find("\"errors\"").unwrap_or(usize::MAX),
+            stats.find("\"mimicErrors\"").unwrap_or(usize::MAX),
+            stats.find("\"latency\"").unwrap_or(0),
+        );
+        assert!(errors < mimic && mimic < latency, "{stats}");
+        sum_identity(
+            refused.requests,
+            &serde_json::from_str(&stats).unwrap_or(Value::Null),
+        );
+
+        let pods = [PodResults {
+            endpoints: vec![refused, Stats::default()],
+        }];
+        let sum = summary(&plan2(), &pods, 2_000);
+        assert_eq!(sum.total.mimic_errors, want);
+        assert_eq!(sum.endpoints[0].row.mimic_errors, want);
+        assert!(sum.endpoints[1].row.mimic_errors.is_empty());
+        assert_eq!((sum.total.requests, sum.total.rps), (12, 6));
+        let row = serde_json::to_string(&sum.total).unwrap_or_default();
+        let (errors, mimic, rps) = (
+            row.find("\"errors\"").unwrap_or(usize::MAX),
+            row.find("\"mimicErrors\"").unwrap_or(usize::MAX),
+            row.find("\"rps\"").unwrap_or(0),
+        );
+        assert!(errors < mimic && mimic < rps, "{row}");
+        sum_identity(
+            sum.total.requests,
+            &serde_json::from_str(&row).unwrap_or(Value::Null),
+        );
+    }
+
+    /// [`pod`] with refusals of a drawn reason too.
+    fn pod_refusing(seed: u64) -> PodResults {
+        let mut r = pod(seed);
+        let mut next = stream(seed ^ 0x5A5A);
+        let keys = Reason::trusted_inbound().map(key);
+        for _ in 0..100 {
+            let i = (next() % 2) as usize;
+            r.endpoints[i].refusal(keys[(next() % 3) as usize]);
+        }
+        r
+    }
+
+    #[test]
+    fn adm_58_merging_with_mimic_errors_is_commutative_and_associative() {
+        let (a, b, c) = (pod_refusing(1), pod_refusing(2), pod_refusing(3));
+        let merged = |x: &PodResults, y: &PodResults| {
+            let mut m = x.clone();
+            m.merge(y);
+            m
+        };
+        let plan = plan2();
+        let ab = merged(&a, &b);
+        assert_eq!(
+            summary(&plan, &[a.clone(), b.clone()], 10_000),
+            summary(&plan, &[b.clone(), a.clone()], 10_000)
+        );
+        assert_eq!(
+            summary(&plan, &[a.clone(), b.clone()], 10_000),
+            summary(&plan, std::slice::from_ref(&ab), 10_000)
+        );
+        assert_eq!(merged(&ab, &c), merged(&a, &merged(&b, &c)));
+        let both: u64 = a.endpoints[0].mimic_errors.values().sum::<u64>()
+            + b.endpoints[0].mimic_errors.values().sum::<u64>();
+        assert_eq!(ab.endpoints[0].mimic_errors.values().sum::<u64>(), both);
+        let sum = summary(&plan, &[a, b, c], 10_000);
+        for row in std::iter::once(&sum.total).chain(sum.endpoints.iter().map(|e| &e.row)) {
+            assert!(!row.mimic_errors.is_empty());
+            sum_identity(
+                row.requests,
+                &serde_json::to_value(row).unwrap_or(Value::Null),
+            );
+        }
+    }
+
+    /// The summary of an F11 run, as stored (`ui/tests/loadtests.rs`).
+    const F11_SUMMARY: &str = r#"{"total":{"requests":30,"missed":1,"statuses":{"2xx":29,"5xx":1},"errors":{"timeout":2},"rps":15,"latencyMicros":{"p50":900,"p90":2000,"p99":5000,"max":9000}},"endpoints":[{"method":"GET","port":8080,"template":"/a","requests":30,"missed":1,"statuses":{"2xx":29,"5xx":1},"errors":{"timeout":2},"rps":15,"latencyMicros":{"p50":900,"p90":2000,"p99":5000,"max":9000}}]}"#;
+
+    #[test]
+    fn adm_58_without_refusals_the_f11_bytes_are_unchanged() {
+        let read: Summary = serde_json::from_str(F11_SUMMARY).expect("an F11 summary");
+        assert!(read.total.mimic_errors.is_empty());
+        assert_eq!(
+            serde_json::to_string(&read).unwrap_or_default(),
+            F11_SUMMARY
+        );
+        let sum = summary(&plan2(), &[pod(3), pod(4)], 12_345);
+        let text = serde_json::to_string(&sum).unwrap_or_default();
+        assert!(
+            !text.contains("mimicErrors"),
+            "an empty mimicErrors written"
+        );
+        let stats = serde_json::to_string(&Stats::default()).unwrap_or_default();
+        assert!(!stats.contains("mimicErrors"), "{stats}");
+        assert_eq!(
+            serde_json::from_str::<Stats>(&stats).ok(),
+            Some(Stats::default())
+        );
+    }
+
+    #[test]
+    fn adm_58_unknown_keys_and_non_integer_values_are_refused() {
+        let ok = r#"{"requests":1,"missed":0,"statuses":{},"errors":{},"mimicErrors":{"overloaded":1},"latency":{}}"#;
+        assert!(serde_json::from_str::<Stats>(ok).is_ok());
+        let total = |mimic: &str| {
+            F11_SUMMARY.replacen(
+                r#""rps":15"#,
+                &format!(r#""mimicErrors":{mimic},"rps":15"#),
+                1,
+            )
+        };
+        assert!(serde_json::from_str::<Summary>(&total(r#"{"overloaded":1}"#)).is_ok());
+        for mimic in [
+            r#"{"breaker-open":1}"#,
+            r#"{"Overloaded":1}"#,
+            r#"{"queue_timeout":1}"#,
+            r#"{"app-refused":1}"#,
+            r#"{"":1}"#,
+            r#"{"overloaded":-1}"#,
+            r#"{"overloaded":1.5}"#,
+            r#"{"overloaded":"1"}"#,
+            r#"{"overloaded":null}"#,
+            r#"{"overloaded":18446744073709551616}"#,
+            r#"["overloaded"]"#,
+            r#""overloaded""#,
+            "1",
+        ] {
+            let stats = ok.replace(r#"{"overloaded":1}"#, mimic);
+            let err = serde_json::from_str::<Stats>(&stats).err();
+            assert!(err.is_some(), "{mimic} in Stats");
+            assert!(
+                !err.map(|e| e.to_string())
+                    .unwrap_or_default()
+                    .contains("breaker-open"),
+                "the key in the message"
+            );
+            assert!(
+                serde_json::from_str::<Summary>(&total(mimic)).is_err(),
+                "{mimic} in Summary"
+            );
+        }
+    }
+
+    #[test]
+    fn adm_58_sixty_four_rows_at_the_maximum_fit_in_192_kib() {
+        let max = u64::MAX;
+        let row = Row {
+            requests: max,
+            missed: max,
+            statuses: [Class::C2xx, Class::C3xx, Class::C4xx, Class::C5xx]
+                .into_iter()
+                .map(|c| (c, max))
+                .collect(),
+            errors: [
+                ErrorKind::Timeout,
+                ErrorKind::Connect,
+                ErrorKind::Reset,
+                ErrorKind::Protocol,
+                ErrorKind::Refused,
+                ErrorKind::Unverified,
+            ]
+            .into_iter()
+            .map(|k| (k, max))
+            .collect(),
+            mimic_errors: Reason::trusted_inbound().map(|r| (key(r), max)).into(),
+            rps: max,
+            latency_micros: Latency {
+                p50: max,
+                p90: max,
+                p99: max,
+                max,
+            },
+        };
+        let s = Summary {
+            total: row.clone(),
+            endpoints: (0..64)
+                .map(|_| EndpointRow {
+                    method: "OPTIONS".into(),
+                    port: 65535,
+                    template: format!("/{}", "a".repeat(2047)),
+                    row: row.clone(),
+                })
+                .collect(),
+        };
+        let len = serde_json::to_string(&s).unwrap_or_default().len();
+        assert!(len > 170_000 && len <= 192 << 10, "{len}");
+    }
 }
 
 fn limits() -> Limits {

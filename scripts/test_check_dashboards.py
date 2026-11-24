@@ -85,6 +85,14 @@ class CheckDashboards(unittest.TestCase):
         self.set_first_expr("sum by (authority) (rate(mimic_store_writes_total[$__rate_interval]))")
         self.assert_fails("authority")
 
+    def test_adm_62_by_reason_over_admission_requests(self):
+        self.set_first_expr("sum by (reason) (rate(mimic_admission_requests_total[$__rate_interval]))")
+        self.assert_fails("reason")
+
+    def test_adm_62_unknown_admission_metric(self):
+        self.set_first_expr("max(mimic_admission_utilisation)")
+        self.assert_fails("unknown metric")
+
     def test_mon_22_datasource_uid_written(self):
         def change(doc):
             panels(doc)[0]["datasource"] = {"type": "prometheus", "uid": "mimic-prometheus"}

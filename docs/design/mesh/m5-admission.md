@@ -4,7 +4,8 @@
 > ("Admission contract", "Failures", "Overload", access `reason`), §7 (`MimicConfig.spec.admission`), §7.9
 > (view `admission`, "Retries" for the callers), §9 (`synthetic`), §10.3 (`MIMIC_MESH`), §11.1, criteria
 > §12.29. Design: [`../mimic-mesh.md`](../mimic-mesh.md) §8, §9, §12, §13, §14 (M5 row) and §15. The
-> signalling of M5 (metrics, the line `admission contract changed`, dashboards) is #454; autoscaling is #455.
+> signalling of M5 (metrics, the line `admission contract changed`, dashboards, load tests counting refusals) is
+> #454, in [Signalling (#454)](#signalling-454) below; autoscaling is #455.
 
 ## Goal
 
@@ -169,10 +170,86 @@ All in spec §11.1 (M5, #453):
   and the pod name, as the `connect-failed` answer of #518 does. A caller that reached the pod already knows its
   address, and the pod name is not a secret.
 
+## Signalling (#454)
+
+Issue #454, criteria `ADM-50` to `ADM-66` (spec §12.29 "M5 signalling"). Spec: §4.1 ("Admission contract":
+"Observability", "Signals"), §7.8 ("Sidecar", "Generator", "Results"), §7.9 ("Admission": `admission contract
+changed`), §9 (the reasons table, the attempt outcomes, the `mimic_admission_*` rows), §9.1 (`mimic-sidecar` rows
+*Mesh* and *Admission*, `mimic-mock-load` "Admission by result") and §11.1 (M5, #454).
+
+| Decision | Reason | Where |
+|---|---|---|
+| The sidecar reads the counts of `mesh::admission` once every 100 ms on one timer, advances the two counters by their deltas and sets the gauges; nothing on the request path | The ADM-32 headroom: the request path gains no lock, counter or allocation | #454 decision, spec §4.1 "Signals", ADM-53, ADM-64 |
+| `mimic_admission_requests_total{result}`: `admitted` is every admission, `queued` the offers that waited, `cancelled` a client that left while queued; demand is `admitted + overloaded + queue-timeout` | The four end results add up to the offers (ADM-05); a client that left is not demand | #454 decision, ADM-53 |
+| `utilization = max(avg(in flight) / concurrency, avg(demand) / rps)`, each average an EWMA of time constant 15 s whose weight `1 − e^(−Δt / 15 s)` follows the real tick interval; not capped | A scrape every ~15 s does not alias 1 s noise, and refused demand above 1 lets #455 grow by more than one step | design §11, `mesh::utilization`, ADM-52, ADM-54 |
+| The gauges exist only while a contract is in force; the averages start at 0 with a new contract, are kept when its values change, dropped when it is removed | An HPA reading a pod without a contract sees no metric rather than 0 | #454 decision, ADM-52, ADM-53 |
+| One INFO `admission contract changed` per change of the contract in force, persisted view at start included, with two integers, their previous values and the ETag | A contract change is visible without a line per refusal | spec §7.9, ADM-55 |
+| One reasons table (§9): `mesh::reason::Reason` is the `x-mimic-error` value, the access `reason`, the metric labels and the `mimicErrors` keys; the attempt outcomes keep their M2 spelling (`queue_timeout`), mapped and tested | One string in three places; renaming the outcomes would break the queries written since M2 | #454 decision, ADM-50, ADM-51 |
+| `mimic_load_inbound_total` gains `refused_admission`; `forwarded` counts only what reached the app | A load request refused by the contract did not reach the app | #454 decision, ADM-56 |
+| The generator trusts only an inbound refusal bound to the target's pod and address (`overloaded`, `queue-timeout`, `connect-failed`, one `x-mimic-origin: inbound; pod=<target>`, one `x-mimic-endpoint` equal to the address dialled); any other answer without `x-mimic-load: ok` is still `Unverified` | A load test must measure a contract; a refusal from elsewhere still stops the run | #454 decision, `load::answer`, ADM-57, ADM-59 |
+| A refusal goes to a new `mimicErrors` map by reason; it counts in `requests` and `rps`, not in `statuses` nor `latencyMicros`; the field is left out when empty | The statuses and the latency stay those of the app; F11 results keep their bytes | #454 decision, `load::summary`, ADM-58, ADM-60 |
+| A refusal never verifies a target: on a connection already verified by an `x-mimic-load: ok` answer it is counted and the connection kept; as the first answer of a new connection it is counted, the connection dropped, and the next request probes again | The marker answer proves the pod is in mock; a refusal proves only that a mimic sidecar answered | PM decision of 2026-11-19 on #454 (safety), ADM-66 |
+| No pause after a refusal in the closed model | The load stays on the deployment under test; the wiki points to the open model | #454 decision, spec §11.1 |
+
+### Sequence: a load test meets a refusal
+
+```mermaid
+sequenceDiagram
+  participant G as mimic-load generator
+  participant S as Target pod sidecar
+  participant A as Target pod app
+  participant C as Controller
+  Note over G,S: a kept connection, verified by an earlier x-mimic-load ok answer
+  G->>S: GET /front/users/7 with mimic-load-run ticket
+  S->>S: marker check, mode mock and ticket valid
+  S->>S: admission, queue full
+  S-->>G: 503 x-mimic-error overloaded, x-mimic-origin inbound pod=front-1, x-mimic-endpoint 10.244.1.7 port 8080
+  Note over A: the app sees nothing of the request
+  Note over S: mimic_load_inbound_total refused_admission, access line reason overloaded, admission counters at the next 100 ms tick
+  G->>G: load answer, trusted refusal of the target (ADM-57)
+  Note over G: mimicErrors overloaded plus 1, not in statuses nor latency, connection kept, run goes on (ADM-59)
+  Note over G,S: no idle verified connection (the kept one is busy), so a new one
+  G->>S: probe GET /load on port 15100
+  S-->>G: 200 deployment, namespace, pod front-1, mode mock
+  G->>S: request with ticket on the new connection
+  S->>S: queued, 150 ms without a slot or token
+  S-->>G: 503 x-mimic-error queue-timeout, same origin and endpoint
+  Note over G: mimicErrors queue-timeout plus 1, the new connection had no ok answer, so it is dropped and the next new connection probes again (PM decision 2026-11-19)
+  G->>S: probe GET /load again before the next new connection
+  S-->>G: 200 mode mock
+  G->>S: request with ticket on that new connection
+  S->>A: admitted, forwarded without mimic-load-run
+  A-->>S: 200
+  S-->>G: 200 x-mimic-load ok
+  Note over G: counted by status class, the connection is now verified
+  G->>C: POST results with mimicErrors, final Completed
+  Note over C: merged into status.results, the run ends Succeeded (ADM-60, ADM-61)
+```
+
+An answer that names another pod or address, a repeated field, a `500` or `breaker-open` is still `Unverified`
+and stops the run (ADM-57, ADM-59). In the closed model the worker sends its next request at once after a
+refusal (spec §11.1).
+
+### Known limits of #454
+
+All in spec §11.1 (M5, #454):
+
+- **Lifted:** a load test no longer stops at the first admission refusal (#453's limit); the generator counts the
+  inbound refusals of its targets under their reason.
+- **A server that passes the probe can pass refusals off as its own.** No signature binds a refusal, nor
+  `x-mimic-load: ok`, to the sidecar. Such a server can already answer `ok`, so a forged refusal gains it nothing:
+  its load stays within the run's rate and concurrency, and the answers are counted in `mimicErrors`. The app
+  behind a real sidecar cannot forge one.
+- **A closed-model load test against a refusing pod spins**: refusals come back at once and the workers send again
+  at once, within the run's concurrency. Use the open model to check a contract.
+- **Callers drive the utilisation.** It counts refused demand, uncapped by design: any client that can reach a pod
+  IP, and a namespace writer that lowers the contract, raise it, and an HPA on it (#455) can be driven to its
+  `maxReplicas`. NetworkPolicy and `maxReplicas` bound it; the app moves only its own pod's signal.
+- **The admission metrics lag by up to 100 ms and miss the last tick at exit.** The access lines and
+  `mimic_http_requests_total` count every refusal at once.
+
 ## Open follow-ups
 
-- #454: the admission metrics, the reasons table shared with logs and labels, the INFO `admission contract
-  changed`, the dashboards and `mimic-load` counting refusals by reason.
 - #455: autoscaling.
 - Out of scope: a configurable queue or timeout (owner decision); a contract per caller, per route or shared
   between pods; inbound TLS. Mesh traffic management beyond the milestones of the design is v2.

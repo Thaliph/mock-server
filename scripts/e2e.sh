@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (MSH-28, CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, GRP-46, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (MSH-28, CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, GRP-46, MCK-19, LDT-16, LDT-19 E, ADM-61 via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -15,6 +15,8 @@ set -Eeuo pipefail
 # silent. errtrace (-E) carries the trap into functions and command substitutions.
 trap 'e2e_status=$?; echo "FAIL line $LINENO: \"$BASH_COMMAND\" exited with status $e2e_status" >&2' ERR
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/e2e/lib.sh
+source scripts/e2e/lib.sh
 
 TAG=${TAG:-e2e-$(git rev-parse --short HEAD 2>/dev/null || echo local)-$$}
 IMAGE=${IMAGE:-ghcr.io/thaliph/mimic:$TAG}
@@ -642,11 +644,9 @@ kubectl -n inj-17 logs mimic-init | grep '"message":"redirection installed"' >/d
 # Scenarios below use Deployments of the Python image. `pod` and `jp` read a pod's fields.
 jp() { kubectl -n "$1" get pod "$2" -o jsonpath="$3"; }
 
-# tcp_count <namespace> <direction> <result>: the app pod's mimic_tcp_connections_total, read from the
-# sidecar's admin port over loopback (not captured) through the app container's Python.
+# tcp_count <namespace> <direction> <result>: the app pod's mimic_tcp_connections_total (sidecar_scrape).
 tcp_count() {
-  kubectl -n "$1" exec deploy/app -c app -- python3 -c \
-    'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode())' \
+  sidecar_scrape "$1" deploy/app \
     | awk -v want="mimic_tcp_connections_total{direction=\"$2\",result=\"$3\"}" 'index($0, want) == 1 { printf "%d\n", $2 }' \
     | tail -1
 }
@@ -836,12 +836,14 @@ resolved=$(kubectl -n inj-13 exec "$pod" -c app -- python3 -c \
 # The HTTP paths /prx14 exist only for this check, so an access line for them comes from it alone.
 
 # sidecar_series <pod> <metric> [label=value...]: sum of the series of the app pod's sidecar that match
-# the labels (0 when none), read over loopback in the app container as tcp_count does.
+# the labels (0 when none), from sidecar_scrape; empty on a failed scrape.
 sidecar_series() {
-  kubectl -n inj-13 exec -i "$1" -c app -- python3 - "$2" "${@:3}" <<'PY'
-import re, sys, urllib.request
+  local text
+  text=$(sidecar_scrape inj-13 "$1") || return 1
+  python3 -I - "$2" "${@:3}" 3<<<"$text" <<'PY'
+import re, sys
 name, want = sys.argv[1], dict(arg.split("=", 1) for arg in sys.argv[2:])
-text = urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode()
+text = open(3).read()
 total = 0.0
 for line in text.splitlines():
     if not line.startswith(name + "{"):
@@ -1534,8 +1536,7 @@ endpoints() { jq -c -f "$WORK/endpoints.jq" "$1"; }
 ui_forward() {
   local pod
   if [[ -n ${UI_PF:-} ]]; then kill "$UI_PF" 2>/dev/null || true; wait "$UI_PF" 2>/dev/null || true; fi
-  pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller --field-selector=status.phase=Running \
-    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | awk 'NR == 1')
+  pod=$(live_pods "$NS" app.kubernetes.io/name=mimic-controller | awk 'NR == 1')
   [[ -n $pod ]] || fail "ctl_20: no controller pod to forward to"
   kubectl -n "$NS" port-forward "pod/$pod" 18082:8080 >/dev/null 2>&1 &
   UI_PF=$!
@@ -3169,7 +3170,8 @@ kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-container
 if found -F "$mck_canary" "$WORK/mck19-controller.log"; then fail "mck_19: a canary of front appears in the controller logs"; fi
 
 # LDT-16 and LDT-19 (E), spec §12.12 (F11): a load test of front on this setup, in mock, and the deployment page with its
-# runs. It needs mck-19, disc-22 and mck-19-provider, so it runs before the teardown below removes them.
+# runs; ADM-61 (§12.29): a load test of front against an admission contract. It needs mck-19, disc-22 and
+# mck-19-provider, so it runs before the teardown below removes them.
 CLUSTER=$CLUSTER TAG=$TAG IMAGE=$IMAGE INIT_IMAGE=$INIT_IMAGE scripts/e2e-load.sh --suite \
   || fail "ldt_16: scripts/e2e-load.sh --suite failed"
 
@@ -3714,21 +3716,18 @@ for p in $non08_pods; do
   [[ $(jp non-08 "$p" '{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_MODE")].value}') == none ]] \
     || fail "non_08: pod $p of a deployment without a MimicWorkload does not carry MIMIC_MODE=none"
 done
-# non08_exchanges <pod>: the exchanges the sidecar of the pod counted, all results (read over loopback in the app).
+# non08_exchanges <pod>: the exchanges the sidecar of the pod counted, all results (sidecar_scrape); empty on a failed
+# scrape.
 non08_exchanges() {
-  kubectl -n non-08 exec -i "$1" -c app -- python3 - <<'PY'
-import urllib.request
-text = urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode()
-print(int(sum(float(l.rsplit(" ", 1)[1]) for l in text.splitlines() if l.startswith("mimic_discovery_exchanges_total{"))))
-PY
+  local text
+  text=$(sidecar_scrape non-08 "$1") || return 1
+  awk 'index($0, "mimic_discovery_exchanges_total{") == 1 { total += $NF } END { printf "%d\n", total }' <<<"$text"
 }
 # non08_mode <pod> <mode>: the pod's sidecar has mimic_mode{mode} at 1.
 non08_mode() {
-  kubectl -n non-08 exec -i "$1" -c app -- python3 - "$2" <<'PY'
-import sys, urllib.request
-text = urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode()
-sys.exit(0 if f'mimic_mode{{mode="{sys.argv[1]}"}} 1' in text else 1)
-PY
+  local text
+  text=$(sidecar_scrape non-08 "$1") || return 1
+  [[ $text == *"mimic_mode{mode=\"$2\"} 1"* ]]
 }
 # non08_calls <n> <canary>: n GETs of users from the non-08-client pod (outside the injected namespaces).
 non08_calls() {

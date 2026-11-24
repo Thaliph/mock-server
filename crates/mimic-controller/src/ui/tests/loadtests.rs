@@ -11,7 +11,15 @@ const BAD: &str = "44444444-4444-4444-8444-444444444444";
 
 const SUMMARY: &str = r#"{"total":{"requests":30,"missed":1,"statuses":{"2xx":29,"5xx":1},"errors":{"timeout":2},"rps":15,"latencyMicros":{"p50":900,"p90":2000,"p99":5000,"max":9000}},"endpoints":[{"method":"GET","port":8080,"template":"/a","requests":30,"missed":1,"statuses":{"2xx":29,"5xx":1},"errors":{"timeout":2},"rps":15,"latencyMicros":{"p50":900,"p90":2000,"p99":5000,"max":9000}}]}"#;
 
-async fn run(store: &Arc<Store>, ns: &str, uid: &str, name: &str, start: u64, end: Option<u64>) {
+async fn run(
+    store: &Arc<Store>,
+    ns: &str,
+    uid: &str,
+    name: &str,
+    start: u64,
+    end: Option<u64>,
+    summary: &str,
+) {
     let spec = format!(r#"{{"name":"{name}","deployment":"pay","concurrency":4}}"#);
     store
         .load_admit(&Admit {
@@ -41,7 +49,7 @@ async fn run(store: &Arc<Store>, ns: &str, uid: &str, name: &str, start: u64, en
                 &Ended {
                     phase: "Succeeded",
                     reason: "Completed",
-                    summary: SUMMARY,
+                    summary,
                     end_ms,
                 },
             )
@@ -54,9 +62,27 @@ async fn run(store: &Arc<Store>, ns: &str, uid: &str, name: &str, start: u64, en
 async fn ldt_19_list_is_newest_first_with_the_fields_of_a_run() {
     let store = store(&valkey_url());
     let ns = unique("ldt19a");
-    run(&store, &ns, OLD, "first", 1_000_000, Some(1_100_000)).await;
-    run(&store, &ns, NEW, "second", 2_000_000, Some(2_100_000)).await;
-    run(&store, &ns, LIVE, "third", 3_000_000, None).await;
+    run(
+        &store,
+        &ns,
+        OLD,
+        "first",
+        1_000_000,
+        Some(1_100_000),
+        SUMMARY,
+    )
+    .await;
+    run(
+        &store,
+        &ns,
+        NEW,
+        "second",
+        2_000_000,
+        Some(2_100_000),
+        SUMMARY,
+    )
+    .await;
+    run(&store, &ns, LIVE, "third", 3_000_000, None, SUMMARY).await;
     let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests")).await;
     assert_eq!(answer.status, 200);
     let body = answer.json();
@@ -93,7 +119,16 @@ async fn ldt_19_list_of_a_deployment_without_runs_is_empty_and_names_are_checked
 async fn ldt_19_run_answers_the_stored_summary_with_per_endpoint_results() {
     let store = store(&valkey_url());
     let ns = unique("ldt19c");
-    run(&store, &ns, NEW, "second", 2_000_000, Some(2_100_000)).await;
+    run(
+        &store,
+        &ns,
+        NEW,
+        "second",
+        2_000_000,
+        Some(2_100_000),
+        SUMMARY,
+    )
+    .await;
     let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{NEW}")).await;
     assert_eq!(answer.status, 200);
     let body = answer.json();
@@ -107,7 +142,7 @@ async fn ldt_19_run_answers_the_stored_summary_with_per_endpoint_results() {
     assert_eq!(summary["endpoints"][0]["statuses"]["5xx"], 1);
     assert!(!body.to_string().contains("secret-ticket"), "{body}");
     // A run in progress has no summary yet.
-    run(&store, &ns, LIVE, "third", 3_000_000, None).await;
+    run(&store, &ns, LIVE, "third", 3_000_000, None, SUMMARY).await;
     let live = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{LIVE}")).await;
     assert_eq!(live.status, 200);
     assert_eq!(live.json()["summary"], Value::Null);
@@ -117,7 +152,16 @@ async fn ldt_19_run_answers_the_stored_summary_with_per_endpoint_results() {
 async fn ldt_19_unknown_uid_is_404_and_a_malformed_one_is_400() {
     let store = store(&valkey_url());
     let ns = unique("ldt19d");
-    run(&store, &ns, NEW, "second", 2_000_000, Some(2_100_000)).await;
+    run(
+        &store,
+        &ns,
+        NEW,
+        "second",
+        2_000_000,
+        Some(2_100_000),
+        SUMMARY,
+    )
+    .await;
     let other = "44444444-4444-4444-8444-444444444444";
     let unknown = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{other}")).await;
     assert_eq!(unknown.status, 404);
@@ -141,7 +185,16 @@ async fn ldt_19_unknown_uid_is_404_and_a_malformed_one_is_400() {
 async fn ldt_19_loopback_rules_and_headers_apply() {
     let store = store(&valkey_url());
     let ns = unique("ldt19e");
-    run(&store, &ns, NEW, "second", 2_000_000, Some(2_100_000)).await;
+    run(
+        &store,
+        &ns,
+        NEW,
+        "second",
+        2_000_000,
+        Some(2_100_000),
+        SUMMARY,
+    )
+    .await;
     for path in [
         format!("/v1/workloads/{ns}/pay/loadtests"),
         format!("/v1/workloads/{ns}/pay/loadtests/{NEW}"),
@@ -173,7 +226,7 @@ async fn ldt_19_an_unparseable_stored_summary_is_null_and_logged_once_as_an_erro
     let (capture, _guard) = crate::webhook::tests::capture_logs();
     let store = store(&valkey_url());
     let ns = unique("ldt19s");
-    run(&store, &ns, BAD, "first", 1_000_000, None).await;
+    run(&store, &ns, BAD, "first", 1_000_000, None, SUMMARY).await;
     store
         .load_end(
             &ns,
@@ -202,4 +255,46 @@ async fn ldt_19_an_unparseable_stored_summary_is_null_and_logged_once_as_an_erro
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["level"], "ERROR");
     assert!(!raw.contains("not json"), "the content reached a log");
+}
+
+#[tokio::test]
+async fn adm_60_an_f11_summary_is_answered_with_the_same_body() {
+    let store = store(&valkey_url());
+    let ns = unique("adm60");
+    run(
+        &store,
+        &ns,
+        NEW,
+        "second",
+        2_000_000,
+        Some(2_100_000),
+        SUMMARY,
+    )
+    .await;
+    let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{NEW}")).await;
+    assert_eq!(answer.status, 200);
+    let f11: Value = serde_json::from_str(SUMMARY).unwrap();
+    assert_eq!(answer.json()["summary"], f11);
+    assert!(!String::from_utf8_lossy(&answer.body).contains("mimicErrors"));
+    let refused = SUMMARY.replacen(
+        r#""rps":15"#,
+        r#""mimicErrors":{"overloaded":4},"rps":15"#,
+        2,
+    );
+    run(
+        &store,
+        &ns,
+        OLD,
+        "first",
+        1_000_000,
+        Some(1_100_000),
+        &refused,
+    )
+    .await;
+    let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{OLD}")).await;
+    assert_eq!(answer.status, 200);
+    let summary = &answer.json()["summary"];
+    for row in [&summary["total"], &summary["endpoints"][0]] {
+        assert_eq!(row["mimicErrors"], json!({"overloaded": 4}), "{summary}");
+    }
 }

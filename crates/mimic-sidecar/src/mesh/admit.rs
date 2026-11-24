@@ -80,16 +80,28 @@ impl Admitter {
         self.0.epoch.elapsed()
     }
 
-    /// Follows the view's `admission` (spec §4.1 "Contract changes").
-    pub(crate) fn set_contract(&self, contract: Option<Contract>) {
-        {
+    /// Follows the view's `admission` (spec §4.1 "Contract changes"); returns the contract it
+    /// replaces.
+    pub(crate) fn set_contract(&self, contract: Option<Contract>) -> Option<Contract> {
+        let previous = {
             let mut guard = self.lock();
             let now = self.now();
             let inner = &mut *guard;
+            let previous = inner.admission.contract();
             inner.admission.set_contract(contract, now, &mut inner.out);
             inner.dispatch(now);
-        }
+            previous
+        };
         self.0.wake.notify_one();
+        previous
+    }
+
+    /// One lock: the admission clock now, the contract in force and the counts at that
+    /// instant (spec §4.1 "Signals").
+    pub(crate) fn sample(&self) -> (Duration, Option<Contract>, Counts) {
+        let inner = self.lock();
+        let now = self.now();
+        (now, inner.admission.contract(), inner.admission.counts(now))
     }
 
     /// The contract in force.
@@ -102,6 +114,14 @@ impl Admitter {
     pub(crate) async fn admit(&self) -> Result<Slot, Refusal> {
         let (ticket, rx, spawn) = {
             let mut guard = self.lock();
+            // Without a contract `offer` admits and counts nothing: no permit to release, and
+            // nothing else to do under the lock.
+            if guard.admission.contract().is_none() {
+                return Ok(Slot {
+                    admitter: self.clone(),
+                    permit: None,
+                });
+            }
             let now = self.now();
             let inner = &mut *guard;
             let offer = inner.admission.offer(now, &mut inner.out);

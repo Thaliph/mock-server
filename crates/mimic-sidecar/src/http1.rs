@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use mimic_core::load::answer::{OK as LOAD_OK, REFUSED as LOAD_REFUSED};
 use mimic_core::mesh::admission::Refusal as AdmissionRefusal;
 use mimic_core::mesh::strip::strip;
 use mimic_core::proxy::http1::{
@@ -31,7 +32,7 @@ use tokio::sync::Notify;
 use crate::access::Outcome;
 use crate::exchange::{RefusalLog, RefusedRequest};
 use crate::listener::DETECT_STALL;
-use crate::load::{MARKER_HEADER, REQUEST_HEADER, Refusal, Watch};
+use crate::load::{MARKER_HEADER, Passed, REQUEST_HEADER, Refusal, Watch};
 use crate::mesh::{Admitter, MeshState, Slot};
 use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
@@ -84,7 +85,7 @@ impl Refused {
     pub fn answer(&self) -> String {
         match self {
             Refused::Load(refusal) => format!(
-                "HTTP/1.1 599 Refused\r\n{MARKER_HEADER}: refused; reason={}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 599 Refused\r\n{MARKER_HEADER}: {LOAD_REFUSED}{}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
                 refusal.as_str()
             ),
             Refused::Admission(answer) => answer.clone(),
@@ -574,6 +575,9 @@ impl<F: FnMut(Event)> Relay<F> {
                             match inbound.admit.admit().await {
                                 Ok(slot) => Some(slot),
                                 Err(refusal) => {
+                                    if let (Some(watch), Some(_)) = (self.watch.as_ref(), &run) {
+                                        watch.marker.passed(Passed::RefusedAdmission);
+                                    }
                                     let refused = Refusing {
                                         refusal,
                                         request,
@@ -599,6 +603,7 @@ impl<F: FnMut(Event)> Relay<F> {
                     if let Some(watch) = self.watch.as_ref() {
                         match (run, whole) {
                             (Some(run), Some((end, _))) => {
+                                watch.marker.passed(Passed::Forwarded);
                                 if let Some(tap) = &watch.tap {
                                     tap.load_exchange();
                                 }
@@ -683,11 +688,11 @@ impl<F: FnMut(Event)> Relay<F> {
         };
         let (Some(body), Some(framing)) = (keep, request.framing.as_ref()) else {
             inbound.log.refused(&observed, refusal, offered.elapsed());
-            let answer = refuse::http1_head(refusal.as_str(), dst, &origin, true);
+            let answer = refuse::http1_head(refusal.reason(), dst, &origin, true);
             self.refuse(Refused::Admission(answer));
             return Ok(false);
         };
-        let answer = refuse::http1_head(refusal.as_str(), dst, &origin, false);
+        let answer = refuse::http1_head(refusal.reason(), dst, &origin, false);
         // Set before the permit, so that the server pump finds it.
         *lock(&self.answer) = Some(answer.into_bytes());
         self.inject.notify_one();
@@ -950,7 +955,7 @@ impl<F: FnMut(Event)> Relay<F> {
                             }
                         }
                         if load {
-                            let ok = format!("{MARKER_HEADER}: ok\r\n");
+                            let ok = format!("{MARKER_HEADER}: {LOAD_OK}\r\n");
                             if let Some(head) =
                                 edited(&held[..end], MARKER_HEADER, Some(ok.as_bytes()))
                             {
