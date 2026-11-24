@@ -5,6 +5,8 @@
 #   assertions on the rendered objects with yq. Exit 0 when all hold, 1 on the first failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/lib/render-checks.sh
+source scripts/lib/render-checks.sh
 
 chart=deploy/helm/mimic
 digest="sha256:$(printf '0%.0s' $(seq 64))"
@@ -754,25 +756,14 @@ lint production -f "$overlay"
 helm template mimic "$chart" -n mimic-system --set valkey.existingSecret=golden -f "$overlay" > "$tmp/prod.yaml" \
   || fail "cht_02: the overlay does not render"
 # docs: the rendered objects as one JSON array; pods: the pod specs of the Deployments and StatefulSets.
-docs=$(yq -o=json -I0 '.' "$tmp/prod.yaml" | jq -cs '[.[] | select(. != null)]')
+docs=$(render_docs "$tmp/prod.yaml")
 pods=$(jq -c '[.[] | select(.kind == "Deployment" or .kind == "StatefulSet") | .spec.template.spec]' <<<"$docs")
 # obj <kind> <name>: the rendered object, as JSON, or nothing.
 obj() { jq -c --arg k "$1" --arg n "$2" '.[] | select(.kind == $k and .metadata.name == $n)' <<<"$docs"; }
 
 # CHT-02, Pod Security restricted: no host namespace or hostPath; runAsNonRoot and seccomp RuntimeDefault on each
 # container (its own setting, else the pod's); allowPrivilegeEscalation false, drop ALL, no added capability.
-violations=$(jq -r '
-  def eff($sc; $p; $f): if ($sc | has($f)) then $sc[$f] else ($p.securityContext[$f]) end;
-  .[] | . as $p
-  | (if ($p.hostNetwork // false) or ($p.hostPID // false) or ($p.hostIPC // false) then "host namespace" else empty end),
-    ((.volumes // [])[] | select(has("hostPath")) | "hostPath volume \(.name)"),
-    (((.containers // []) + (.initContainers // []))[] | . as $c | ($c.securityContext // {}) as $sc
-      | (if eff($sc; $p; "runAsNonRoot") == true then empty else "\($c.name): not runAsNonRoot" end),
-        (if (eff($sc; $p; "seccompProfile") // {}).type == "RuntimeDefault" then empty else "\($c.name): seccomp is not RuntimeDefault" end),
-        (if $sc.allowPrivilegeEscalation == false then empty else "\($c.name): allowPrivilegeEscalation is not false" end),
-        (if (($sc.capabilities.drop // []) | index("ALL")) != null then empty else "\($c.name): capabilities are not dropped ALL" end),
-        (if (($sc.capabilities.add // []) | length) == 0 then empty else "\($c.name): a capability is added" end))
-' <<<"$pods")
+violations=$(pss_violations <<<"$pods")
 [[ -z $violations ]] || fail "cht_02: Pod Security restricted: $(tr '\n' ';' <<<"$violations")"
 echo "cht_02: every pod of the overlay render is Pod Security restricted"
 
@@ -834,10 +825,9 @@ jq -e '.spec.ingress[0].from | length == 1 and (.[0].ipBlock.cidr | type == "str
 echo "cht_05: 3 spread controllers with a PDB, priority class, monitors, no bundled monitoring, no load test, webhook narrowed"
 
 # CHT-06: no secret in the file: no non-empty scalar at a key named like a secret, and no key material or token.
-secrets=$(yq -o=json '.' "$overlay" | jq -r '[paths(scalars) as $p | {k: ($p | map(tostring) | join(".")), v: getpath($p)}]
-  | .[] | select(.k | test("pass|token|secret|credential|private"; "i")) | select(.v != "" and .v != null and .v != false) | .k')
+secrets=$(secret_keys "$overlay")
 [[ -z $secrets ]] || fail "cht_06: values-production.yaml sets a secret-like value: $secrets"
-if grep -qE -- '-----BEGIN|AKIA|ghp_|sk_live_' "$overlay"; then fail "cht_06: values-production.yaml holds key or token material"; fi
+if has_token_material "$overlay"; then fail "cht_06: values-production.yaml holds key or token material"; fi
 echo "cht_06: values-production.yaml holds no secret"
 
 # UI-14 (#437, spec §12.7): the controller container declares mimic-ui on 8080/TCP, for information only. The read API

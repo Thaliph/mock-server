@@ -48,3 +48,7 @@ FROM docker.io/fortio/fortio:1.76.0@sha256:3dd31ddeb4f962a1dae8cc2a0bce62c408ac8
 FROM ghcr.io/kedacore/keda:2.21.1@sha256:d09d92c0a310e3057a3c54df387b99abf2bf31352218dbe1adcb00e807886488 AS keda
 FROM ghcr.io/kedacore/keda-metrics-apiserver:2.21.1@sha256:747e376b3e80dc4f72bf4f7043f47cc4cdb56f34b1aed9531789f474996e1c84 AS keda-metrics-apiserver
 FROM ghcr.io/kedacore/keda-admission-webhooks:2.21.1@sha256:5f4b0b0f7831b9f53738be85e99449a1747a5effa970305fe602455ab0f4fcd3 AS keda-admission-webhooks
+
+# kind node image of the e2e-autoscaling job (#455, ADM-70): the newest Kubernetes minor that KEDA 2.21 supports (1.34 to
+# 1.36). kind's own default is newer. A KEDA bump moves this stage with it.
+FROM kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed AS kind-node-keda

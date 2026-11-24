@@ -262,6 +262,9 @@ class Adm70Gate(unittest.TestCase):
         "deploy/helm/mimic/templates/prometheus-networkpolicy.yaml",
         "deploy/helm/mimic/templates/_monitoring.tpl",
         "crates/mimic-core/src/mesh/admission.rs",
+        "crates/mimic-core/src/mesh/utilization.rs",
+        "crates/mimic-sidecar/src/mesh/signal.rs",
+        "scripts/keda-chart.sh",
         "crates/mimic-sidecar/src/limits.rs",
         "crates/mimic-controller/src/sidecar_api/admission.rs",
     ]
@@ -277,6 +280,8 @@ class Adm70Gate(unittest.TestCase):
         # It starts no Rust job.
         r = run(["scripts/e2e-autoscaling.sh"])
         self.assertFalse(r["gate_lint"] or r["gate_test"] or r["gate_security"])
+        # Its edit alone does not start the other kind jobs.
+        self.assertFalse(r["gate_e2e"] or r["gate_e2e_load"])
 
     def test_adm_70_unrelated_changes_leave_the_gate_off(self):
         for path in (

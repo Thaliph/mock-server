@@ -95,10 +95,17 @@ for pair in keda:keda keda-metrics-apiserver:metricsApiServer keda-admission-web
     exit 1
   fi
 done
-keda_sha=$(sed -n 's/^sha256=//p' scripts/check-autoscaling.sh)
-[[ $keda_sha =~ ^[0-9a-f]{64}$ ]] || { echo "scripts/check-autoscaling.sh does not pin the keda chart archive by SHA-256" >&2; exit 1; }
-grep -qF "$keda_sha  keda-2.21.1.tgz" "$keda_values" || { echo "$keda_values does not give the archive SHA-256 of scripts/check-autoscaling.sh" >&2; exit 1; }
-grep -qF "$keda_sha" docs/SPEC.md || { echo "docs/SPEC.md does not name the keda archive SHA-256 of scripts/check-autoscaling.sh" >&2; exit 1; }
-echo "pins: the KEDA images match images/Dockerfile; the keda chart archive SHA-256 is the same in the values, the check and the spec"
+read -r keda_version keda_sha < <(scripts/keda-chart.sh --pin)
+[[ $keda_sha =~ ^[0-9a-f]{64}$ ]] || { echo "scripts/keda-chart.sh does not pin the keda chart archive by SHA-256" >&2; exit 1; }
+grep -qF "$keda_sha  keda-$keda_version.tgz" "$keda_values" || { echo "$keda_values does not give the archive SHA-256 of scripts/keda-chart.sh" >&2; exit 1; }
+grep -qF "$keda_sha" docs/SPEC.md || { echo "docs/SPEC.md does not name the keda archive SHA-256 of scripts/keda-chart.sh" >&2; exit 1; }
+# ADM-70: the e2e-autoscaling job runs on the kind-node-keda stage, which is Kubernetes 1.36 at most (KEDA 2.21 supports 1.34 to 1.36),
+# and the script defaults to it.
+keda_node=$(scripts/pinned-image.sh kind-node-keda)
+[[ $keda_node == kindest/node:v1.3[4-6].* ]] || { echo "kind-node-keda is $keda_node, not a Kubernetes 1.34 to 1.36 node" >&2; exit 1; }
+job_node=$(yq '.jobs.e2e-autoscaling.steps[] | select(.uses | test("^helm/kind-action@")) | .with.node_image' .github/workflows/ci.yml)
+[[ $job_node == "$keda_node" ]] || { echo "the e2e-autoscaling job uses '$job_node', images/Dockerfile says $keda_node" >&2; exit 1; }
+grep -qF 'pinned-image.sh kind-node-keda' scripts/e2e-autoscaling.sh || { echo "scripts/e2e-autoscaling.sh does not default to the kind-node-keda stage" >&2; exit 1; }
+echo "pins: the KEDA images match images/Dockerfile; the keda chart archive SHA-256 is the same in scripts/keda-chart.sh, the values and the spec; the e2e-autoscaling node is kind-node-keda"
 
 echo "pins: the e2e gRPC requirements are hashed; the Valkey image, the Valkey exporter image, the Prometheus and Grafana images and the kind node image match images/Dockerfile"

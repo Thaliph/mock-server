@@ -11,8 +11,9 @@
 #   IMAGE=ghcr.io/thaliph/mimic:$TAG            image to test (built here unless SKIP_BUILD=1)
 #   INIT_IMAGE=ghcr.io/thaliph/mimic-init:$TAG  mimic-init image (built here unless SKIP_BUILD=1)
 #   CLUSTER=mimic-autoscaling                   kind cluster name
-#   NODE_IMAGE=kindest/node:v1.36.0@sha256:…    kind node image (default: kind's own, the latest; KEDA 2.21 needs 1.34 to 1.36)
-#   KEDA_ARCHIVE=<file>                         a local keda-2.21.1.tgz instead of downloading it (its SHA-256 is still checked)
+#   NODE_IMAGE=kindest/node:v1.36.4@sha256:…    kind node image (default: the kind-node-keda stage of images/Dockerfile, Kubernetes
+#                                               1.36; KEDA 2.21 supports 1.34 to 1.36, kind's own default is newer)
+#   KEDA_ARCHIVE=<file>                         a local keda chart archive instead of downloading it (scripts/keda-chart.sh checks it)
 #   KEEP_CLUSTER=1                              keep the cluster afterwards (default: keep locally, delete in CI)
 set -Eeuo pipefail
 # A command that fails outside a condition ends the run: name it, so that no exit is silent.
@@ -32,6 +33,7 @@ TAG=${TAG:-e2e-autoscaling-$(git rev-parse --short HEAD 2>/dev/null || echo loca
 IMAGE=${IMAGE:-ghcr.io/thaliph/mimic:$TAG}
 INIT_IMAGE=${INIT_IMAGE:-ghcr.io/thaliph/mimic-init:$TAG}
 CLUSTER=${CLUSTER:-mimic-autoscaling}
+NODE_IMAGE=${NODE_IMAGE:-$(scripts/pinned-image.sh kind-node-keda)}
 NS=mimic-system
 RELEASE=mimic
 APP_NS=shop
@@ -62,32 +64,13 @@ cleanup() {
 trap cleanup EXIT
 
 # --- set-up ----------------------------------------------------------------------------------------------------
-clusters=$(kind get clusters) || { echo "FAIL kind get clusters failed" >&2; exit 1; }
-if ! grep -qx "$CLUSTER" <<<"$clusters"; then
-  log "create kind cluster $CLUSTER"
-  node_args=()
-  [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
-  kind create cluster --name "$CLUSTER" --wait 120s "${node_args[@]}"
-fi
-kubectl config use-context "kind-$CLUSTER" >/dev/null
+e2e_cluster_up
 log "kubernetes $(kubectl version -o json | jq -r '.serverVersion.gitVersion')"
-
-if [[ ${SKIP_BUILD:-0} != 1 ]]; then
-  log "build $IMAGE and $INIT_IMAGE"
-  docker build -q -t "$IMAGE" .
-  docker build -q -t "$INIT_IMAGE" --target init .
-  BUILT=1
-fi
-kind load docker-image --name "$CLUSTER" "$IMAGE" "$INIT_IMAGE"
+e2e_load_images
 
 # KEDA, from the archive checked against the SHA-256 that scripts/check-autoscaling.sh pins, with keda-values.yaml unchanged.
 log "install KEDA from the checked chart archive"
-keda_version=2.21.1
-keda_sha=$(sed -n 's/^sha256=//p' scripts/check-autoscaling.sh)
-[[ $keda_sha =~ ^[0-9a-f]{64}$ ]] || fail "scripts/check-autoscaling.sh does not pin the keda archive"
-archive=${KEDA_ARCHIVE:-$WORK/keda-$keda_version.tgz}
-[[ -n ${KEDA_ARCHIVE:-} ]] || curl -fsSL --retry 3 -o "$archive" "https://kedacore.github.io/charts/keda-$keda_version.tgz"
-[[ $(sha256sum "$archive" | cut -d' ' -f1) == "$keda_sha" ]] || fail "the keda chart archive is not the pinned one"
+archive=$(scripts/keda-chart.sh "$WORK") || fail "the pinned keda chart is not available"
 helm upgrade --install keda "$archive" -n keda --create-namespace -f deploy/autoscaling/keda-values.yaml --wait --timeout 5m \
   || fail "helm install keda"
 
@@ -153,30 +136,8 @@ kubectl -n "$APP_NS" rollout status deploy/cart --timeout=3m || fail "cart did n
 [[ -n $(kubectl -n "$APP_NS" get pods -l app=cart -o jsonpath='{.items[0].metadata.annotations.mimic\.platform\.io/injected}') ]] \
   || fail "cart is not injected"
 
-# The client: an open model (one thread per request, started on a fixed 6 requests/s clock), a new connection each time.
-cat > "$WORK/client.py" <<'PY'
-import sys
-import threading
-import time
-import urllib.request
-
-url, rate = sys.argv[1], float(sys.argv[2])
-
-
-def one():
-    try:
-        urllib.request.urlopen(url, timeout=5).read()
-    except Exception:
-        pass
-
-
-start, n = time.monotonic(), 0
-while True:
-    n += 1
-    threading.Thread(target=one, daemon=True).start()
-    time.sleep(max(0.0, start + n / rate - time.monotonic()))
-PY
-kubectl -n "$CLIENT_NS" create configmap client-code --from-file=client.py="$WORK/client.py" >/dev/null
+# The client: an open model (scripts/e2e/apps/open_client.py, 6 requests/s), a new connection each time.
+kubectl -n "$CLIENT_NS" create configmap client-code --from-file=client.py=scripts/e2e/apps/open_client.py >/dev/null
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
@@ -196,11 +157,8 @@ kubectl -n "$CLIENT_NS" wait --for=condition=Ready pod/client --timeout=180s >/d
 # TLS (ADM-70): the API server verifies the metrics server, with the caBundle that KEDA injected.
 log "adm_70 tls: the APIService is Available with a caBundle"
 api=v1beta1.external.metrics.k8s.io
-for _ in $(seq 60); do
-  [[ $(kubectl get apiservice $api -o jsonpath='{.status.conditions[?(@.type=="Available")].status}') == True ]] && break
-  sleep 2
-done
-[[ $(kubectl get apiservice $api -o jsonpath='{.status.conditions[?(@.type=="Available")].status}') == True ]] \
+apiservice_available() { [[ $(kubectl get apiservice $api -o jsonpath='{.status.conditions[?(@.type=="Available")].status}') == True ]]; }
+wait_for 120 apiservice_available \
   || fail "adm_70: the APIService $api is not Available"
 [[ -n $(kubectl get apiservice $api -o jsonpath='{.spec.caBundle}') ]] || fail "adm_70: the APIService $api has no caBundle"
 [[ $(kubectl get apiservice $api -o jsonpath='{.spec.insecureSkipTLSVerify}') != true ]] || fail "adm_70: the APIService skips TLS verification"
@@ -236,22 +194,12 @@ observe() {
     printf ' | hpa: absent, cart replicas=%s\n' "$(cart_replicas)"
   fi
 }
-# wait_for <seconds> <command...>: the command succeeds within the time (its errors are no failure while it polls).
-wait_for() {
-  local limit=$1 deadline; shift
-  deadline=$((SECONDS + limit))
-  while (( SECONDS < deadline )); do
-    if "$@" >/dev/null 2>&1; then return 0; fi
-    sleep 2
-  done
-  "$@" >/dev/null 2>&1
-}
-
 # --- no contract: does KEDA create the HPA while its scaler query fails? ------------------------------------------
 log "adm_70 no contract: KEDA creates the HPA while the scaler query is empty; the HPA holds (60 s)"
 echo "  The sidecars expose no mimic_admission_utilization without a contract, so the query returns nothing and"
 echo "  ignoreNullValues=false makes it a scaler error. Observing what KEDA does with the HPA:"
-wait_for 120 test -n "$(hpa_name)" || { observe "no hpaName"; fail "adm_70: OBSERVED: KEDA set no status.hpaName within 120 s: it creates no HPA while the scaler fails (design assumption false)"; }
+has_hpa_name() { [[ -n $(hpa_name) ]]; }
+wait_for 120 has_hpa_name || { observe "no hpaName"; fail "adm_70: OBSERVED: KEDA set no status.hpaName within 120 s: it creates no HPA while the scaler fails (design assumption false)"; }
 hpa=$(hpa_name)
 kubectl -n "$APP_NS" get hpa "$hpa" >/dev/null 2>&1 \
   || { observe "no hpa"; fail "adm_70: OBSERVED: status.hpaName=$hpa but the HPA does not exist (design assumption false)"; }
@@ -292,7 +240,7 @@ raw="/apis/external.metrics.k8s.io/v1beta1/namespaces/$APP_NS/$metric?labelSelec
 metric_positive() {
   local out
   out=$(kubectl get --raw "$raw") || return 1
-  jq -e '(.items | length) == 1 and (.items[0].value | . != "0" and . != "0m")' <<<"$out"
+  jq -e '(.items | length) == 1 and (.items[0].value | . != "0" and . != "0m")' <<<"$out" >/dev/null
 }
 wait_for 60 metric_positive || fail "adm_70: the external metric $metric has no value above 0 within 60 s of the contract: $(kubectl get --raw "$raw" 2>&1)"
 echo "  external metric: $(kubectl get --raw "$raw" | jq -c '.items[0] | {metricName, value}')"
@@ -314,9 +262,9 @@ q_rps="sum(rate(mimic_admission_requests_total{$sel,result=~\"admitted|overloade
 q_conc="sum(rate(mimic_admission_in_flight_seconds_total{$sel}[2m])) / max(mimic_admission_limit{$sel,kind=\"concurrency\"})"
 prom_positive() {
   curl -fsS -G "http://127.0.0.1:$PROM_PORT/api/v1/query" --data-urlencode "query=$1" \
-    | jq -e '.status == "success" and (.data.result | length) > 0 and ((.data.result[0].value[1] | tonumber) > 0)'
+    | jq -e '.status == "success" and (.data.result | length) > 0 and ((.data.result[0].value[1] | tonumber) > 0)' >/dev/null
 }
-wait_for 30 curl -fs "http://127.0.0.1:$PROM_PORT/-/ready" || fail "adm_70: Prometheus is not reachable by port-forward"
+wait_for 30 curl -fs -o /dev/null "http://127.0.0.1:$PROM_PORT/-/ready" || fail "adm_70: Prometheus is not reachable by port-forward"
 wait_for 150 prom_positive "$q_rps" || fail "adm_70: the rate() query on requests has no value above 0"
 wait_for 150 prom_positive "$q_conc" || fail "adm_70: the rate() query on in-flight seconds has no value above 0"
 echo "adm_70: both rate() queries return a value above 0"
