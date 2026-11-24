@@ -126,7 +126,7 @@ class Fnd10Classification(unittest.TestCase):
         # e2e deploys the chart with the images, so a chart change needs both.
         r = run(["deploy/helm/mimic/values.yaml"])
         self.assertFalse(r["full"])
-        self.assertTrue(on(r, "chart", "vendored_ui", "trivy_config", "image", "e2e", "e2e_load"))
+        self.assertTrue(on(r, "chart", "vendored_ui", "trivy_config", "image", "e2e", "e2e_load", "e2e_autoscaling"))
         self.assertFalse(r["gate_lint"])
         self.assertFalse(r["gate_test"])
         self.assertFalse(r["gate_security"])
@@ -274,9 +274,9 @@ class Adm70Gate(unittest.TestCase):
         for path in ("scripts/e2e-autoscaling.sh", "scripts/check-autoscaling.sh"):
             r = run([path])
             self.assertTrue(r["gate_chart"] and r["gate_image"], path)
-        # It does not start the other e2e suites.
+        # It starts no Rust job.
         r = run(["scripts/e2e-autoscaling.sh"])
-        self.assertFalse(r["gate_e2e"] or r["gate_e2e_load"] or r["gate_lint"])
+        self.assertFalse(r["gate_lint"] or r["gate_test"] or r["gate_security"])
 
     def test_adm_70_unrelated_changes_leave_the_gate_off(self):
         for path in (
