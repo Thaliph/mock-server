@@ -961,7 +961,16 @@ like any other. The generator counts the refusals of the targets' sidecars in th
 so a run above the contract shows its refusals instead of a latency collapse. The four steps (an open-model run
 without a contract at rising rates, a contract below the break, a second run, then the utilisation at the planned
 load) are in [Finding and setting the contract](Load-test#finding-and-setting-the-contract). The capacity is then
-`replicas × contract`; size the replicas (or the HPA) from it.
+`replicas × contract`; size the replicas from it, or let KEDA scale them on the utilisation.
+
+### Scaling on the contract
+
+KEDA can scale the Deployment on `mimic_admission_utilization`: a `ScaledObject` with one Prometheus trigger on
+`sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})` and a threshold of `0.7`
+(70 % of the contract per pod), bounded by `maxReplicaCount`. Without a contract there is no series, and the HPA
+holds its replicas. Mimic ships the examples in `deploy/autoscaling/` and installs neither KEDA nor a `ScaledObject`;
+see [Autoscaling on the admission contract](Monitoring#autoscaling-on-the-admission-contract). Find the contract
+first with [Finding and setting the contract](Load-test#finding-and-setting-the-contract).
 
 ## Observability
 
@@ -1128,5 +1137,6 @@ INFO line `admission contract changed` are in [Monitoring](Monitoring#admission-
   ([Fault injection](#fault-injection)) are in.
 - **M5**: the admission contract is in ([Admission contract](#admission-contract)), and so are its metrics, the line
   `admission contract changed`, the dashboard rows and load tests counting refusals (#454,
-  [Monitoring](Monitoring#admission-metrics)); the HPA (#455) is coming.
+  [Monitoring](Monitoring#admission-metrics)), and so are the KEDA examples to scale on it (#455,
+  [Autoscaling](Monitoring#autoscaling-on-the-admission-contract)).
 - **M6**: north-south gateway.

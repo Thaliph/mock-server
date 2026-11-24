@@ -200,8 +200,9 @@ refusals there, next to "Load requests received by result" (`mimic_load_inbound_
 
 ## Network and an external datasource
 
-With `networkPolicy.enabled` (the default), Prometheus admits queries from the Grafana pods only, and Grafana
-admits the release namespace only. Prometheus reaches the scrape ports, the controller and the Valkey exporter.
+With `networkPolicy.enabled` (the default), Prometheus admits queries from the Grafana pods and the peers of
+`monitoring.prometheus.queryFrom` only (empty by default, see
+[Autoscaling](#autoscaling-on-the-admission-contract)), and Grafana admits the release namespace only. Prometheus reaches the scrape ports, the controller and the Valkey exporter.
 Grafana reaches Prometheus, DNS and the API server (its dashboard sidecar watches the ConfigMaps). A port-forward
 is not blocked by a NetworkPolicy, and kind's default CNI does not enforce NetworkPolicy. Set
 `networkPolicy.apiServerCIDR` to narrow the API server egress.
@@ -219,6 +220,227 @@ monitoring:
         ports: [{port: 9090, protocol: TCP}]
 ```
 
+## Autoscaling on the admission contract
+
+A Deployment with an [admission contract](Mesh#admission-contract) can be scaled on `mimic_admission_utilization`
+([Admission metrics](#admission-metrics)) with [KEDA](https://keda.sh/) and its Prometheus scaler (M5, #455). A
+`ScaledObject` holds one Prometheus trigger; KEDA creates and owns the `autoscaling/v2` HPA, which reads the value as
+an `External` metric through KEDA's `v1beta1.external.metrics.k8s.io`. The flow is: the sidecar's gauge, scraped by
+Prometheus as job `mimic-sidecar` with the target labels `namespace`, `pod` and `deployment`; the KEDA operator,
+which runs the query; KEDA's metrics server; the HPA.
+
+**What mimic ships, and what it does not.** Mimic installs neither KEDA nor a `ScaledObject`: the chart renders no
+KEDA object and has no `autoscaling.*` value, and the controller gains no RBAC. The only chart value is
+`monitoring.prometheus.queryFrom`. Mimic ships three reviewed example files in `deploy/autoscaling/` of its
+repository, outside the chart, so the published chart is unchanged:
+
+| File | What it is |
+|---|---|
+| `keda-values.yaml` | Values for the chart `keda` **2.21.1**, pinned by version and by the SHA-256 of its archive, with its three images pinned by tag and digest. Secrets are read in KEDA's own namespace only (`permissions.operator.restrict.secret` and `permissions.metricServer.restrict.secret`), there is no `get` on `*/*` and no `*/scale` (`rbac.enabledCustomScaledRefKinds: false`; Deployments and StatefulSets stay scalable), `rbac.aggregateToDefaultRoles` stays `false`, and KEDA's own `kubernetes` NetworkPolicies are on. |
+| `scaledobject.yaml` | The `ScaledObject` `cart` of the Deployment `cart` in namespace `shop`, on the bundled Prometheus of release `mimic`. |
+| `scaledobject-external.yaml` | The same `ScaledObject` for an external Prometheus, with a `ClusterTriggerAuthentication`. |
+
+The set-up below (bundled Prometheus, KEDA from the checked archive, `scaledobject.yaml`) is the one the project's kind
+end-to-end test runs (`scripts/e2e-autoscaling.sh`).
+
+**Requirements.** KEDA 2.21 supports Kubernetes **1.34 to 1.36**, so autoscaling needs 1.34 or later, above mimic's
+own floor of 1.33. The pods must be injected with the mesh on, and the Deployment's name at most 63 characters: a
+longer one has no `deployment` label, so it has no series and is never scaled.
+
+### Install KEDA from the checked archive
+
+The `keda` chart of `https://kedacore.github.io/charts` has no OCI artefact, so it is pinned by the SHA-256 of its
+archive. Check the archive before installing it, with `keda-values.yaml` from a checkout of the mimic repository:
+
+```bash
+curl -fsSLO https://kedacore.github.io/charts/keda-2.21.1.tgz
+echo "76b45621e48e18c9872cdc0c46295e4cbac1236fd379d06bca38ef91d8fb883e  keda-2.21.1.tgz" | sha256sum -c -
+helm install keda ./keda-2.21.1.tgz -n keda --create-namespace -f deploy/autoscaling/keda-values.yaml --wait
+```
+
+`sha256sum -c` prints `keda-2.21.1.tgz: OK`; on any other answer, stop. The images are
+`ghcr.io/kedacore/keda`, `ghcr.io/kedacore/keda-metrics-apiserver` and `ghcr.io/kedacore/keda-admission-webhooks`,
+all `2.21.1` by digest.
+
+**Egress to the API server.** KEDA's `kubernetes` NetworkPolicies admit egress to pods only, and the API server is not
+a pod (on kind it is the node's address). Without more, the operator cannot reach it: it crash-loops and never
+creates its certificate Secret `kedaorg-certs`. `keda-values.yaml` therefore adds, to the operator, the metrics
+server and the webhooks, an egress rule admitting TCP 443 and 6443 to any destination, as mimic's own chart does
+while `networkPolicy.apiServerCIDR` is empty. To narrow it, give each rule the API server's address
+(`kubectl get endpoints kubernetes`):
+
+```yaml
+networkPolicy:
+  kubernetes:
+    operator:
+      extraEgressRules: &apiServerEgress
+        - to: [{ipBlock: {cidr: <api-server-address>/32}}]
+          ports:
+            - {port: 443, protocol: TCP}
+            - {port: 6443, protocol: TCP}
+    metricsServer:
+      extraEgressRules: *apiServerEgress
+    webhooks:
+      extraEgressRules: *apiServerEgress
+```
+
+**TLS.** The operator generates the metrics server's certificate and patches its CA into the `APIService` (KEDA's
+default), so the API server verifies it: there is no `insecureSkipTLSVerify`. Check that the `APIService` is
+available:
+
+```bash
+kubectl get apiservice v1beta1.external.metrics.k8s.io   # AVAILABLE: True
+```
+
+### The bundled Prometheus and `queryFrom`
+
+`scaledobject.yaml` queries the bundled Prometheus of release `mimic` in `mimic-system`
+(`http://mimic-prometheus.mimic-system.svc:9090`). The KEDA operator runs the scalers, so it is the pod that queries
+Prometheus. With `networkPolicy.enabled`, the Prometheus NetworkPolicy admits port 9090 from the Grafana pods only;
+`monitoring.prometheus.queryFrom` adds the operator pods:
+
+```yaml
+monitoring:
+  prometheus:
+    enabled: true
+    queryFrom:
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keda}}
+        podSelector: {matchLabels: {app: keda-operator}}
+```
+
+`queryFrom` is a list of NetworkPolicy `from` peers admitted to TCP 9090 besides the Grafana pods, rendered only with
+`networkPolicy.enabled`. Empty (the default), no rule is added. Each peer reads every series (see
+[Limits](#limits)). KEDA's own policies admit the operator's egress to Prometheus.
+
+### A cluster that already runs KEDA or another external metrics provider
+
+A cluster can have only one `v1beta1.external.metrics.k8s.io` `APIService`. A cluster that already runs KEDA does not
+install `keda-values.yaml`: it uses `scaledobject.yaml` alone, with its own KEDA settings, and `queryFrom` names its
+own operator's namespace and labels. A cluster whose external metrics API is served by another provider cannot add
+KEDA's next to it.
+
+### An external Prometheus
+
+`scaledobject-external.yaml` is the variant for a Prometheus outside the release. It needs the series of job
+`mimic-sidecar` with the labels `namespace` and `deployment`, which the PodMonitor `<release>-sidecar` gives
+(`metrics.podMonitor.enabled`, also set by `values-production.yaml`).
+
+- A `ClusterTriggerAuthentication` `mimic-prometheus` takes `bearerToken` and `ca` from the keys `token` and `ca.crt`
+  of a Secret `mimic-prometheus-auth` **in KEDA's namespace**.
+- The `ScaledObject` adds `authModes: bearer`, an `https://` `serverAddress` (a placeholder: set yours) and
+  `authenticationRef: {name: mimic-prometheus, kind: ClusterTriggerAuthentication}`.
+- A namespaced `TriggerAuthentication` is not used: its Secret would sit in the app's namespace, which the
+  restricted operator cannot read.
+
+Create the Secret out of band; the token is never a value of the file, a `customHeaders` entry or an argument:
+
+```bash
+kubectl -n keda create secret generic mimic-prometheus-auth --from-file=token=./token --from-file=ca.crt=./ca.crt
+```
+
+An external Prometheus can also scope each query to a namespace: put it behind prom-label-proxy and use KEDA's
+`namespace` parameter of the trigger (see [Limits](#limits)).
+
+### The `ScaledObject`
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cart
+  namespace: shop
+spec:
+  scaleTargetRef:
+    name: cart
+    kind: Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://mimic-prometheus.mimic-system.svc:9090
+        query: sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})
+        threshold: "0.7"
+        ignoreNullValues: "false"
+```
+
+Change `name`, `namespace`, `scaleTargetRef.name` and the `namespace` and `deployment` matchers of the query to your
+Deployment.
+
+- **The query** sums the gauge over the Deployment's pods. `deployment` is the target label the webhook sets on
+  injected pods, and `job="mimic-sidecar"` is the job of the bundled Prometheus and of the PodMonitor
+  `<release>-sidecar`. The `job` matcher keeps out a series of the same name from any other scrape job (an app's own
+  `/metrics`).
+- **Why `0.7` with `AverageValue` and a sum.** With `AverageValue` the HPA wants `ceil(sum / 0.7)` replicas, which is
+  the same as an average of 0.7 per pod: 70 % of the contract in use (the `0.7` of
+  [Finding and setting the contract](Load-test#finding-and-setting-the-contract)). Since the utilisation counts
+  refused demand and is not capped, a load above the contract can grow the Deployment by more than one step at a
+  time.
+- **`maxReplicaCount` is the bound of what callers can drive.** The utilisation is driven by the callers, so the HPA
+  can be pushed up to `maxReplicaCount` (see [Limits](#limits)). Always set it to the cost you accept; the example
+  does.
+- **`minReplicaCount` is at least 1.** At 0 replicas there is no sidecar to measure demand. There is no scale to zero,
+  no `fallback` and no `idleReplicaCount`.
+
+Check what the HPA reads:
+
+```bash
+kubectl -n shop get scaledobject cart -o jsonpath='{.status.hpaName}{"\n"}{.status.externalMetricNames[0]}{"\n"}'
+kubectl get --raw "/apis/external.metrics.k8s.io/v1beta1/namespaces/shop/<externalMetricNames[0]>?labelSelector=scaledobject.keda.sh/name=cart"
+kubectl -n shop describe hpa <hpaName>
+```
+
+### No metric: the HPA holds
+
+Without a contract the pods have no utilisation series, so the query is empty. `ignoreNullValues: "false"` makes
+that a scaler error, not a 0. KEDA then gives the HPA no metric (its default error behaviour, since there is no
+`fallback`), and the HPA sets `ScalingActive` to `False` with reason `FailedGetExternalMetric` and **keeps its
+replicas**: neither up nor down on a false 0. This also holds when a contract is removed: the Deployment stays at its
+replica count until a contract is back.
+
+- **New pods.** A new pod not yet scraped adds nothing to the sum until its first scrape.
+- **The delay from load to scale.** The signal reaches the HPA after the sidecar's 15 s average, one scrape interval
+  (`metrics.podMonitor.interval`, 30 s by default) and the HPA sync period (15 s). KEDA runs the query when the HPA
+  asks for the metric.
+
+### The `rate()` variant
+
+Instead of the smoothed gauge, a `ScaledObject` can read the admission counters with `rate()`. It uses two triggers,
+each with `threshold: "0.7"`, and the HPA follows the larger replica count:
+
+```yaml
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://mimic-prometheus.mimic-system.svc:9090
+        query: sum(rate(mimic_admission_requests_total{job="mimic-sidecar",namespace="shop",deployment="cart",result=~"admitted|overloaded|queue-timeout"}[2m])) / max(mimic_admission_limit{job="mimic-sidecar",namespace="shop",deployment="cart",kind="rps"})
+        threshold: "0.7"
+        ignoreNullValues: "false"
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://mimic-prometheus.mimic-system.svc:9090
+        query: sum(rate(mimic_admission_in_flight_seconds_total{job="mimic-sidecar",namespace="shop",deployment="cart"}[2m])) / max(mimic_admission_limit{job="mimic-sidecar",namespace="shop",deployment="cart",kind="concurrency"})
+        threshold: "0.7"
+        ignoreNullValues: "false"
+```
+
+The first is the demand (`admitted + overloaded + queue-timeout`) over the contract's `rps`, the second the mean in
+flight over its `concurrency`. The limit gauge is absent without a contract, so both queries are empty then, and the
+HPA holds as above. The `[2m]` window is at least four scrape intervals of the default 30 s: keep it at four
+intervals or more if you change `metrics.podMonitor.interval`. The variant does not have the sidecar's 15 s
+smoothing.
+
+### Who may write `ScaledObject`s
+
+The query of a `ScaledObject` is its author's own, and KEDA cannot scope it to a namespace: whoever can write a
+`ScaledObject` reads any series KEDA's Prometheus holds, one aggregate at a time, in the HPA's status. With the
+bundled Prometheus that includes other namespaces' series (authorities of the egress, endpoint templates, pod names).
+`keda-values.yaml` keeps `rbac.aggregateToDefaultRoles: false`, so the namespace roles `edit` and `admin` do not
+grant `keda.sh` objects: granting them is the cluster admin's decision. See [Limits](#limits).
+
 ## Limits
 
 - The bundled Prometheus reads pod objects, which show literal env values to it. This is accepted for a demo
@@ -233,4 +455,28 @@ monitoring:
   design (the autoscaling of #455 scales on it). Any client that can reach a pod IP, meshed or not, and a namespace
   writer that lowers the contract, raise it; an HPA built on it can then be driven up to its `maxReplicas`.
   NetworkPolicy bounds who can reach the pods, `maxReplicas` bounds the cost, and the contract is the namespace's
-  own configuration. The app can move only its own pod's signal, by answering slowly or by calling itself.
+  own configuration. The app can move only its own pod's signal, by answering slowly or by calling itself; with the
+  `ScaledObject` of `deploy/autoscaling/scaledobject.yaml` that is enough to hold the Deployment at
+  `maxReplicaCount`, which the example always sets.
+- **Whoever can write a `ScaledObject` reads any series KEDA's Prometheus holds** ([above](#who-may-write-scaledobjects)).
+  The value shows in the HPA's status, one aggregate at a time, so a `ScaledObject` in one namespace can read another
+  namespace's series in the bundled Prometheus. `rbac.aggregateToDefaultRoles: false` keeps `keda.sh` objects out of
+  the namespace `edit` and `admin` roles. An external Prometheus can scope the query with KEDA's `namespace`
+  parameter behind prom-label-proxy.
+- **A `queryFrom` peer reads every series.** The Prometheus HTTP API has no authentication, so the peer given for the
+  KEDA operator reads every series too, as Grafana does.
+- **KEDA's operator is a cluster-wide scaler.** Its chart grants it, in every namespace: `get`, `list` and `watch` on
+  pods, services, ConfigMaps, ServiceAccounts, EndpointSlices, Deployments, ReplicaSets and StatefulSets; `patch` and
+  `update` on `deployments/scale` and `statefulsets/scale`; create, update and delete of HPAs and Jobs; patch of
+  `APIService` and `ValidatingWebhookConfiguration` objects, for its certificates. `keda-values.yaml` removes the
+  Secret rules outside KEDA's namespace and the `*/*` and `*/scale` rules. A compromised operator can still scale any
+  Deployment and edit any HPA. KEDA is a cluster component you install, not mimic.
+- **KEDA's operator may reach any pod.** Its chart's `kubernetes` NetworkPolicy admits the operator's egress to every
+  pod on every port, since its scalers can query any source; the example keeps it, as a narrower policy would break
+  other teams' scalers on a shared KEDA. The Prometheus side is the narrow one: `queryFrom` admits the operator pods
+  only. Its egress to the API server is TCP 443 and 6443 to any destination until you narrow it
+  ([above](#install-keda-from-the-checked-archive)).
+- **A namespace writer can feed a fake series.** A pod labelled `mimic.platform.io/deployment: <deployment>` with a
+  container port named `mimic-admin` is scraped as job `mimic-sidecar` and can serve any
+  `mimic_admission_utilization`. That writer can already edit the `ScaledObject` and the Deployment. The `job` matcher
+  keeps out the series of other scrape jobs (an app's own `/metrics` scraped by annotation).

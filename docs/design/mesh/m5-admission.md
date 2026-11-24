@@ -5,7 +5,7 @@
 > (view `admission`, "Retries" for the callers), §9 (`synthetic`), §10.3 (`MIMIC_MESH`), §11.1, criteria
 > §12.29. Design: [`../mimic-mesh.md`](../mimic-mesh.md) §8, §9, §12, §13, §14 (M5 row) and §15. The
 > signalling of M5 (metrics, the line `admission contract changed`, dashboards, load tests counting refusals) is
-> #454, in [Signalling (#454)](#signalling-454) below; autoscaling is #455.
+> #454, in [Signalling (#454)](#signalling-454) below; autoscaling is #455, in [Autoscaling (#455)](#autoscaling-455).
 
 ## Goal
 
@@ -248,8 +248,32 @@ All in spec §11.1 (M5, #454):
 - **The admission metrics lag by up to 100 ms and miss the last tick at exit.** The access lines and
   `mimic_http_requests_total` count every refusal at once.
 
+## Autoscaling (#455)
+
+Issue #455, criteria `ADM-67` to `ADM-72` (spec §12.29 "M5 autoscaling"). Spec: §10.7
+(`monitoring.prometheus.queryFrom`, "Autoscaling on the admission contract"), §11 (the bundled Prometheus) and
+§11.1 (M5, #455). Wiki: [Autoscaling on the admission contract](../../wiki/Monitoring.md#autoscaling-on-the-admission-contract).
+
+KEDA's Prometheus scaler reads `sum(mimic_admission_utilization{job="mimic-sidecar",namespace=…,deployment=…})`; KEDA
+creates and owns the `autoscaling/v2` HPA, which reads it as an `External` metric through KEDA's
+`v1beta1.external.metrics.k8s.io`. No Rust code, `MIMIC_*` variable, metric or controller RBAC rule is added.
+
+| Decision | Reason | Where |
+|---|---|---|
+| KEDA, not prometheus-adapter | The adapter has had no release since 2024-05 and its image has 57 HIGH or CRITICAL findings | maintainer decision 2026-11-24 on #455 |
+| Examples only, in `deploy/autoscaling/`, no `ScaledObject` template and no `autoscaling.*` value; the only chart value is `monitoring.prometheus.queryFrom` | A `ScaledObject` belongs to the app's namespace and team; a template would make the release own autoscaling objects in other namespaces and need KEDA's CRDs at render | #455 decision, ADM-67, ADM-69 |
+| `threshold: "0.7"` with `metricType: AverageValue` on the sum | The HPA wants `ceil(sum / 0.7)` replicas, an average of 70 % of the contract per pod | spec §10.7, ADM-69 |
+| `ignoreNullValues: "false"`, no `fallback`, `minReplicaCount: 1` | No contract means no series: a scaler error, `FailedGetExternalMetric`, and the HPA holds instead of scaling on a false 0; at 0 replicas no sidecar measures demand | spec §10.7, ADM-69, ADM-70 |
+| The bundled Prometheus is the default; an external one goes through a `ClusterTriggerAuthentication` with its Secret in KEDA's namespace | The restricted operator reads Secrets in its own namespace only | #455 decision, ADM-69 |
+| KEDA 2.21.1, chart pinned by its archive SHA-256, images by digest, Secrets restricted, no `*/*` or `*/scale`, no role aggregation, KEDA's NetworkPolicies plus egress to the API server on 443 and 6443 | 2.21.0 has 7 HIGH findings; the chart has no OCI artefact; the API server is not a pod, so pod-only egress cuts the operator from it | #455 decision, ADM-68, ADM-72 |
+| The `rate()` variant is in the wiki only, with a `[2m]` window | It reads the counters without the 15 s smoothing; ADM-70 evaluates its queries | #455 decision, ADM-70, ADM-71 |
+| The kind e2e is its own job, on the latest Kubernetes only | KEDA 2.21 needs 1.34 or later; it does not add to the main e2e job | #455 decision, ADM-70 |
+
+Known limits (spec §11.1, M5, #455): whoever can write a `ScaledObject` reads any series of KEDA's Prometheus
+through the HPA status; a `queryFrom` peer reads every series; KEDA's operator is a cluster-wide scaler and may reach
+any pod; a namespace writer can feed a fake series; callers can drive the Deployment up to `maxReplicaCount`.
+
 ## Open follow-ups
 
-- #455: autoscaling.
 - Out of scope: a configurable queue or timeout (owner decision); a contract per caller, per route or shared
-  between pods; inbound TLS. Mesh traffic management beyond the milestones of the design is v2.
+  between pods; inbound TLS; mimic creating HPAs or `ScaledObject`s, scale to zero, KEDA's `fallback`, alert rules. Mesh traffic management beyond the milestones of the design is v2.

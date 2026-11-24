@@ -276,7 +276,8 @@ are those of one pod (`kubectl -n demo scale deploy/front --replicas=1`).
 4. **Read the utilisation at the planned load.** Run at the load you expect in production and read
    `mimic_admission_utilization` on each pod (the *Admission* row of the `mimic-sidecar` dashboard): `0.7` means
    70 % of the contract in use, smoothed over 15 s. The autoscaling of #455 targets `averageValue: 700m`, which is
-   that 70 %. A value above 1 means demand over the contract was refused. Then scale back: the capacity is
+   that 70 % (the `threshold: "0.7"` of the KEDA `ScaledObject`,
+   [Autoscaling](Monitoring#autoscaling-on-the-admission-contract)). A value above 1 means demand over the contract was refused. Then scale back: the capacity is
    `replicas × contract`.
 
 **Why not the closed model.** In the closed model (no `rate`) a worker sends its next request as soon as it has an

@@ -21,6 +21,21 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Autoscaling on the admission contract (#455, M5), with KEDA's Prometheus scaler on `mimic_admission_utilization`.
+  Mimic installs neither KEDA nor a `ScaledObject` and its controller gains no RBAC: reviewed examples ship in
+  `deploy/autoscaling/`, outside the chart. `keda-values.yaml` installs the chart `keda` 2.21.1, pinned by the
+  SHA-256 of its archive and its three images by digest, with Secrets read in KEDA's namespace only, no `*/*` or
+  `*/scale` rule, no aggregation to the default roles, and KEDA's NetworkPolicies plus egress to the API server on
+  TCP 443 and 6443. `scaledobject.yaml` scales `shop/cart` on
+  `sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})` with `threshold: "0.7"`
+  and `AverageValue` (70 % of the contract per pod), `minReplicaCount: 1`, `maxReplicaCount` set, no `fallback`, and
+  `ignoreNullValues: "false"`, so that without a contract the HPA reports `FailedGetExternalMetric` and holds its
+  replicas. It reads the bundled Prometheus; `scaledobject-external.yaml` reads an external one through a
+  `ClusterTriggerAuthentication` whose token and CA are in a Secret of KEDA's namespace. New chart value
+  `monitoring.prometheus.queryFrom`: NetworkPolicy peers admitted to port 9090 of the bundled Prometheus besides
+  Grafana, for the KEDA operator (each peer reads every series). KEDA 2.21 needs Kubernetes 1.34 or later. No new
+  `MIMIC_*` variable, metric or Rust code. See Autoscaling on the admission contract in the wiki page Monitoring.
+
 - Admission signalling (#454, M5). New sidecar metrics: `mimic_admission_requests_total{result}` (`admitted`,
   `queued`, `overloaded`, `queue-timeout`, `cancelled`; demand is `admitted + overloaded + queue-timeout`) and
   `mimic_admission_in_flight_seconds_total`, from the first contract applied; the gauges `mimic_admission_in_flight`,
