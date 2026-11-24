@@ -1,6 +1,6 @@
 {{- if and .Values.monitoring.prometheus.enabled .Values.networkPolicy.enabled }}
 # The NetworkPolicy of the bundled Prometheus (spec §10.7, §11, MON-20, #379). Its HTTP API has no authentication and
-# reads every series, so it admits ingress from the Grafana pods only (none without Grafana); `kubectl port-forward` is
+# reads every series, so it admits ingress from the Grafana pods and monitoring.prometheus.queryFrom only (none when neither is set); `kubectl port-forward` is
 # not blocked by a NetworkPolicy (§11.1). Egress: the scrape of the pods (15100 in the namespaces of its jobs), the
 # controller (8081), the Valkey exporter (9121, with valkey.metrics) and the API server (443, 6443). No DNS: it
 # scrapes pod IPs.
@@ -17,9 +17,10 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/name: mimic-prometheus
   policyTypes: [Ingress, Egress]
-  {{- if .Values.monitoring.grafana.enabled }}
-  # The queries of the Grafana pods only (MON-20).
+  {{- if or .Values.monitoring.grafana.enabled .Values.monitoring.prometheus.queryFrom }}
   ingress:
+    {{- if .Values.monitoring.grafana.enabled }}
+    # The queries of the Grafana pods (MON-20).
     - from:
         - podSelector:
             matchLabels:
@@ -27,6 +28,14 @@ spec:
               app.kubernetes.io/name: mimic-grafana
       ports:
         - {port: 9090, protocol: TCP}
+    {{- end }}
+    {{- with .Values.monitoring.prometheus.queryFrom }}
+    # The queries of the peers of monitoring.prometheus.queryFrom (ADM-67), for example the KEDA operator.
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - {port: 9090, protocol: TCP}
+    {{- end }}
   {{- else }}
   ingress: []
   {{- end }}

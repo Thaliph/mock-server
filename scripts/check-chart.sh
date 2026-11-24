@@ -663,6 +663,35 @@ render --set monitoring.grafana.enabled=true --set networkPolicy.enabled=false >
   || fail "mon_20: a monitoring NetworkPolicy is rendered with networkPolicy.enabled false"
 echo "mon_20: the Grafana NetworkPolicy admits 3000 from the release namespace, and Prometheus admits 9090 from Grafana only"
 
+# ADM-67: monitoring.prometheus.queryFrom adds one ingress rule, after the Grafana rule; empty changes nothing.
+qf=(--set 'monitoring.prometheus.queryFrom[0].namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=keda'
+  --set 'monitoring.prometheus.queryFrom[0].podSelector.matchLabels.app=keda-operator'
+  --set 'monitoring.prometheus.queryFrom[1].ipBlock.cidr=10.30.0.0/16')
+pnp() { yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$1"; }
+render --set monitoring.prometheus.enabled=true "${qf[@]}" > "$tmp/qf-nog.yaml"
+render --set monitoring.prometheus.enabled=true --set monitoring.grafana.enabled=true "${qf[@]}" > "$tmp/qf-g.yaml"
+for f in qf-nog qf-g; do
+  np=$(pnp "$tmp/$f.yaml")
+  n=$([[ $f == qf-g ]] && echo 1 || echo 0)
+  [[ $(yq -r '.spec.ingress | length' <<<"$np") == $((n + 1)) ]] || fail "adm_67: $f: the ingress has not $((n + 1)) rule(s)"
+  [[ $(yq -o json -I0 ".spec.ingress[$n].ports" <<<"$np") == '[{"port":9090,"protocol":"TCP"}]' ]] || fail "adm_67: $f: the queryFrom rule is not TCP 9090"
+  [[ $(yq -o json -I0 ".spec.ingress[$n].from" <<<"$np") == '[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"keda"}},"podSelector":{"matchLabels":{"app":"keda-operator"}}},{"ipBlock":{"cidr":"10.30.0.0/16"}}]' ]] \
+    || fail "adm_67: $f: the queryFrom peers are not the two given, in order"
+  [[ $(yq -r '[.spec.egress[].ports[].port] | join(",")' <<<"$np") == "15100,8081,443,6443" ]] || fail "adm_67: $f: the egress changed"
+done
+[[ $(yq -r '.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$(pnp "$tmp/qf-g.yaml")") == mimic-grafana ]] \
+  || fail "adm_67: the Grafana rule is not first"
+render --set monitoring.prometheus.enabled=true --set networkPolicy.enabled=false "${qf[@]}" > "$tmp/qf-off.yaml"
+render "${qf[@]}" > "$tmp/qf-noprom.yaml"
+[[ -z $(pnp "$tmp/qf-off.yaml") && -z $(pnp "$tmp/qf-noprom.yaml") ]] || fail "adm_67: the Prometheus policy is rendered with networkPolicy off or Prometheus off"
+render --set monitoring.prometheus.enabled=true --set monitoring.prometheus.queryFrom=null > "$tmp/qf-null.yaml"
+cmp -s <(pnp "$tmp/np-prom-novalkey.yaml") <(pnp "$tmp/qf-null.yaml") || fail "adm_67: an empty queryFrom changes the policy"
+for g in true false; do
+  helm lint --strict "$chart" --set monitoring.prometheus.enabled=true --set monitoring.grafana.enabled=$g "${qf[@]}" >/dev/null \
+    || fail "adm_67: helm lint --strict fails with grafana $g"
+done
+echo "adm_67: queryFrom adds one TCP 9090 ingress rule after Grafana's; empty, networkPolicy off and Prometheus off change nothing"
+
 # MON-20 (#379, datasourceEgress): the rules of datasourceEgress are appended only with datasourceUrl set.
 ext=(--set monitoring.grafana.enabled=true --set networkPolicy.enabled=true
   --set 'monitoring.grafana.datasourceEgress[0].to[0].ipBlock.cidr=10.20.0.0/16'
