@@ -74,7 +74,7 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `inject.initImage.tag` / `.digest` | `""` / `""` | Tag defaults to the appVersion; digest wins. |
 | `inject.sidecarResources` | requests `50m` / `64Mi`; limit memory `128Mi` | Resources of `mimic-sidecar` in injected pods (JSON in `MIMIC_INJECT_SIDECAR_RESOURCES`). |
 | `inject.sidecarLogLevel` | `info` | `MIMIC_LOG` given to injected sidecars. |
-| `valkey.image.repository` / `.tag` / `.digest` | `docker.io/valkey/valkey` / `9.0-alpine` / pinned digest | Valkey 9.0 or later is required (hash field expiry). |
+| `valkey.image.repository` / `.tag` / `.digest` | `docker.io/valkey/valkey` / `9.1-alpine` / pinned digest | Valkey 9.0 or later is required (hash field expiry). |
 | `valkey.existingSecret` | `""` | Secret with key `password`. Empty: the chart creates a random one, kept on upgrade and uninstall. |
 | `valkey.persistence.enabled` | `true` | `false`: `emptyDir`, store lost on pod restart. |
 | `valkey.persistence.size` | `4Gi` | AOF rewrites need about twice the data. Immutable after install, see the [upgrade note](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293). |

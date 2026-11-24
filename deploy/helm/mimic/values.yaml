@@ -89,8 +89,8 @@ inject:
 valkey:
   image:
     repository: docker.io/valkey/valkey
-    tag: 9.0-alpine
-    digest: sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+    tag: 9.1-alpine
+    digest: sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
   # Secret holding the key `password`. Empty: the chart creates one with a random password,
   # kept across upgrades and on uninstall.
   existingSecret: ""
