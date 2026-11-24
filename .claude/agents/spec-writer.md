@@ -58,6 +58,8 @@ Post it as one issue comment (`gh issue comment <n> --body-file -`), first line
 9. **Out of scope** for this step.
 
 ## Rules
+- Write the step spec in Simplified Technical English (ASD-STE100 style, `docs/WRITING.md`). Use
+  the spec's terms exactly, one instruction per sentence, and numbered lists for ordered steps.
 
 - Stay inside the criteria. If one is ambiguous, untestable or contradicts the code, write the
   question at the top of the comment and stop: it goes back to the architect, not to the dev.

@@ -19,5 +19,6 @@
   `cargo test --workspace`; chart changes: `helm lint --strict deploy/helm/mimic`; workflow
   changes: `zizmor --offline .github/workflows`; image/chart/cluster changes: `scripts/e2e.sh`.
 - Never push to `main`; merge only on green CI (`ci-ok`) and an approving review.
-- English everywhere: code, comments, docs, commits, issues.
+- English everywhere: code, comments, docs, commits, issues. The spec, design notes, step specs
+  and wiki use Simplified Technical English (ASD-STE100 style): see `docs/WRITING.md`.
 - Free tier only: public repo, GitHub-hosted runners, GHCR.
