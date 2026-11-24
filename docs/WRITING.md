@@ -47,8 +47,8 @@ documents:
 14. Use a vertical list for three or more items, steps or conditions. Number the steps when their order
     is important.
 15. An acceptance criterion starts with its test level (§12.2, or an extra level that its section
-    defines). Then it gives the setup, the action and the expected result, in that order. Each expected result is a separate
-    sentence or list item that a test can check.
+    defines). Then it gives the setup, the action and the expected result, in that order. Each
+    expected result is a separate sentence or list item that a test can check.
 16. Put a warning or a security limit before the instruction that it applies to.
 
 ## Example
