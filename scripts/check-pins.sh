@@ -82,4 +82,23 @@ if grep -q 'Gateway API (optional)' docs/wiki/Install.md; then
 fi
 echo "rte_25: the Gateway API manifest is pinned once at $gw_version with its SHA-256, the same in the spec and the wiki"
 
+# ADM-68 (#455): the KEDA images of deploy/autoscaling/keda-values.yaml are the stages keda, keda-metrics-apiserver and
+# keda-admission-webhooks, by tag and digest; the chart archive SHA-256 is the same in the values header, the check
+# script and the spec.
+keda_values=deploy/autoscaling/keda-values.yaml
+for pair in keda:keda keda-metrics-apiserver:metricsApiServer keda-admission-webhooks:webhooks; do
+  stage=${pair%%:*}; key=${pair##*:}
+  keda_chart=$(yq ".image.$key.registry + \"/\" + .image.$key.repository + \":\" + .image.$key.tag" "$keda_values")
+  keda_pin=$(scripts/pinned-image.sh "$stage")
+  if [ "$keda_chart" != "$keda_pin" ]; then
+    echo "$keda_values image.$key is $keda_chart, images/Dockerfile says $keda_pin" >&2
+    exit 1
+  fi
+done
+keda_sha=$(sed -n 's/^sha256=//p' scripts/check-autoscaling.sh)
+[[ $keda_sha =~ ^[0-9a-f]{64}$ ]] || { echo "scripts/check-autoscaling.sh does not pin the keda chart archive by SHA-256" >&2; exit 1; }
+grep -qF "$keda_sha  keda-2.21.1.tgz" "$keda_values" || { echo "$keda_values does not give the archive SHA-256 of scripts/check-autoscaling.sh" >&2; exit 1; }
+grep -qF "$keda_sha" docs/SPEC.md || { echo "docs/SPEC.md does not name the keda archive SHA-256 of scripts/check-autoscaling.sh" >&2; exit 1; }
+echo "pins: the KEDA images match images/Dockerfile; the keda chart archive SHA-256 is the same in the values, the check and the spec"
+
 echo "pins: the e2e gRPC requirements are hashed; the Valkey image, the Valkey exporter image, the Prometheus and Grafana images and the kind node image match images/Dockerfile"

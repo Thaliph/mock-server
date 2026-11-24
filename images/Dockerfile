@@ -42,3 +42,9 @@ FROM docker.io/chromedp/headless-shell:158.0.8106.0@sha256:7e9783a01393515a5b199
 # Benchmarks (#436, scripts/bench.sh): fortio v1.76.0, the load generator and the echo server of the baseline, published
 # 2026-10-11 (GitHub release), outside the 14-day cooldown.
 FROM docker.io/fortio/fortio:1.76.0@sha256:3dd31ddeb4f962a1dae8cc2a0bce62c408ac830c8435bbea51b1e0fd4c8f7181 AS fortio
+
+# KEDA 2.21.1 (#455, spec §10.7 "Autoscaling on the admission contract"): the images of deploy/autoscaling/keda-values.yaml,
+# published 2026-11-15 (inside the 14-day cooldown until 2026-11-30; the PR merges on or after that date).
+FROM ghcr.io/kedacore/keda:2.21.1@sha256:d09d92c0a310e3057a3c54df387b99abf2bf31352218dbe1adcb00e807886488 AS keda
+FROM ghcr.io/kedacore/keda-metrics-apiserver:2.21.1@sha256:747e376b3e80dc4f72bf4f7043f47cc4cdb56f34b1aed9531789f474996e1c84 AS keda-metrics-apiserver
+FROM ghcr.io/kedacore/keda-admission-webhooks:2.21.1@sha256:5f4b0b0f7831b9f53738be85e99449a1747a5effa970305fe602455ab0f4fcd3 AS keda-admission-webhooks

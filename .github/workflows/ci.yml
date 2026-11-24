@@ -179,6 +179,8 @@ jobs:
       - run: scripts/check-pins.sh
       # #378: the chart variants lint strictly, the default render is the golden file, the exporter and PodMonitor shape (MON-01).
       - run: scripts/check-chart.sh
+      # #455 (ADM-68, ADM-69): the pinned KEDA chart archive, its render with the example values and the two ScaledObjects.
+      - run: scripts/check-autoscaling.sh
       # #364 (REL-01): the workspace version, the chart version and appVersion are one semver version.
       - run: scripts/check-release.sh
 
