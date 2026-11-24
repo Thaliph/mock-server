@@ -86,16 +86,110 @@ np=$(jq -r '
 [[ -z $np ]] || fail "adm_68: no NetworkPolicy selects the pods of: $np"
 echo "adm_68: a NetworkPolicy selects each Deployment's pods"
 
+# ADM-68 (#564): each Deployment's pods are selected by exactly one NetworkPolicy, with exactly the chart's rules, in order,
+# and then one rule of TCP 443 and 6443 with no peer (keda-values.yaml). Ports of a rule compare as a set.
+expected_np=$(cat <<'JSON'
+{
+  "keda-operator": {
+    "ingress": [{"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "TCP", "port": 9666}]}],
+    "egress": [
+      {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+      {"to": [{"namespaceSelector": {}}], "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}]},
+      {"to": [{"namespaceSelector": {}}]},
+      {"ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}]}
+    ]
+  },
+  "keda-operator-metrics-apiserver": {
+    "ingress": [{"ports": [{"protocol": "TCP", "port": 6443}]}],
+    "egress": [
+      {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+      {"to": [{"namespaceSelector": {}}], "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}]},
+      {"to": [{"podSelector": {"matchLabels": {"app": "keda-operator"}}}], "ports": [{"protocol": "TCP", "port": 9666}]},
+      {"to": [{"namespaceSelector": {}}]},
+      {"ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}]}
+    ]
+  },
+  "keda-admission-webhooks": {
+    "ingress": [{"ports": [{"protocol": "TCP", "port": 9443}]}],
+    "egress": [
+      {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+      {"to": [{"namespaceSelector": {}}], "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}]},
+      {"to": [{"namespaceSelector": {}}]},
+      {"ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}]}
+    ]
+  }
+}
+JSON
+)
+bad=$(jq -r --argjson want "$expected_np" '
+  def norm: map(if has("ports") then .ports |= sort_by(.port, .protocol) else . end);
+  . as $all
+  | [.[] | select(.kind == "Deployment")] | .[] | . as $d | $d.metadata.name as $n
+  | [$all[] | select(.kind == "NetworkPolicy")
+      | select(.spec.podSelector.matchLabels as $m | $m != null and ($m | to_entries | all(. as $e | $d.spec.template.metadata.labels[$e.key] == $e.value)))] as $nps
+  | if ($want[$n] == null) then "unexpected Deployment \($n)"
+    elif ($nps | length) != 1 then "\($n): \($nps | length) NetworkPolicies select its pods"
+    elif $nps[0].spec.policyTypes != ["Ingress", "Egress"] then "\($n): policyTypes"
+    elif ($nps[0].spec.ingress | norm) != ($want[$n].ingress | norm) then "\($n): ingress rules"
+    elif ($nps[0].spec.egress | norm) != ($want[$n].egress | norm) then "\($n): egress rules"
+    else empty end' <<<"$docs")
+[[ -z $bad ]] || fail "adm_68: NetworkPolicy rules differ from the chart's plus the API server rule: $bad"
+echo "adm_68: each NetworkPolicy has exactly the chart's rules and the one TCP 443/6443 rule with no peer"
+
+# ADM-68 (#562): no rule grants any verb on the admission policies, so a compromised operator cannot remove keda-auth-policy.yaml.
+bad=$(jq -r '.[] | select(.kind == "ClusterRole" or .kind == "Role") | . as $r | (.rules // [])[]
+  | select((.resources // []) | any(. == "validatingadmissionpolicies" or . == "validatingadmissionpolicybindings" or . == "*"))
+  | "\($r.metadata.name)"' <<<"$docs")
+[[ -z $bad ]] || fail "adm_68: a rule grants a right on validatingadmissionpolicies or their bindings: $bad"
+echo "adm_68: no KEDA rule on validatingadmissionpolicies or their bindings"
+
+# ADM-73 (#562): keda-auth-policy.yaml.
+pol=$dir/keda-auth-policy.yaml
+pdocs=$(yq -o=json -I0 '.' "$pol" | jq -cs '[.[] | select(. != null)]')
+[[ $(jq 'length' <<<"$pdocs") == 2 ]] || fail "adm_73: $pol is not exactly one policy and one binding"
+jq -e '[.[] | select(.apiVersion == "admissionregistration.k8s.io/v1" and .kind == "ValidatingAdmissionPolicy")] | length == 1' <<<"$pdocs" >/dev/null \
+  || fail "adm_73: $pol is not exactly one ValidatingAdmissionPolicy"
+jq -e '[.[] | select(.apiVersion == "admissionregistration.k8s.io/v1" and .kind == "ValidatingAdmissionPolicyBinding")] | length == 1' <<<"$pdocs" >/dev/null \
+  || fail "adm_73: $pol is not exactly one ValidatingAdmissionPolicyBinding"
+ext_address=$(yq -r 'select(.kind == "ScaledObject") | .spec.triggers[0].metadata.serverAddress' $dir/scaledobject-external.yaml)
+jq -e --arg addr "$ext_address" '
+  (.[] | select(.kind == "ValidatingAdmissionPolicy")) as $p | (.[] | select(.kind == "ValidatingAdmissionPolicyBinding")) as $b
+  | $p.metadata.name == "mimic-prometheus-auth" and $b.metadata.name == "mimic-prometheus-auth"
+  and $p.spec.failurePolicy == "Fail"
+  and ($p.spec.matchConstraints.resourceRules | length) == 1
+  and ($p.spec.matchConstraints.resourceRules[0] | .apiGroups == ["keda.sh"] and (.operations | sort) == ["CREATE", "UPDATE"]
+       and (.resources | sort) == ["scaledjobs", "scaledobjects"])
+  and ([$p.spec.variables[] | select(.name == "address")] | length == 1)
+  and ([$p.spec.variables[] | select(.name == "address")][0].expression == "\"" + $addr + "\"")
+  and ($addr | startswith("https://"))
+  and ([$p.spec.variables[] | select(.name == "uses")][0].expression | contains("mimic-prometheus") and contains("clustertriggerauthentication") and contains("lowerAscii"))
+  and ([$p.spec.validations[].expression] | join(" ") | contains("type") and contains("serverAddress") and contains("unsafeSsl") and contains("FromEnv"))
+  and ($p.spec.validations | all(.messageExpression | contains("mimic-prometheus")))
+  and $b.spec.policyName == "mimic-prometheus-auth" and $b.spec.validationActions == ["Deny"] and ($b.spec | has("paramRef") | not)' <<<"$pdocs" >/dev/null \
+  || fail "adm_73: $pol: the policy or its binding is not the one of §10.7"
+echo "adm_73: keda-auth-policy.yaml is one policy and one binding bound to the address of scaledobject-external.yaml"
+
+# ADM-75 (#565): keda-scaledobject-editor.yaml.
+yq -o=json -I0 '.' $dir/keda-scaledobject-editor.yaml | jq -es '
+  length == 1 and .[0].kind == "ClusterRole" and .[0].metadata.name == "keda-scaledobject-editor"
+  and (.[0].rules | length) == 1
+  and (.[0].rules[0] | .apiGroups == ["keda.sh"] and .resources == ["scaledobjects"]
+       and (.verbs | sort) == ["create", "delete", "get", "list", "patch", "update", "watch"])
+  and (.[0] | has("aggregationRule") | not)
+  and ((.[0].metadata.labels // {}) | keys | any(startswith("rbac.authorization.k8s.io/aggregate-to-")) | not)' >/dev/null \
+  || fail "adm_75: keda-scaledobject-editor.yaml is not one ClusterRole with the one scaledobjects rule"
+echo "adm_75: keda-scaledobject-editor.yaml is one ClusterRole with one scaledobjects rule"
+
 # ADM-68, ADM-69: the three files hold no secret (CHT-06): no non-empty string at a key named like a secret, outside
 # a secretTargetRef (a reference to a Secret, not a value), and no key material or token.
-for f in $dir/keda-values.yaml $dir/scaledobject.yaml $dir/scaledobject-external.yaml; do
+for f in $dir/keda-values.yaml $dir/scaledobject.yaml $dir/scaledobject-external.yaml $dir/keda-auth-policy.yaml $dir/keda-scaledobject-editor.yaml; do
   secrets=$(yq -o=json -I0 '.' "$f" | jq -rs '.[] | [paths(scalars) as $p | {k: ($p | map(tostring) | join(".")), v: getpath($p)}]
     | .[] | select(.k | test("secretTargetRef") | not) | select(.k | test("pass|token|secret|credential|private"; "i"))
     | select((.v | type) == "string" and .v != "") | .k')
   [[ -z $secrets ]] || fail "adm_68: $f sets a secret-like value: $secrets"
   ! grep -qE -- '-----BEGIN|AKIA|ghp_|sk_live_|eyJ[A-Za-z0-9_-]{10,}' "$f" || fail "adm_68: $f holds key or token material"
 done
-echo "adm_68: the three files hold no secret"
+echo "adm_68: the files of deploy/autoscaling hold no secret"
 
 # ADM-69: the ScaledObject files.
 query='sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})'

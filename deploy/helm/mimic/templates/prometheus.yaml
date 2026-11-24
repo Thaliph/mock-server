@@ -59,6 +59,10 @@ spec:
             - --storage.tsdb.retention.size={{ .Values.monitoring.prometheus.retentionSize }}
             - --web.listen-address=:9090
             - --log.format=json
+            # Fixed query limits (spec §10.7, ADM-76): its queries can come from any ScaledObject author through KEDA.
+            - --query.timeout=15s
+            - --query.max-samples=5000000
+            - --query.max-concurrency=4
           ports:
             - name: http
               containerPort: 9090

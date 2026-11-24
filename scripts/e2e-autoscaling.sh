@@ -359,4 +359,87 @@ answer=$(kubectl auth can-i get secrets -n "$APP_NS" --as system:serviceaccount:
 [[ $answer == no ]] || fail "adm_70: can-i get secrets -n $APP_NS as keda-operator answered '$answer', not 'no'"
 echo "adm_70: can-i get secrets -n $APP_NS as the KEDA operator: no"
 
+# --- ADM-74: the admission policy binds the credential to its address (#562) ------------------------------------
+log "adm_74: keda-auth-policy.yaml admits the credential only at its address (--dry-run=server)"
+OTHER_NS=other
+kubectl delete namespace "$OTHER_NS" --ignore-not-found --wait=true --timeout=2m >/dev/null
+kubectl create namespace "$OTHER_NS" >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cart, namespace: $OTHER_NS}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cart}}
+  template:
+    metadata: {labels: {app: cart}}
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers: [{name: app, image: $PY, command: [sleep, infinity]}]
+YAML
+kubectl apply -f deploy/autoscaling/keda-auth-policy.yaml >/dev/null
+yq 'select(.kind == "ClusterTriggerAuthentication")' deploy/autoscaling/scaledobject-external.yaml | kubectl apply -f - >/dev/null
+yq 'select(.kind == "ScaledObject") | .metadata.namespace = "other"' deploy/autoscaling/scaledobject-external.yaml > "$WORK/ext-so.yaml"
+# variant <yq expression>: the external ScaledObject in other, changed by the expression.
+variant() { yq -e "$1" "$WORK/ext-so.yaml"; }
+# dry <file>: kubectl apply --dry-run=server of the file; sets dry_out and dry_rc (never stops the script).
+dry_out=""; dry_rc=0
+dry() {
+  if dry_out=$(kubectl apply --dry-run=server -f "$1" 2>&1); then dry_rc=0; else dry_rc=1; fi
+}
+admitted() { # <description> <file>
+  dry "$2"
+  (( dry_rc == 0 )) || fail "adm_74: $1 was refused: $dry_out"
+  echo "  admitted: $1"
+}
+refused() { # <description> <file>
+  dry "$2"
+  (( dry_rc == 1 )) || fail "adm_74: $1 was admitted"
+  [[ $dry_out == *mimic-prometheus* ]] || fail "adm_74: the refusal of $1 does not name mimic-prometheus: $dry_out"
+  [[ $dry_out == *ValidatingAdmissionPolicy* ]] || fail "adm_74: $1 was refused, but not by the policy: $dry_out"
+  ! grep -qiE 'token|ca\.crt|secretTargetRef' <<<"$dry_out" || fail "adm_74: the refusal of $1 mentions the token or the Secret: $dry_out"
+  echo "  refused:  $1"
+}
+other_addr=https://collector.other.svc:443
+variant ".spec.triggers[0].metadata.serverAddress = \"$other_addr\"" > "$WORK/r-address.yaml"
+variant '.spec.triggers[0].metadata.unsafeSsl = "true"' > "$WORK/r-unsafe.yaml"
+variant '.spec.triggers[0].metadata.serverAddressFromEnv = "PROMETHEUS_ADDRESS"' > "$WORK/r-fromenv.yaml"
+variant '.spec.triggers[0].type = "loki"' > "$WORK/r-type.yaml"
+variant ".spec.triggers[0].authenticationRef.kind = \"clustertriggerauthentication\" | .spec.triggers[0].metadata.serverAddress = \"$other_addr\"" > "$WORK/r-kind.yaml"
+variant "del(.spec.triggers[0].authenticationRef) | del(.spec.triggers[0].metadata.authModes) | .spec.triggers[0].metadata.serverAddress = \"$other_addr\"" > "$WORK/a-noauth.yaml"
+{
+  printf 'apiVersion: keda.sh/v1alpha1\nkind: ScaledJob\nmetadata: {name: job, namespace: %s}\nspec:\n' "$OTHER_NS"
+  printf '  jobTargetRef: {template: {spec: {restartPolicy: Never, containers: [{name: c, image: %s}]}}}\n  triggers:\n' "$PY"
+  yq '.spec.triggers | del(.[0].metricType) | .[0].metadata.serverAddress = "'"$other_addr"'"' "$WORK/ext-so.yaml" | sed 's/^/  /'
+} > "$WORK/r-scaledjob.yaml"
+# The policy takes a moment to be enforced: wait until the first refused case is refused (30 s at most).
+t0=$SECONDS
+until dry "$WORK/r-address.yaml"; (( dry_rc == 1 )) || (( SECONDS - t0 >= 30 )); do sleep 2; done
+admitted "the ScaledObject of scaledobject-external.yaml, in other" "$WORK/ext-so.yaml"
+admitted "the same with another serverAddress and no authenticationRef" "$WORK/a-noauth.yaml"
+refused "serverAddress $other_addr with the credential" "$WORK/r-address.yaml"
+refused 'unsafeSsl "true"' "$WORK/r-unsafe.yaml"
+refused "a serverAddressFromEnv key" "$WORK/r-fromenv.yaml"
+refused "type loki with the credential" "$WORK/r-type.yaml"
+# The CRD's own enum refuses a lower-case kind before the policy runs (the policy's lowerAscii is defence in depth, and
+# cannot be reached on this CRD): the refusal is by the schema, not by the policy.
+dry "$WORK/r-kind.yaml"
+(( dry_rc == 1 )) || fail "adm_74: kind clustertriggerauthentication in lower case was admitted"
+[[ $dry_out == *"authenticationRef.kind: Unsupported value"* || $dry_out == *mimic-prometheus* ]] \
+  || fail "adm_74: the lower-case kind was refused for another reason: $dry_out"
+echo "  refused:  kind clustertriggerauthentication in lower case with another serverAddress (by the CRD schema enum, not the policy)"
+refused "a ScaledJob using the credential with another serverAddress" "$WORK/r-scaledjob.yaml"
+# An update of the live shop/cart (ADM-70) that adds the credential and another serverAddress is refused, and the object is unchanged.
+before=$(kubectl -n "$APP_NS" get scaledobject cart -o json | jq -c '.spec')
+patch=$(jq -nc --arg a "$other_addr" --argjson t "$(jq -c '.triggers' <<<"$before")" \
+  '{spec: {triggers: ($t | .[0].metadata.serverAddress = $a | .[0].authenticationRef = {name: "mimic-prometheus", kind: "ClusterTriggerAuthentication"})}}')
+if patch_out=$(kubectl -n "$APP_NS" patch scaledobject cart --type merge -p "$patch" 2>&1); then
+  fail "adm_74: the update of the live ScaledObject was admitted"
+fi
+[[ $patch_out == *mimic-prometheus* && $patch_out == *ValidatingAdmissionPolicy* ]] || fail "adm_74: the update was refused, but not by the policy: $patch_out"
+[[ $(kubectl -n "$APP_NS" get scaledobject cart -o json | jq -c '.spec') == "$before" ]] || fail "adm_74: the refused update changed the live ScaledObject"
+echo "  refused:  the update of the live shop/cart, which is unchanged"
+kubectl delete namespace "$OTHER_NS" --wait=false >/dev/null
+echo "adm_74: 2 cases admitted, 6 refused by the policy with mimic-prometheus in the message, the update refused"
+
 echo "e2e-autoscaling: ADM-70 passed"
