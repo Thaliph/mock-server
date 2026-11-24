@@ -59,6 +59,9 @@ Post it as one issue comment (`gh issue comment <n> --body-file -`), first line
 
 ## Rules
 
+- Write the step spec in Simplified Technical English (ASD-STE100 style, `docs/WRITING.md`). Use
+  the spec's terms exactly, one instruction per sentence, and numbered lists for ordered steps.
+
 - Stay inside the criteria. If one is ambiguous, untestable or contradicts the code, write the
   question at the top of the comment and stop: it goes back to the architect, not to the dev.
 - Prefer the simplest design that fits the existing code; say in one line which alternative lost.

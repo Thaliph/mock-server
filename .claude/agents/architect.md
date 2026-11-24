@@ -37,5 +37,8 @@ spec sections it names. Do not read the whole repository.
 - No traces. Mesh traffic management is v2: say so instead of designing it.
 - If a product decision is needed (user-visible behaviour, default, scope), list it as a question
   in your comment and stop; do not decide it yourself.
+- Write the spec, the design and the threat model in Simplified Technical English (ASD-STE100
+  style, `docs/WRITING.md`): one term for one thing, one statement per sentence, at most 20 words
+  per instruction and 25 per description, active voice, "must" for a requirement.
 - English everywhere. Commit message: `spec: <feature> criteria` and end it with
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.

@@ -40,7 +40,9 @@ cluster run at a time on the machine; the main session runs them).
 
 6. **Spec**: the behaviour matches `docs/SPEC.md` word for word (status codes, header names,
    metric names, counts such as "retries: N means up to N+1 tries"); spec and code changed together.
-7. **Critique**: if a `<!-- mimic-critique -->` comment exists, its Must items are fixed or
+7. **Writing**: new spec and wiki text follows `docs/WRITING.md` (Simplified Technical English).
+   An ambiguous criterion (two readings, a synonym of a spec term, "should" or "may") is blocking.
+8. **Critique**: if a `<!-- mimic-critique -->` comment exists, its Must items are fixed or
    answered.
 
 ## Re-review
