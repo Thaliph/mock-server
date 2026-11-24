@@ -4554,7 +4554,7 @@ storage and ingress are out of scope; the dashboards are those of §9.1, shipped
 | Value | Default | Meaning |
 |---|---|---|
 | `monitoring.prometheus.enabled` | `false` | Renders `<release>-prometheus`: a Deployment (1 replica, `Recreate`), a Service `ClusterIP` on 9090 only, a ConfigMap `prometheus.yml`, a ServiceAccount, its RBAC (below) and, with `networkPolicy.enabled`, a NetworkPolicy (§11). |
-| `monitoring.prometheus.image` | `quay.io/prometheus/prometheus:v3.15.1@sha256:fa33…` | Pinned by digest in `images/Dockerfile` (stage `prometheus`, checked by `scripts/check-pins.sh`). Built 2026-10-21, outside the 14-day cooldown. |
+| `monitoring.prometheus.image` | `quay.io/prometheus/prometheus:v3.16.0@sha256:9332…` | Pinned by digest in `images/Dockerfile` (stage `prometheus`, checked by `scripts/check-pins.sh`). Built 2026-11-05, outside the 14-day cooldown. |
 | `monitoring.prometheus.retention` | `24h` | `--storage.tsdb.retention.time`. |
 | `monitoring.prometheus.retentionSize` | `800MB` | `--storage.tsdb.retention.size`, below the emptyDir limit so that the kubelet never evicts the pod for its data. |
 | `monitoring.prometheus.storageSizeLimit` | `1Gi` | `sizeLimit` of the `emptyDir` that holds the TSDB. There is no persistent volume: the data are lost when the pod restarts. |
