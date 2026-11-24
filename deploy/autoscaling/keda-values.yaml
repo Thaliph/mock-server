@@ -38,3 +38,17 @@ rbac:
 networkPolicy:
   enabled: true
   flavor: kubernetes
+  # KEDA's policies admit egress to pods only, but the API server is not a pod on most clusters (on kind it is the node's
+  # address), so every KEDA pod would time out reaching it. These rules admit TCP 443 and 6443 to any destination (what
+  # mimic's own chart does while networkPolicy.apiServerCIDR is empty). Narrow each to the API server with
+  # `to: [{ipBlock: {cidr: <address>/32}}]` (`kubectl get endpoints kubernetes`).
+  kubernetes:
+    operator:
+      extraEgressRules: &apiServerEgress
+        - ports:
+            - {port: 443, protocol: TCP}
+            - {port: 6443, protocol: TCP}
+    metricsServer:
+      extraEgressRules: *apiServerEgress
+    webhooks:
+      extraEgressRules: *apiServerEgress
