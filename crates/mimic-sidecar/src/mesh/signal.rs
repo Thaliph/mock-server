@@ -72,6 +72,8 @@ impl Signals {
         }
         state.at = Some(now);
         state.utilization.tick(now, contract, counts);
+        // The counters exist from the first contract on: one seen by a sample, or one applied
+        // and removed between two samples, whose offers are counted.
         if state.totals.is_some() || contract.is_some() || counts != Counts::default() {
             state.totals = Some(Totals {
                 admitted: counts
@@ -261,5 +263,21 @@ mimic_admission_limit{kind=\"rps\"} 1000
         };
         Signals::update(&mut signals.lock(), Duration::from_secs(2), c, fewer);
         assert_eq!(text(&signals), counters);
+    }
+
+    #[test]
+    fn adm_53_a_contract_gone_between_two_samples_keeps_its_counters() {
+        let signals = Signals::default();
+        let counts = Counts {
+            admitted_at_once: 1,
+            ..Counts::default()
+        };
+        Signals::update(&mut signals.lock(), Duration::from_secs(1), None, counts);
+        let scrape = text(&signals);
+        assert!(
+            scrape.contains("mimic_admission_requests_total{result=\"admitted\"} 1\n"),
+            "{scrape}"
+        );
+        assert!(!scrape.contains("mimic_admission_in_flight "), "{scrape}");
     }
 }

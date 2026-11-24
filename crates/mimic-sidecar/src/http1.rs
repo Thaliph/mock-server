@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use mimic_core::load::answer::{OK as LOAD_OK, REFUSED as LOAD_REFUSED};
 use mimic_core::mesh::admission::Refusal as AdmissionRefusal;
 use mimic_core::mesh::strip::strip;
 use mimic_core::proxy::http1::{
@@ -84,7 +85,7 @@ impl Refused {
     pub fn answer(&self) -> String {
         match self {
             Refused::Load(refusal) => format!(
-                "HTTP/1.1 599 Refused\r\n{MARKER_HEADER}: refused; reason={}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 599 Refused\r\n{MARKER_HEADER}: {LOAD_REFUSED}{}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
                 refusal.as_str()
             ),
             Refused::Admission(answer) => answer.clone(),
@@ -954,7 +955,7 @@ impl<F: FnMut(Event)> Relay<F> {
                             }
                         }
                         if load {
-                            let ok = format!("{MARKER_HEADER}: ok\r\n");
+                            let ok = format!("{MARKER_HEADER}: {LOAD_OK}\r\n");
                             if let Some(head) =
                                 edited(&held[..end], MARKER_HEADER, Some(ok.as_bytes()))
                             {

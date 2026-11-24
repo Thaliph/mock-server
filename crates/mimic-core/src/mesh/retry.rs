@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use super::lb::Endpoints;
 use super::reason::Reason;
+use super::refusal;
 
 /// What one try came to; the `result` label of `mimic_mesh_attempts_total` and, for a retry,
 /// the `reason` label of `mimic_mesh_retries_total`.
@@ -158,62 +159,24 @@ const IDEMPOTENT: [&str; 6] = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE
 
 /// Whether an answer is a trusted refusal of the pod of this try: `503`, exactly one
 /// `x-mimic-error` (`overloaded` or `queue-timeout`) and exactly one `x-mimic-endpoint` equal
-/// to `pod`; `connect-failed` also needs exactly one valid `x-mimic-origin` (see [`origin`]).
-/// Field names are compared without case; `pod` is `None` on the original destination.
+/// to `pod`; `connect-failed` also needs exactly one valid `x-mimic-origin` (see
+/// [`refusal::origin`]). Field names are compared without case; `pod` is `None` on the original
+/// destination.
 pub fn trusted(status: u16, fields: &[(&[u8], &[u8])], pod: Option<SocketAddr>) -> Option<Refusal> {
     let pod = pod?;
-    if status != 503 {
+    let head = refusal::refusal_head(status, fields.iter().copied())?;
+    if head.endpoint != pod {
         return None;
     }
-    let mut error = None;
-    let mut endpoint = None;
-    let mut origins = Vec::new();
-    for (name, value) in fields {
-        let slot = if name.eq_ignore_ascii_case(b"x-mimic-error") {
-            &mut error
-        } else if name.eq_ignore_ascii_case(b"x-mimic-endpoint") {
-            &mut endpoint
-        } else {
-            if name.eq_ignore_ascii_case(b"x-mimic-origin") {
-                origins.push(*value);
-            }
-            continue;
-        };
-        if slot.replace(*value).is_some() {
-            return None;
-        }
-    }
-    let bound = std::str::from_utf8(endpoint?)
-        .ok()?
-        .parse::<SocketAddr>()
-        .ok()?;
-    if bound != pod {
-        return None;
-    }
-    match Reason::parse(error?)? {
+    match head.reason {
         Reason::Overloaded => Some(Refusal::Overloaded),
         Reason::QueueTimeout => Some(Refusal::QueueTimeout),
-        Reason::ConnectFailed => match origins[..] {
-            [one] if origin(one) => Some(Refusal::AppRefused),
-            _ => None,
-        },
+        Reason::ConnectFailed => head
+            .origin
+            .one()
+            .and_then(refusal::origin)
+            .map(|_| Refusal::AppRefused),
         _ => None,
-    }
-}
-
-/// Whether `value` is an `x-mimic-origin` of an inbound sidecar (spec §4.1 "Refused app
-/// connections"): `inbound`, or `inbound; pod=<name>` with a name of 1 to 253 characters
-/// `a-z 0-9 . -`.
-pub fn origin(value: &[u8]) -> bool {
-    match value.strip_prefix(b"inbound") {
-        Some(b"") => true,
-        Some(rest) => rest.strip_prefix(b"; pod=").is_some_and(|name| {
-            (1..=253).contains(&name.len())
-                && name.iter().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-')
-                })
-        }),
-        None => false,
     }
 }
 

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::mesh_pods::{EchoPod, H1Client, Pod, Svc, mesh_state, view_services};
-use common::{Logs, capture_logs, closed_port, fixture_mesh};
+use common::{capture_logs, closed_port, fixture_mesh};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -143,16 +143,6 @@ fn ejected(scrape: &str, backend: &str) -> f64 {
     )
 }
 
-/// The lines of the log with this message.
-async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
-    logs.settled().await;
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["message"] == message)
-        .collect()
-}
-
 async fn status(client: &mut H1Client, method: &str, path: &str) -> u16 {
     let body = if method == "POST" { "abc" } else { "" };
     let head = format!(
@@ -185,7 +175,7 @@ async fn cbr_15_a_resetting_pod_is_ejected_after_five_and_restored_after_its_tim
     let scrape = f.metrics.encode();
     assert_eq!(ejections(&scrape, "consecutive_failures"), 1.0, "{scrape}");
     assert_eq!(ejected(&scrape, "shop/cart:80"), 1.0, "{scrape}");
-    let ejected_lines = lines(&logs, "endpoint ejected").await;
+    let ejected_lines = logs.messages("endpoint ejected").await;
     assert_eq!(ejected_lines.len(), 1, "{}", logs.text());
     let line = &ejected_lines[0];
     assert_eq!(line["service"], "shop/cart");
@@ -197,7 +187,7 @@ async fn cbr_15_a_resetting_pod_is_ejected_after_five_and_restored_after_its_tim
     // Back after its second, and ejected again for two.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     state.tick();
-    let restored = lines(&logs, "endpoint restored").await;
+    let restored = logs.messages("endpoint restored").await;
     assert_eq!(restored.len(), 1, "{}", logs.text());
     assert_eq!(restored[0]["cause"], "elapsed");
     assert_eq!(restored[0]["endpoint"], bad.addr.to_string());
@@ -209,7 +199,7 @@ async fn cbr_15_a_resetting_pod_is_ejected_after_five_and_restored_after_its_tim
         }
     }
     assert_eq!(bad.heads(), 10, "five more heads once restored");
-    let again = lines(&logs, "endpoint ejected").await;
+    let again = logs.messages("endpoint ejected").await;
     assert_eq!(again.len(), 2, "{}", logs.text());
     assert_eq!(again[1]["ejection_seconds"], 2);
     assert_eq!(again[1]["ejections"], 2);
@@ -315,7 +305,7 @@ async fn cbr_17_busy_pods_and_the_original_destination_are_never_ejected() {
         assert_eq!(status(&mut client, "GET", "/").await, 500);
     }
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
-    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    assert!(logs.messages("endpoint ejected").await.is_empty());
 }
 
 #[tokio::test]
@@ -371,7 +361,7 @@ async fn cbr_18_a_refusal_naming_another_pod_is_the_5xx_of_the_pod_that_sent_it(
         status(&mut client, "GET", "/").await;
     }
     assert_eq!(a.heads(), 3, "three 5xx, then none");
-    let ejected_lines = lines(&logs, "endpoint ejected").await;
+    let ejected_lines = logs.messages("endpoint ejected").await;
     assert_eq!(ejected_lines.len(), 1, "{}", logs.text());
     assert_eq!(ejected_lines[0]["endpoint"], a.addr.to_string());
     assert_eq!(ejected_lines[0]["reason"], "consecutive_5xx");
@@ -417,7 +407,7 @@ async fn cbr_19_a_trusted_app_refusal_ejects_its_pod_and_a_forged_one_nothing() 
     }
     assert!(forger.heads() > 5, "{}", forger.heads());
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
-    let ejected_lines = lines(&logs, "endpoint ejected").await;
+    let ejected_lines = logs.messages("endpoint ejected").await;
     assert_eq!(ejected_lines.len(), 1, "only the first Service ejected");
 }
 
@@ -491,7 +481,7 @@ async fn cbr_20_with_every_pod_ejected_nothing_is_tried_and_an_l4_connection_is_
         "no try while all are ejected"
     );
     assert_eq!(cluster.counts.requests(), 0, "the ClusterIP sees nothing");
-    let warned = lines(&logs, "breaker open").await;
+    let warned = logs.messages("breaker open").await;
     assert_eq!(warned.len(), 1, "{}", logs.text());
     assert_eq!(warned[0]["cause"], "all_ejected");
     assert_eq!(warned[0]["service"], "shop/cart");
@@ -524,7 +514,7 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
         view_services(&[cart(&[bad[0].addr, bad[1].addr])]),
         "\"2-a\"",
     );
-    let restored = lines(&logs, "endpoint restored").await;
+    let restored = logs.messages("endpoint restored").await;
     assert_eq!(restored.len(), 1, "{}", logs.text());
     assert_eq!(restored[0]["cause"], "max_percent");
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 1.0);
@@ -533,7 +523,7 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
         view_services(&[cart(&[bad[0].addr, bad[1].addr]).outlier(30, 0, 5, 0)]),
         "\"3-a\"",
     );
-    assert_eq!(lines(&logs, "endpoint restored").await.len(), 2);
+    assert_eq!(logs.messages("endpoint restored").await.len(), 2);
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 0.0);
     // An ejected pod that leaves the view drops from the gauge, without a line.
     state.hold(
@@ -544,14 +534,14 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
         let _ = status_or_closed(&mut client).await;
         client = H1Client::connect(f.addr).await;
     }
-    assert!(lines(&logs, "endpoint ejected").await.len() >= 3);
+    assert!(logs.messages("endpoint ejected").await.len() >= 3);
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 1.0);
-    let before = lines(&logs, "endpoint restored").await.len();
+    let before = logs.messages("endpoint restored").await.len();
     state.hold(view_services(&[cart(&[ok[0].addr])]), "\"4-a\"");
     state.tick();
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 0.0);
     assert_eq!(
-        lines(&logs, "endpoint restored").await.len(),
+        logs.messages("endpoint restored").await.len(),
         before,
         "an endpoint that left writes no line"
     );
@@ -993,13 +983,13 @@ async fn cbr_15_over_h2c_a_resetting_pod_is_ejected_after_five_and_restored_afte
     let scrape = f.metrics.encode();
     assert_eq!(ejections(&scrape, "consecutive_failures"), 1.0, "{scrape}");
     assert_eq!(ejected(&scrape, "shop/cart:80"), 1.0, "{scrape}");
-    let ejected_lines = lines(&logs, "endpoint ejected").await;
+    let ejected_lines = logs.messages("endpoint ejected").await;
     assert_eq!(ejected_lines.len(), 1, "{}", logs.text());
     assert_eq!(ejected_lines[0]["endpoint"], bad.to_string());
     assert_eq!(ejected_lines[0]["ejection_seconds"], 1);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     state.tick();
-    let restored = lines(&logs, "endpoint restored").await;
+    let restored = logs.messages("endpoint restored").await;
     assert_eq!(restored.len(), 1, "{}", logs.text());
     assert_eq!(restored[0]["cause"], "elapsed");
     for n in 0..200 {
@@ -1009,7 +999,7 @@ async fn cbr_15_over_h2c_a_resetting_pod_is_ejected_after_five_and_restored_afte
         }
     }
     assert_eq!(resets.load(Ordering::SeqCst), 10, "five more once restored");
-    let again = lines(&logs, "endpoint ejected").await;
+    let again = logs.messages("endpoint ejected").await;
     assert_eq!(again[1]["ejection_seconds"], 2);
 }
 
@@ -1041,7 +1031,7 @@ async fn cbr_17_refused_streams_and_goaways_are_never_ejected() {
             "goaway {goaway}: {scrape}"
         );
     }
-    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    assert!(logs.messages("endpoint ejected").await.is_empty());
 }
 
 #[tokio::test]
@@ -1058,7 +1048,7 @@ async fn cbr_17_a_route_timeout_is_never_ejected() {
         assert_eq!(status(&mut client, "GET", "/").await, 504, "request {n}");
     }
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
-    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    assert!(logs.messages("endpoint ejected").await.is_empty());
 }
 
 /// A pod that answers only once it has the whole `content-length` body of a request, and counts
@@ -1170,7 +1160,7 @@ async fn cbr_17_a_request_the_app_abandons_is_never_ejected() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
-    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    assert!(logs.messages("endpoint ejected").await.is_empty());
     // The pod is still a candidate: a whole request is answered by it.
     let mut client = H1Client::connect(f.addr).await;
     client
@@ -1195,7 +1185,7 @@ async fn cbr_18_the_answers_of_the_caller_sidecar_count_on_no_pod() {
     }
     let scrape = f.metrics.encode();
     assert_eq!(ejections(&scrape, "consecutive_5xx"), 0.0, "{scrape}");
-    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    assert!(logs.messages("endpoint ejected").await.is_empty());
 }
 
 #[tokio::test]

@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 
 pub use super::Answer;
 use super::mesh_pods::{Counts, H1Client, meshed, view_services};
-use super::{Fixture, H2Sender, Logs, fixture_mesh_on, h2_send, until};
+use super::{Fixture, H2Sender, fixture_mesh_on, h2_send, until};
 
 /// The time any one answer may take before the test fails.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -485,16 +485,6 @@ pub async fn hold_slot(app: &App, sender: &H2Sender) -> JoinHandle<Answer> {
     })
     .await;
     held
-}
-
-/// The lines of `message` so far.
-pub async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
-    logs.settled().await;
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["message"] == message)
-        .collect()
 }
 
 /// `<dir>/state/mesh.json` holding `view`, fetched now.

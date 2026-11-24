@@ -114,8 +114,8 @@ impl Admitter {
     pub(crate) async fn admit(&self) -> Result<Slot, Refusal> {
         let (ticket, rx, spawn) = {
             let mut guard = self.lock();
-            // Without a contract nothing is offered: the counts hold only the offers made to
-            // one (spec §9 `mimic_admission_requests_total`).
+            // Without a contract `offer` admits and counts nothing: no permit to release, and
+            // nothing else to do under the lock.
             if guard.admission.contract().is_none() {
                 return Ok(Slot {
                     admitter: self.clone(),

@@ -18,6 +18,7 @@ use hyper::body::Bytes;
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::{Response, StatusCode};
 use mimic_core::Mode;
+use mimic_core::load::answer;
 use mimic_core::load::ticket::{self, Payload};
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
@@ -33,7 +34,7 @@ use crate::tls::TlsConfig;
 /// The request header that carries the ticket.
 pub const REQUEST_HEADER: &str = "mimic-load-run";
 /// The answer header: `ok`, or `refused; reason=<reason>`.
-pub const MARKER_HEADER: &str = "x-mimic-load";
+pub const MARKER_HEADER: &str = answer::MARKER;
 /// Verified tickets kept, the last seen: a request costs a lookup.
 const MAX_VERIFIED: usize = 16;
 const ENABLED_VAR: &str = "MIMIC_LOAD_ENABLED";
@@ -105,7 +106,7 @@ impl Refusal {
 
     /// The value of `x-mimic-load` that says it.
     pub fn header_value(self) -> HeaderValue {
-        HeaderValue::from_str(&format!("refused; reason={}", self.as_str()))
+        HeaderValue::from_str(&format!("{}{}", answer::REFUSED, self.as_str()))
             .unwrap_or_else(|_| HeaderValue::from_static("refused"))
     }
 }
@@ -327,7 +328,7 @@ async fn identity(State(marker): State<Marker>) -> impl IntoResponse {
 /// one `ok` stays.
 pub fn mark_answer(headers: &mut HeaderMap) {
     headers.remove(MARKER_HEADER);
-    headers.insert(MARKER_HEADER, HeaderValue::from_static("ok"));
+    headers.insert(MARKER_HEADER, HeaderValue::from_static(answer::OK));
 }
 
 /// The body of a forwarded or sidecar-made answer.

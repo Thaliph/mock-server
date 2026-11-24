@@ -121,9 +121,8 @@ async fn recorded(metrics: &mimic_runtime::metrics::Metrics, label: &str, n: u64
 
 /// The WARN lines of the discovery target with this message.
 fn warnings(logs: &common::Logs, message: &str) -> Vec<serde_json::Value> {
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    logs.json()
+        .into_iter()
         .filter(|v| v["target"] == "discovery" && v["message"] == message)
         .collect()
 }

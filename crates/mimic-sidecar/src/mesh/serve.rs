@@ -750,18 +750,12 @@ impl Serving {
         if req.method() == Method::CONNECT || (http1 && req.headers().contains_key(header::UPGRADE))
         {
             let (tracker, _) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
-            self.count(
-                "none",
-                &self.backend.label,
-                StatusCode::NOT_IMPLEMENTED,
-                Some(Reason::Unsupported),
-                began,
-            );
-            tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16(), Reason::Unsupported);
-            return Ok(answer(
-                StatusCode::NOT_IMPLEMENTED,
-                Reason::Unsupported,
+            return Ok(self.own_answer(
+                tracker,
+                ("none", &self.backend.label),
+                (StatusCode::NOT_IMPLEMENTED, Reason::Unsupported),
                 http1,
+                began,
             ));
         }
         let mut req = req;
@@ -861,9 +855,13 @@ impl Serving {
                         route = &view.name;
                         tracker.matched(route, rule);
                     }
-                    self.count(route, backend, status, Some(reason), began);
-                    tracker.synthetic(status.as_u16(), reason);
-                    return Ok(answer(status, reason, false));
+                    return Ok(self.own_answer(
+                        tracker,
+                        (route, backend),
+                        (status, reason),
+                        false,
+                        began,
+                    ));
                 }
             }
         } else if !direct {
@@ -1125,19 +1123,14 @@ impl Serving {
         backend: &Backend,
         began: Instant,
     ) -> Response<MeshBody> {
-        self.count(
-            route,
-            &backend.label,
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some(Reason::BreakerOpen),
-            began,
-        );
         tracker.backend(&backend.label);
-        tracker.synthetic(
-            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            Reason::BreakerOpen,
-        );
-        answer(StatusCode::SERVICE_UNAVAILABLE, Reason::BreakerOpen, false)
+        self.own_answer(
+            tracker,
+            (route, &backend.label),
+            (StatusCode::SERVICE_UNAVAILABLE, Reason::BreakerOpen),
+            false,
+            began,
+        )
     }
 
     /// The fault of the request (spec §7.9 "Fault injection"), with the faults of the drawn
@@ -1177,20 +1170,18 @@ impl Serving {
     ) -> Response<MeshBody> {
         // The view holds statuses 200 to 599 only.
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-        self.count(
-            route,
-            &backend.label,
-            status,
-            Some(Reason::FaultInjected),
-            began,
-        );
         self.mesh.router().metrics.fault(&backend.label, "abort");
         tracker.backend(&backend.label);
         tracker.fault(fault::Kind::Abort {
             status: status.as_u16(),
         });
-        tracker.synthetic(status.as_u16(), Reason::FaultInjected);
-        answer(status, Reason::FaultInjected, close)
+        self.own_answer(
+            tracker,
+            (route, &backend.label),
+            (status, Reason::FaultInjected),
+            close,
+            began,
+        )
     }
 
     /// Waits an injected delay (spec §7.9 "Fault injection"): `Err` with the route timeout that
@@ -1214,15 +1205,13 @@ impl Serving {
         backend: &str,
         began: Instant,
     ) -> Response<MeshBody> {
-        self.count(
-            route,
-            backend,
-            StatusCode::SERVICE_UNAVAILABLE,
-            Some(Reason::NoEndpoint),
+        self.own_answer(
+            tracker,
+            (route, backend),
+            (StatusCode::SERVICE_UNAVAILABLE, Reason::NoEndpoint),
+            false,
             began,
-        );
-        tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Reason::NoEndpoint);
-        answer(StatusCode::SERVICE_UNAVAILABLE, Reason::NoEndpoint, false)
+        )
     }
 
     /// The call ends on a route timeout before the response head: the `504`, counted and
@@ -1409,37 +1398,22 @@ impl Serving {
         match failure {
             Failure::Connect => {
                 tracing::debug!(%upstream, "connect failed");
-                self.count(
-                    route,
-                    backend,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Some(Reason::ConnectFailed),
-                    began,
-                );
-                tracker.synthetic(
-                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    Reason::ConnectFailed,
-                );
-                Ok(answer(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Reason::ConnectFailed,
+                Ok(self.own_answer(
+                    tracker,
+                    (route, backend),
+                    (StatusCode::SERVICE_UNAVAILABLE, Reason::ConnectFailed),
                     false,
+                    began,
                 ))
             }
             Failure::Response => {
                 tracing::debug!(%upstream, "the pod's response head was refused");
-                self.count(
-                    route,
-                    backend,
-                    StatusCode::BAD_GATEWAY,
-                    Some(Reason::InvalidResponse),
-                    began,
-                );
-                tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16(), Reason::InvalidResponse);
-                Ok(answer(
-                    StatusCode::BAD_GATEWAY,
-                    Reason::InvalidResponse,
+                Ok(self.own_answer(
+                    tracker,
+                    (route, backend),
+                    (StatusCode::BAD_GATEWAY, Reason::InvalidResponse),
                     false,
+                    began,
                 ))
             }
             _ => {
@@ -1454,6 +1428,21 @@ impl Serving {
                 Err(error.map_or_else(|| "connection closed".into(), Into::into))
             }
         }
+    }
+
+    /// One of the sidecar's own answers (`x-mimic-error`, no body): counted, logged and
+    /// written; with `close` the connection ends.
+    fn own_answer(
+        &self,
+        tracker: Tracker,
+        (route, backend): (&str, &str),
+        (status, reason): (StatusCode, Reason),
+        close: bool,
+        began: Instant,
+    ) -> Response<MeshBody> {
+        self.count(route, backend, status, Some(reason), began);
+        tracker.synthetic(status.as_u16(), reason);
+        answer(status, reason, close)
     }
 
     fn count(
@@ -1852,4 +1841,18 @@ fn head_end(buf: &[u8]) -> Option<usize> {
         start = at + 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{REFUSED, Reason};
+
+    #[test]
+    fn adm_51_the_refused_head_answer_carries_the_invalid_request_reason() {
+        let field = format!("\r\nx-mimic-error: {}\r\n", Reason::InvalidRequest.as_str());
+        assert!(
+            REFUSED.windows(field.len()).any(|w| w == field.as_bytes()),
+            "REFUSED does not write Reason::InvalidRequest"
+        );
+    }
 }

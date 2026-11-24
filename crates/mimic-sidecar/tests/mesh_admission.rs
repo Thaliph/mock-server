@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::admission::{
-    ANSWER_TIMEOUT, Answer, App, call, contract, from_env, hold_slot, inbound, lines, no_contract,
+    ANSWER_TIMEOUT, Answer, App, call, contract, from_env, hold_slot, inbound, no_contract,
     persist, refusal_fields, rig, spawn_call,
 };
 use common::faults::no_series;
@@ -385,7 +385,7 @@ async fn adm_24_a_stale_view_keeps_its_contract() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     state.tick();
     assert_eq!(
-        lines(&logs, "mesh view stale").await.len(),
+        logs.messages("mesh view stale").await.len(),
         1,
         "the view is stale"
     );
@@ -424,7 +424,7 @@ async fn adm_28_without_a_view_one_warning_after_the_startup_wait_and_nothing_he
     let six: Vec<_> = (0..6).map(|_| spawn_call(&client, "/")).collect();
     tokio::time::sleep_until((t0 + Duration::from_millis(150)).into()).await;
     assert!(
-        lines(&logs, "admission contract unknown").await.is_empty(),
+        logs.messages("admission contract unknown").await.is_empty(),
         "no warning before the startup wait"
     );
     for answer in six {
@@ -432,12 +432,12 @@ async fn adm_28_without_a_view_one_warning_after_the_startup_wait_and_nothing_he
     }
     assert_eq!(app.counts.max_in_flight(), 6, "nothing is held");
     tokio::time::sleep_until((t0 + Duration::from_secs(1)).into()).await;
-    let warned = lines(&logs, "admission contract unknown").await;
+    let warned = logs.messages("admission contract unknown").await;
     assert_eq!(warned.len(), 1, "{warned:?}");
     assert_eq!(warned[0]["level"], "WARN");
     assert_eq!(warned[0]["target"], "mesh");
     tokio::time::sleep_until((t0 + Duration::from_millis(1600)).into()).await;
-    assert_eq!(lines(&logs, "admission contract unknown").await.len(), 1);
+    assert_eq!(logs.messages("admission contract unknown").await.len(), 1);
     state.hold(contract(1, 1000), "\"1-a\"");
     app.counts.delay_ms.store(1000, Ordering::SeqCst);
     let mut client = client;
@@ -464,7 +464,7 @@ async fn adm_28_a_persisted_or_timely_view_writes_no_warning() {
     tokio::time::sleep_until((t0 + Duration::from_millis(100)).into()).await;
     other.hold(no_contract(), "\"1-a\"");
     tokio::time::sleep_until((t0 + Duration::from_millis(900)).into()).await;
-    assert!(lines(&logs, "admission contract unknown").await.is_empty());
+    assert!(logs.messages("admission contract unknown").await.is_empty());
 }
 
 #[tokio::test]

@@ -12,6 +12,7 @@ pub mod mirror;
 pub mod outlier;
 pub mod policy;
 pub mod reason;
+pub mod refusal;
 pub mod retry;
 pub mod route;
 pub mod strip;

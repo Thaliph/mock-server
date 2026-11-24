@@ -5,14 +5,14 @@
 use std::net::SocketAddr;
 
 use super::summary::MimicError;
-use crate::mesh::reason::Reason;
+use crate::mesh::refusal::{Origin, RefusalFields, RefusalHead, origin};
 
-const MARKER: &[u8] = b"x-mimic-load";
-const ERROR: &[u8] = b"x-mimic-error";
-const ORIGIN: &[u8] = b"x-mimic-origin";
-const ENDPOINT: &[u8] = b"x-mimic-endpoint";
-/// The `x-mimic-origin` of an inbound sidecar, before the pod's name (spec §4.1).
-const INBOUND_POD: &[u8] = b"inbound; pod=";
+/// The load marker of an answer (spec §7.8 "Sidecar"): [`OK`], or [`REFUSED`] and a reason.
+pub const MARKER: &str = "x-mimic-load";
+/// The marker of the app's answer.
+pub const OK: &str = "ok";
+/// The marker of a refusal, before its reason (read back more loosely, see [`classify`]).
+pub const REFUSED: &str = "refused; reason=";
 
 /// The target a load request went to: the pod of the targets answer, and the `ip:port` dialled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,30 +33,6 @@ pub enum Answer {
     Unverified,
 }
 
-/// One field seen none, once or more than once.
-#[derive(Clone, Copy)]
-enum Seen<'a> {
-    None,
-    One(&'a [u8]),
-    Many,
-}
-
-impl<'a> Seen<'a> {
-    fn add(&mut self, value: &'a [u8]) {
-        *self = match self {
-            Seen::None => Seen::One(value),
-            _ => Seen::Many,
-        };
-    }
-
-    fn one(self) -> Option<&'a [u8]> {
-        match self {
-            Seen::One(value) => Some(value),
-            _ => None,
-        }
-    }
-}
-
 /// Classifies an answer of `status` whose head holds `fields` (every field, in order, a repeated
 /// name once per value). Names are compared without case, values exactly but the marker's.
 pub fn classify<'a>(
@@ -65,22 +41,21 @@ pub fn classify<'a>(
     expected: &Expected<'_>,
 ) -> Answer {
     let mut marker = None;
-    let (mut error, mut origin, mut endpoint) = (Seen::None, Seen::None, Seen::None);
+    let mut refusal = RefusalFields::default();
     for (name, value) in fields {
-        if name.eq_ignore_ascii_case(MARKER) {
+        if name.eq_ignore_ascii_case(MARKER.as_bytes()) {
             marker = marker.or(Some(value));
-        } else if name.eq_ignore_ascii_case(ERROR) {
-            error.add(value);
-        } else if name.eq_ignore_ascii_case(ORIGIN) {
-            origin.add(value);
-        } else if name.eq_ignore_ascii_case(ENDPOINT) {
-            endpoint.add(value);
+        } else {
+            refusal.add(name, value);
         }
     }
     if let Some(value) = marker {
         return marked(value);
     }
-    inbound(status, (error, origin, endpoint), expected).map_or(Answer::Unverified, Answer::Inbound)
+    refusal
+        .head(status)
+        .and_then(|head| inbound(&head, expected))
+        .map_or(Answer::Unverified, Answer::Inbound)
 }
 
 /// The answer of the first `x-mimic-load` value: as `HeaderValue::to_str`, a byte outside
@@ -93,7 +68,7 @@ fn marked(value: &[u8]) -> Answer {
         return Answer::Unverified;
     }
     let value = value.trim_ascii();
-    if value == b"ok" {
+    if value == OK.as_bytes() {
         return Answer::App;
     }
     let Some(rest) = value.strip_prefix(b"refused") else {
@@ -110,20 +85,12 @@ fn marked(value: &[u8]) -> Answer {
     }
 }
 
-/// The trusted refusal: `503`, exactly one of each field, a trusted reason, the target's pod
-/// and the address dialled, compared exactly.
-fn inbound(
-    status: u16,
-    (error, origin, endpoint): (Seen<'_>, Seen<'_>, Seen<'_>),
-    expected: &Expected<'_>,
-) -> Option<MimicError> {
-    if status != 503 {
+/// The trusted refusal (see [`RefusalFields::head`]) bound to the target: exactly one
+/// `x-mimic-origin` naming its pod, and the address dialled in its display form.
+fn inbound(head: &RefusalHead<'_>, expected: &Expected<'_>) -> Option<MimicError> {
+    let pod = Origin::Pod(expected.pod.as_bytes());
+    if head.origin.one().and_then(origin) != Some(pod) || !head.displays(expected.addr) {
         return None;
     }
-    let (error, origin, endpoint) = (error.one()?, origin.one()?, endpoint.one()?);
-    let refusal = MimicError::new(Reason::parse(error)?)?;
-    if origin.strip_prefix(INBOUND_POD) != Some(expected.pod.as_bytes()) {
-        return None;
-    }
-    (endpoint == expected.addr.to_string().as_bytes()).then_some(refusal)
+    MimicError::new(head.reason)
 }

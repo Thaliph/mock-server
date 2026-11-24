@@ -23,6 +23,8 @@ set -Eeuo pipefail
 # A command that fails outside a condition ends the run: name it, so that no exit is silent.
 trap 'e2e_status=$?; echo "FAIL line $LINENO: \"$BASH_COMMAND\" exited with status $e2e_status" >&2' ERR
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/e2e/lib.sh
+source scripts/e2e/lib.sh
 
 SUITE=0
 case ${1:-} in
@@ -359,33 +361,25 @@ ldt_19_check() {
 }
 
 # --- ADM-61: a load test of front against its admission contract (spec §12.29) ----------------------------------------
-# front_pods: the names of the Running pods of front that are not being deleted, one per line.
-front_pods() {
-  kubectl -n mck-19 get pods -l app=front -o json \
-    | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name'
-}
-# front_metrics <pod>: the Prometheus text of the pod's sidecar, read over loopback (not captured) through the app container's
-# Python, as e2e.sh's tcp_count. Non-zero on any failure.
-front_metrics() {
-  kubectl -n mck-19 exec "$1" -c app -- python3 -c \
-    'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode())'
-}
-# series <file> <series>: the value of the exact series (name and labels, or a bare name), empty when absent. Never a prefix match.
-series() { awk -v s="$2" '$1 == s { print $2; exit }' "$1"; }
 # adm_61_valid <file>: the scrape is the sidecar's (an empty or cut body is not one).
 adm_61_valid() { found -F -e 'mimic_build_info{component="sidecar"' "$1"; }
-# adm_61_contract <pod>: the pod's sidecar holds the contract 1/5 (limit gauges, compared as numbers).
-adm_61_contract() {
+# adm_61_scraped <pod> <predicate>: a valid scrape of the pod's sidecar, kept in $WORK/adm61-<pod>.prom, for which
+# `<predicate> <file>` holds.
+adm_61_scraped() {
   local f="$WORK/adm61-$1.prom"
-  front_metrics "$1" > "$f" || return 1
+  sidecar_scrape mck-19 "$1" > "$f" || return 1
   adm_61_valid "$f" || return 1
-  awk -v c="$(series "$f" 'mimic_admission_limit{kind="concurrency"}')" -v r="$(series "$f" 'mimic_admission_limit{kind="rps"}')" \
-    'BEGIN { exit !(c != "" && r != "" && c + 0 == 1 && r + 0 == 5) }'
+  "$2" "$f"
 }
-# adm_61_all_contract: every pod of front holds the contract.
-adm_61_all_contract() {
+# adm_61_each <predicate>: adm_61_scraped holds for every pod of front.
+adm_61_each() {
   local p
-  for p in "${adm_61_pods[@]}"; do adm_61_contract "$p" || return 1; done
+  for p in "${adm_61_pods[@]}"; do adm_61_scraped "$p" "$1" || return 1; done
+}
+# adm_61_contract <file>: the scrape holds the contract 1/5 (limit gauges, compared as numbers).
+adm_61_contract() {
+  awk -v c="$(series "$1" 'mimic_admission_limit{kind="concurrency"}')" -v r="$(series "$1" 'mimic_admission_limit{kind="rps"}')" \
+    'BEGIN { exit !(c != "" && r != "" && c + 0 == 1 && r + 0 == 5) }'
 }
 # adm_61_round <dir>: one valid scrape of every pod of front in <dir>, one file per pod; non-zero when one fails.
 adm_61_round() {
@@ -393,21 +387,12 @@ adm_61_round() {
   rm -rf "$1"
   mkdir -p "$1"
   for p in "${adm_61_pods[@]}"; do
-    front_metrics "$p" > "$1/$p.prom" 2>/dev/null || return 1
+    sidecar_scrape mck-19 "$p" > "$1/$p.prom" 2>/dev/null || return 1
     adm_61_valid "$1/$p.prom" || return 1
   done
 }
-# adm_61_gone <pod>: a valid scrape of the pod holds no line of mimic_admission_utilization (no sample, no # HELP).
-adm_61_gone() {
-  local f="$WORK/adm61-$1.prom"
-  front_metrics "$1" > "$f" || return 1
-  adm_61_valid "$f" || return 1
-  ! found -F -e mimic_admission_utilization "$f"
-}
-adm_61_all_gone() {
-  local p
-  for p in "${adm_61_pods[@]}"; do adm_61_gone "$p" || return 1; done
-}
+# adm_61_gone <file>: the scrape holds no line of mimic_admission_utilization (no sample, no # HELP).
+adm_61_gone() { ! found -F -e mimic_admission_utilization "$1"; }
 # adm_61_accepted: the Accepted condition of the MimicConfig is True.
 adm_61_accepted() {
   [[ $(kubectl -n mck-19 get mimicconfig front-admission -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}') == True ]]
@@ -425,7 +410,7 @@ adm_61_check() {
     || fail "adm_61: cannot switch front to mock"
   wait_for 150 front_in_mock || fail "adm_61: front did not converge to mock within 150 s"
   sleep 10
-  front_pods > "$WORK/adm61-pods.txt" || fail "adm_61: cannot list the pods of front"
+  live_pods mck-19 app=front > "$WORK/adm61-pods.txt" || fail "adm_61: cannot list the pods of front"
   mapfile -t adm_61_pods < "$WORK/adm61-pods.txt"
   (( ${#adm_61_pods[@]} == 3 )) || fail "adm_61: front has ${#adm_61_pods[@]} running pods, not 3"
 
@@ -439,9 +424,9 @@ spec:
   admission: {concurrency: 1, rps: 5}
 YAML
   wait_for 30 adm_61_accepted || fail "adm_61: the MimicConfig front-admission is not Accepted: True within 30 s"
-  if ! wait_for 60 adm_61_all_contract; then
+  if ! wait_for 60 adm_61_each adm_61_contract; then
     for p in "${adm_61_pods[@]}"; do
-      adm_61_contract "$p" 2>/dev/null && continue
+      adm_61_scraped "$p" adm_61_contract 2>/dev/null && continue
       fail "adm_61: the sidecar of $p holds no contract 1/5 60 s after the config: $(awk '/^mimic_admission_/ { printf "%s;", $0 }' \
         "$WORK/adm61-$p.prom" 2>/dev/null || true)"
     done
@@ -497,9 +482,9 @@ YAML
   wait_for 60 absent mimicloadtest adm61 -n mck-19 || fail "adm_61: the run is there 60 s after its delete"
   wait_for 60 absent mimicconfig front-admission -n mck-19 || fail "adm_61: the MimicConfig is there 60 s after its delete"
   ADM_61_CLEANUP=""
-  if ! wait_for 60 adm_61_all_gone; then
+  if ! wait_for 60 adm_61_each adm_61_gone; then
     for p in "${adm_61_pods[@]}"; do
-      adm_61_gone "$p" 2>/dev/null && continue
+      adm_61_scraped "$p" adm_61_gone 2>/dev/null && continue
       fail "adm_61: the sidecar of $p still shows mimic_admission_utilization, or answers no valid scrape, 60 s after the config was deleted"
     done
   fi

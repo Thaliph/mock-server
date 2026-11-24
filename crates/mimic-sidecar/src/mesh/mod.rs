@@ -512,7 +512,8 @@ impl MeshState {
             unscoped: Counter::default(),
             opaque_ports: config.opaque_ports.clone(),
             pod: config.pod.clone().filter(|pod| {
-                mimic_core::mesh::retry::origin(format!("inbound; pod={pod}").as_bytes())
+                mimic_core::mesh::refusal::origin(format!("inbound; pod={pod}").as_bytes())
+                    .is_some()
             }),
             router: Router::new(config),
             seen: AtomicBool::new(false),

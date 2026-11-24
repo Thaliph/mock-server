@@ -276,6 +276,23 @@ impl Logs {
         String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
     }
 
+    /// The lines so far that are JSON, parsed.
+    pub fn json(&self) -> Vec<serde_json::Value> {
+        self.text()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    /// The lines of `message`, once the log queue wrote them all ([`Logs::settled`]).
+    pub async fn messages(&self, message: &str) -> Vec<serde_json::Value> {
+        self.settled().await;
+        self.json()
+            .into_iter()
+            .filter(|v| v["message"] == message)
+            .collect()
+    }
+
     /// The access lines so far, parsed.
     pub fn access(&self) -> Vec<serde_json::Value> {
         self.text()

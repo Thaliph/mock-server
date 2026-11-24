@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Serialize};
 
 use super::histogram::Histogram;
 use super::plan::Plan;
@@ -35,7 +35,8 @@ pub enum ErrorKind {
 /// A key of `mimicErrors`: one of [`Reason::trusted_inbound`], ordered and written as its
 /// `x-mimic-error` value, so that a map reads `connect-failed`, `overloaded`, `queue-timeout`
 /// (spec §7.8 "Results").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "&'static str")]
 pub struct MimicError(Reason);
 
 impl MimicError {
@@ -69,30 +70,20 @@ impl PartialOrd for MimicError {
     }
 }
 
-impl Serialize for MimicError {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
+// The error never quotes the value: it comes from a post.
+impl TryFrom<String> for MimicError {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<MimicError, Self::Error> {
+        Reason::parse(value.as_bytes())
+            .and_then(MimicError::new)
+            .ok_or("unknown mimicErrors key")
     }
 }
 
-impl<'de> Deserialize<'de> for MimicError {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<MimicError, D::Error> {
-        struct Key;
-        impl de::Visitor<'_> for Key {
-            type Value = MimicError;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a mimicErrors key")
-            }
-
-            // The message never quotes the value: it comes from a post.
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<MimicError, E> {
-                Reason::parse(v.as_bytes())
-                    .and_then(MimicError::new)
-                    .ok_or_else(|| E::custom("unknown mimicErrors key"))
-            }
-        }
-        deserializer.deserialize_str(Key)
+impl From<MimicError> for &'static str {
+    fn from(key: MimicError) -> &'static str {
+        key.as_str()
     }
 }
 

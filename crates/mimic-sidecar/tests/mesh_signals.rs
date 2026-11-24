@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::admission::{
-    App, call, contract, from_env, hold_slot, inbound, lines, no_contract, persist, rig, spawn_call,
+    App, call, contract, from_env, hold_slot, inbound, no_contract, persist, rig, spawn_call,
 };
 use common::faults::absent;
 use common::mesh_pods::meshed;
@@ -270,7 +270,7 @@ async fn adm_55_set_changed_kept_and_removed_contracts_write_one_line_each() {
     ] {
         state.hold(view, etag);
     }
-    let changed = lines(&logs, CHANGED).await;
+    let changed = logs.messages(CHANGED).await;
     assert_eq!(changed.len(), 3, "{changed:?}");
     for entry in &changed {
         assert_eq!(
@@ -306,7 +306,7 @@ async fn adm_55_a_restart_with_a_persisted_contract_writes_one_line() {
     persist(dir.path(), &contract(2, 100));
     let state = from_env(dir.path(), &[]);
     state.restore().await;
-    let changed = lines(&logs, CHANGED).await;
+    let changed = logs.messages(CHANGED).await;
     assert_eq!(changed.len(), 1, "{changed:?}");
     let entry = &changed[0];
     assert_eq!(
@@ -324,7 +324,7 @@ async fn adm_55_a_thousand_refusals_write_no_component_line() {
     ticks(&state);
     let held_by = h2_client(f.addr).await;
     let _held = hold_slot(&app, &held_by).await;
-    let unknown = lines(&logs, "admission contract unknown").await.len();
+    let unknown = logs.messages("admission contract unknown").await.len();
     logs.settled().await;
     let before = logs.text().len();
     let mut calls = Vec::new();
@@ -349,7 +349,7 @@ async fn adm_55_a_thousand_refusals_write_no_component_line() {
     let access = new.iter().filter(|v| v["target"] == "access").count();
     assert_eq!(access, 1000);
     assert_eq!(
-        lines(&logs, "admission contract unknown").await.len(),
+        logs.messages("admission contract unknown").await.len(),
         unknown
     );
     assert_eq!(app.counts.requests(), 1, "only the held one");

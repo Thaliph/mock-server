@@ -30,16 +30,6 @@ fn dst() -> SocketAddr {
     "127.0.0.1:80".parse().unwrap()
 }
 
-/// The lines of the log with this message.
-async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
-    logs.settled().await;
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["message"] == message)
-        .collect()
-}
-
 /// The access lines whose `reason` is this one, after the log caught up.
 async fn reasoned(logs: &Logs, reason: &str) -> Vec<serde_json::Value> {
     logs.settled().await;
@@ -636,7 +626,7 @@ async fn cbr_28_an_open_breaker_adds_no_try_and_is_counted_and_logged_once_a_sec
         30.0,
         "{scrape}"
     );
-    let warned = lines(&logs, "breaker open").await;
+    let warned = logs.messages("breaker open").await;
     assert_eq!(warned.len(), 1, "{}", logs.text());
     assert_eq!(warned[0]["level"], "WARN");
     assert_eq!(warned[0]["cause"], "max_requests");
@@ -647,7 +637,7 @@ async fn cbr_28_an_open_breaker_adds_no_try_and_is_counted_and_logged_once_a_sec
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let (head, body) = client.get("/").await;
     assert_open(&head, body.as_bytes());
-    let warned = lines(&logs, "breaker open").await;
+    let warned = logs.messages("breaker open").await;
     assert_eq!(warned.len(), 2, "{}", logs.text());
     assert_eq!(warned[1]["suppressed"], 29);
     // The access line: a reason, the backend and the rule, no pod and no tries.
@@ -997,5 +987,5 @@ async fn cbr_18_breaker_open_answers_count_on_no_pod() {
     }
     assert_eq!(code(held).await, 200);
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
-    assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    assert!(logs.messages("endpoint ejected").await.is_empty());
 }

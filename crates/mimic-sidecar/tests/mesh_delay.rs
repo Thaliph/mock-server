@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::faults::{abort_on, absent, delay, faults, no_series, status};
 use common::mesh_pods::{H1Client, Pod, RawPod, Svc, cluster_ip, mesh_state};
-use common::{Logs, capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until};
+use common::{capture_logs, closed_port, fixture_mesh, h2_client, median, metric, until};
 use http_body_util::{BodyExt, Full};
 use mimic_core::discovery::histogram::bucket_index;
 use mimic_core::mesh::fault::drawn;
@@ -590,16 +590,6 @@ async fn flt_20_aborts_and_delays_eject_no_pod() {
     assert_eq!(pod.counts.requests(), 100);
 }
 
-/// The lines of the log with this message.
-async fn lines(logs: &Logs, message: &str) -> Vec<serde_json::Value> {
-    logs.settled().await;
-    logs.text()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["message"] == message)
-        .collect()
-}
-
 #[tokio::test]
 async fn flt_20_a_delayed_try_that_is_reset_counts_one_failure() {
     let logs = capture_logs();
@@ -635,7 +625,7 @@ async fn flt_20_a_delayed_try_that_is_reset_counts_one_failure() {
         ),
         1.0
     );
-    let ejected = lines(&logs, "endpoint ejected").await;
+    let ejected = logs.messages("endpoint ejected").await;
     assert_eq!(ejected.len(), 1);
     assert_eq!(ejected[0]["endpoint"], resetting.addr.to_string());
 }
