@@ -4561,7 +4561,7 @@ storage and ingress are out of scope; the dashboards are those of §9.1, shipped
 | `monitoring.prometheus.resources` | requests 100m CPU and 256Mi memory, limit 512Mi memory | Resources of the Prometheus container. |
 | `monitoring.prometheus.namespaces` | `[]` | Namespaces of the sidecar and load jobs. Empty: every namespace, through a ClusterRole. A list: those namespaces and the release namespace, through a Role and a RoleBinding in each (each namespace must exist at install). |
 | `monitoring.grafana.enabled` | `false` | Renders `<release>-grafana`: a Deployment (1 replica, `Recreate`) with the containers `grafana` and `dashboards` (the k8s-sidecar), a Service `ClusterIP` on 3000 only, the ConfigMaps `<release>-grafana` (`grafana.ini`) and `<release>-grafana-provisioning` (the datasource and the dashboards provider), the Secret `<release>-grafana-admin`, a ServiceAccount, the Role and RoleBinding `<release>-grafana-dashboards` and, with `networkPolicy.enabled`, a NetworkPolicy (§11). Grafana can be enabled without the bundled Prometheus (see `datasourceUrl`). |
-| `monitoring.grafana.image` | `docker.io/grafana/grafana:13.2.4-distroless@sha256:ae3d…` | Pinned by digest in `images/Dockerfile` (stage `grafana`, checked by `scripts/check-pins.sh`). Built 2026-10-12, outside the 14-day cooldown. |
+| `monitoring.grafana.image` | `docker.io/grafana/grafana:13.3.1-distroless@sha256:54e2…` | Pinned by digest in `images/Dockerfile` (stage `grafana`, checked by `scripts/check-pins.sh`). Built 2026-11-10, outside the 14-day cooldown. |
 | `monitoring.grafana.sidecarImage` | `quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:092d…` | The dashboard sidecar. Pinned by digest in `images/Dockerfile` (stage `k8s-sidecar`, checked by `scripts/check-pins.sh`). Built 2026-10-08. |
 | `monitoring.grafana.datasourceUrl` | `""` | URL of the provisioned Prometheus datasource. Empty: `http://<release>-prometheus:9090`, the bundled Prometheus, also when it is off. An external datasource needs `datasourceEgress` as well, with `networkPolicy.enabled`. |
 | `monitoring.grafana.datasourceEgress` | `[]` | NetworkPolicy egress rules appended to the Grafana NetworkPolicy, rendered only when `datasourceUrl` is set. Required for an external datasource with `networkPolicy.enabled`: the bundled policy admits only the bundled Prometheus, the DNS and the API server, so without a rule the datasource is unreachable. Each entry is a NetworkPolicy egress rule (`to`, `ports`), for example `{to: [{ipBlock: {cidr: 10.20.0.0/16}}], ports: [{port: 9090, protocol: TCP}]}`. Nothing is added when empty. |
@@ -4609,7 +4609,7 @@ The Grafana Deployment:
   `security.admin_password = $__file{/etc/grafana-admin/admin-password}`. The user is `admin`
   (`security.admin_user`). The password is never a value, an argument, an env value or a log field, and
   the `grafana` container has no env at all. The env form `GF_SECURITY_ADMIN_PASSWORD__FILE` is not used:
-  Grafana 13.2.4 logs it as an override, but the default admin is created with `admin` as password, so
+  Grafana 13.2.4 (checked again on 13.3.1) logs it as an override, but the default admin is created with `admin` as password, so
   every login with the Secret answers `401 password-auth.invalid` (reproduced with the pinned image).
 - `grafana.ini`: `analytics.reporting_enabled = false`, `analytics.check_for_updates = false`,
   `analytics.check_for_plugin_updates = false`, `news.news_feed_enabled = false`,

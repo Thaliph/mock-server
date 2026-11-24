@@ -212,9 +212,9 @@ monitoring:
     enabled: false
     image:
       repository: docker.io/grafana/grafana
-      tag: 13.2.4-distroless
+      tag: 13.3.1-distroless
       # Pinned in images/Dockerfile (stage grafana); scripts/check-pins.sh keeps the two equal.
-      digest: sha256:ae3d3add290adbe6a88412229f5d76fd7bb82743050881698642d3d62f277e35
+      digest: sha256:54e297ac67e2b72572f926892f4e06074dc4f79f2a56ed9a9ca9a88a46f28733
     # The dashboard sidecar: it writes the dashboard files and never calls Grafana (no credential).
     sidecarImage:
       repository: quay.io/kiwigrid/k8s-sidecar
