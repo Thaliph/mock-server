@@ -14,7 +14,7 @@ FROM quay.io/prometheus/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b
 
 # Bundled Grafana (#379, spec §10.7): the chart's monitoring.grafana.image, v13.2.4 published 2026-10-13 (GitHub
 # release), outside the 14-day cooldown.
-FROM docker.io/grafana/grafana:13.2.4-distroless@sha256:ae3d3add290adbe6a88412229f5d76fd7bb82743050881698642d3d62f277e35 AS grafana
+FROM docker.io/grafana/grafana:13.3.1-distroless@sha256:54e297ac67e2b72572f926892f4e06074dc4f79f2a56ed9a9ca9a88a46f28733 AS grafana
 
 # Dashboard sidecar of the bundled Grafana (#379): the chart's monitoring.grafana.sidecarImage, 2.14.1 published
 # 2026-10-08 (GitHub release), outside the 14-day cooldown.
