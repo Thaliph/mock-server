@@ -10,7 +10,7 @@ use crate::resources::KINDS;
 use crate::store::{ReadError, keys, valid_name};
 
 /// The pinned `swagger-ui-dist` version (`ui/package.json`; a test checks they agree).
-const SWAGGER_VERSION: &str = "5.34.0";
+const SWAGGER_VERSION: &str = "5.34.1";
 
 const HTML: &str = "text/html; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
