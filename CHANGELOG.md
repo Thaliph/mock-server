@@ -21,6 +21,35 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- The mimic Gateway: GatewayClass `mimic` and the Gateway reconciler (#456, M6, off by default). With
+  `gateway.enabled`, the chart creates the GatewayClass `mimic` (`controllerName: mimic.platform.io/gateway-controller`).
+  Each `Gateway` of a mimic class in a namespace of `gateway.namespaces` gets a gateway Deployment, Service and
+  PodDisruptionBudget named `<gateway>-mimic` (GEP-1762, a hashed form for a long or dotted name), owned by the
+  Gateway. The controller applies them by server-side apply (field manager `mimic-gateway`) and writes the standard
+  status: `Accepted`, `Programmed`, the listeners and `status.addresses`. The gateway pods run `mimic-sidecar` with
+  `MIMIC_ROLE=gateway`: HTTP/1.1 and HTTP/2 with prior knowledge on the `HTTP` listener ports, every request answered
+  `404` `x-mimic-error: no-route` until routing (#457); HTTPS listeners come with #458. Replicas come from the
+  annotation `mimic.platform.io/replicas` in `spec.infrastructure.annotations` (default 2, no HPA). The controller
+  refuses, never applies in part: a namespace that is not listed (`NamespaceNotAllowed`), `spec.tls`,
+  `spec.addresses`, `spec.allowedListeners`, `spec.infrastructure.labels` and other annotations, unknown fields,
+  listener `filters`, `allowedRoutes.namespaces.from: Selector`, and protocols other than `HTTP`. It never changes or
+  deletes an object of the generated name that it does not manage (`Programmed: False`, `Invalid`, WARN
+  `gateway object not managed`). New chart values `gateway.enabled`, `gateway.namespaces`, `gateway.serviceType`
+  (`ClusterIP`, `NodePort`, `LoadBalancer`), `gateway.maxReplicas` (10) and `gateway.resources`; the chart fails
+  without `mesh.enabled`, `image.digest`, a namespace or the Gateway API CRDs. New controller variables
+  `MIMIC_GATEWAY_NAMESPACES`, `MIMIC_GATEWAY_SERVICE_TYPE`, `MIMIC_GATEWAY_MAX_REPLICAS`, `MIMIC_GATEWAY_RESOURCES`;
+  new sidecar variables `MIMIC_ROLE`, `MIMIC_GATEWAY_PORTS`, `MIMIC_GATEWAY_HEADER_TIMEOUT`,
+  `MIMIC_GATEWAY_IDLE_TIMEOUT`. New metrics `mimic_gateway_reconciles_total{result}` and
+  `mimic_gateway_gateways{state}`; the gateway pods give `component="gateway"`. **New RBAC** (only with
+  `gateway.enabled`): `get`, `list`, `watch` on `gateways` and `gatewayclasses` and `patch` on their `status`,
+  cluster-wide; `get`, `create`, `patch`, `delete` on `deployments`, `services` and `poddisruptionbudgets` through a
+  ClusterRole `<release>-gateway` bound by a RoleBinding in each listed namespace only. No Secret, pod or Namespace
+  read is added. **New admission policy** `<release>-gateway` (`failurePolicy: Fail`): the controller can write only
+  labelled gateway objects of the fixed shape (the chart image by digest, no volume, no token, no host access, no
+  capability) in the listed namespaces. Gateway pods run as UID 65532 under Pod Security `restricted`. Delete the
+  Gateways before you disable the gateway or unlist a namespace: their objects stay unreconciled otherwise. See the
+  wiki pages Gateway, Security, Monitoring and Troubleshooting.
+
 - Admission signalling (#454, M5). New sidecar metrics: `mimic_admission_requests_total{result}` (`admitted`,
   `queued`, `overloaded`, `queue-timeout`, `cancelled`; demand is `admitted + overloaded + queue-timeout`) and
   `mimic_admission_in_flight_seconds_total`, from the first contract applied; the gauges `mimic_admission_in_flight`,
@@ -207,6 +236,9 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Documentation
 
+- Wiki: new page "Gateway" (enabling, creating a Gateway, the generated objects, replicas, the Service type, the
+  status, what is refused) and gateway sections in Configuration, Install, Security, Monitoring and Troubleshooting
+  (#456). Design page `docs/design/mesh/m6-gateway.md`.
 - Wiki: new page "Mesh" (load balancing, scope, failure behaviour, retries, limits) and mesh sections in Configuration, Monitoring, Access logs, Troubleshooting and Security.
 - Wiki "Reading the API": the Endpoints tab and its filters; annotation values of the resource view are shown as set by their authors (#466, #474).
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).

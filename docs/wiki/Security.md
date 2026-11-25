@@ -34,8 +34,9 @@ See [Discovery and redaction](Discovery-and-redaction).
 |---|---|---|
 | controller, Valkey, `mimic-sidecar`, `mimic-trust-<n>` | non-root (65532, 999, 1337, 1337) | read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp, no privilege escalation; `mimic-trust` has no network |
 | `mimic-init` | UID 0 | only `NET_ADMIN` and `NET_RAW`, no privilege escalation, read-only root, exits after installing the rules |
+| `gateway` (the [gateway](Gateway) pods, with `gateway.enabled`) | non-root (65532) | read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp, no privilege escalation, no service account token, no volume; the only sysctl is `net.ipv4.ip_unprivileged_port_start` |
 
-Every pod the chart creates is Pod Security `restricted`. Application namespaces must be `privileged`
+Every pod the chart creates is Pod Security `restricted`, and so is every gateway pod that the controller creates. Application namespaces must be `privileged`
 for `mimic-init`. No mimic container mounts an app volume or the pod's API token. mimic's images are
 distroless (no shell). Valkey is the pinned upstream Alpine image (`valkey/valkey:9.0-alpine`, which has
 a shell). mimic's images are pinned by digest only when `image.digest` and `inject.initImage.digest`
@@ -56,9 +57,12 @@ Controller (ClusterRole / Role):
 | `mimicconfigs/status` (when `mesh.enabled`) | `patch` (server-side apply, field manager `mimic-mesh`) |
 | `httproutes`, `gateway.networking.k8s.io` (when `mesh.enabled`) | `get`, `list`, `watch` |
 | `httproutes/status`, `gateway.networking.k8s.io` (when `mesh.enabled`) | `patch` (JSON merge patch, field manager `mimic-mesh`) |
+| `gateways`, `gatewayclasses`, `gateway.networking.k8s.io`, cluster-wide (when `gateway.enabled`) | `get`, `list`, `watch` |
+| `gateways/status`, `gatewayclasses/status`, cluster-wide (when `gateway.enabled`) | `patch` (the Gateway status by server-side apply, field manager `mimic-gateway`) |
+| `deployments`, `services`, `poddisruptionbudgets`, only in the namespaces of `gateway.namespaces` (when `gateway.enabled`) | `get`, `create`, `patch`, `delete` (see [Gateway](#gateway)) |
 | Secrets, only `<release>-webhook-tls` and `<release>-tls-ca` in its namespace | `get`, `update` |
 
-No access to pods, ReplicaSets or other Secrets, no write on Deployments, no `create`, `update` or `delete` on any Gateway API object and nothing on `gateways`, `gatewayclasses` or `customresourcedefinitions`. RBAC cannot narrow the `httproutes/status` patch to mimic's entries: the controller changes only `status.parents[]` entries of `controllerName: mimic.platform.io/mesh`, but a compromised controller could rewrite the status (never the `spec`) of any route. The mesh view a sidecar fetches holds the Services of its own namespace and the destinations its `MimicConfig` declares in a namespace that consents with a `ReferenceGrant`; a pod reads its own deployment's view only, and no Secret, label or annotation reaches a view. Whoever can `exec`/`get` the two Secrets
+No access to pods, ReplicaSets or other Secrets, no `create`, `update` or `delete` on any Gateway API object and nothing on `customresourcedefinitions`. Without `gateway.enabled` there is no write on Deployments and nothing on `gateways` or `gatewayclasses`. RBAC cannot narrow the `httproutes/status` patch to mimic's entries: the controller changes only `status.parents[]` entries of `controllerName: mimic.platform.io/mesh`, but a compromised controller could rewrite the status (never the `spec`) of any route. The mesh view a sidecar fetches holds the Services of its own namespace and the destinations its `MimicConfig` declares in a namespace that consents with a `ReferenceGrant`; a pod reads its own deployment's view only, and no Secret, label or annotation reaches a view. Whoever can `exec`/`get` the two Secrets
 or the controller pods can obtain the TLS seed: restrict that access. Whoever can use `pods/portforward`
 in the release namespace can read every discovered report.
 
@@ -132,6 +136,63 @@ connections. No metric label or access field of faults carries a path, a header 
 decision (`mimic-core` `mesh::fault`) has no clock, no I/O and no random source of its own: the two draws are
 passed in. See [Mesh](Mesh#fault-injection).
 
+## Gateway
+
+The [gateway](Gateway) is off by default (`gateway.enabled`). With `false` the chart renders none of the rules below.
+
+**RBAC.** The controller gets two kinds of rules:
+
+- cluster-wide: `get`, `list`, `watch` on `gateways` and `gatewayclasses`, and `patch` on `gateways/status` and
+  `gatewayclasses/status`;
+- namespaced: `get`, `create`, `patch`, `delete` on `deployments`, `services` and `poddisruptionbudgets`, through a
+  ClusterRole `<release>-gateway`. One RoleBinding in each namespace of `gateway.namespaces` binds it, and nothing
+  else binds it (no ClusterRoleBinding).
+
+The controller watches the labelled gateway Deployments and Services with the cluster-wide read of the mesh. For
+these labelled objects it reads full objects: it needs the status of the Deployment and the addresses of the
+Service. The gateway adds no Secret, pod or Namespace read. It never gets `update`, `create` or `delete` on a
+Gateway API object.
+
+**Admission policy.** RBAC cannot limit `create`, `patch` and `delete` to labelled objects. A
+`ValidatingAdmissionPolicy` `<release>-gateway` does it (`failurePolicy: Fail`, `validationActions: [Deny]`). It
+applies only to requests of the service account of the controller, on `CREATE`, `UPDATE` and `DELETE` of
+Deployments, Services and PodDisruptionBudgets. It admits only:
+
+- a `DELETE` of an object with the labels `app.kubernetes.io/managed-by: mimic` and `mimic.platform.io/gateway`;
+- a `CREATE` or an `UPDATE` in a namespace of `gateway.namespaces`, of an object with those labels and one owner
+  reference to the Gateway that the label names; an `UPDATE` only of an object that had those labels before;
+- a Deployment of the fixed gateway shape: one container, the image of the chart by digest, the fixed `command`
+  and no `args`, the three `env` names with literal values, no volume, no host access, the exact security contexts,
+  replicas from 1 to `gateway.maxReplicas`, `resources` equal to `gateway.resources`;
+- a Service of the type `gateway.serviceType`, with the gateway selector, no port 15100 and no `externalIPs`,
+  `externalName`, `loadBalancerIP`, `loadBalancerSourceRanges` or `loadBalancerClass`;
+- a PodDisruptionBudget with the gateway selector and `maxUnavailable: 1`.
+
+Each refusal message names the refused field. The full list is in section 7.10 of
+[the spec](https://github.com/Thaliph/mock-server/blob/main/docs/SPEC.md#710-the-mimic-gateway-m6).
+
+**What the policy does not check.** The policy reads no other object, so it cannot check that an object matches a
+real Gateway. A stolen controller token can still do these things in the listed namespaces:
+
+- create gateway objects of the fixed shape;
+- scale a gateway Deployment to `gateway.maxReplicas`;
+- change the ports of a gateway, or delete the gateway objects (a denial of service of the gateways);
+- write the status of any Gateway or GatewayClass.
+
+It cannot run another image or command, mount a volume, use the host or add a capability. It cannot take over or
+delete an object without the labels of mimic, or select pods other than those labelled `mimic.platform.io/gateway`.
+
+**The gateway pod.** It runs as UID and GID 65532, with `runAsNonRoot`, `RuntimeDefault` seccomp, a read-only root
+filesystem and all capabilities dropped. It has no service account token (`automountServiceAccountToken: false`), no
+volume and no host access. It passes Pod Security `restricted`. To bind a port below 1024 it uses the safe,
+namespaced sysctl `net.ipv4.ip_unprivileged_port_start=0`, not a capability. The webhook never injects it
+(`mimic.platform.io/inject: disabled`).
+
+**What reaches a log, a metric or a status.** No hostname, annotation value or other `spec` value. Only field
+paths, annotation keys and identifiers that the API server validated and bounded: namespace, class, listener and
+object names, kinds, protocols, ports and counts. An error in a log line is the status reason and code of the API
+server, never an object body.
+
 ## Network
 
 - **Webhook (8443):** open to any source by default, because the API server's address depends on the
@@ -199,6 +260,16 @@ The main ones (full list: [the spec](https://github.com/Thaliph/mock-server/blob
   can reach a pod IP, and a namespace writer that lowers the contract, raise it, and an HPA built on it can be
   driven up to its `maxReplicas`. NetworkPolicy bounds who can reach the pods and `maxReplicas` bounds the cost.
   See [Monitoring](Monitoring#limits).
+- **Gateway.** Whoever can create a `Gateway` of the class `mimic` in a listed namespace gets pods of the fixed
+  shape and a Service of `gateway.serviceType`, even without RBAC on Deployments or Services. With `LoadBalancer`
+  that Service is reachable from outside the cluster. The namespace `ResourceQuota` counts the pods,
+  `gateway.maxReplicas` bounds one Gateway, and only a quota on `count/gateways.gateway.networking.k8s.io` bounds
+  the number of Gateways. The namespace is the trust domain of a Gateway: a namespace user can label pods
+  `mimic.platform.io/gateway: <gateway>` to get traffic from the gateway Service, edit the generated objects, or
+  take a generated name first. Each needs rights that already reach the pods and Services of the namespace. The
+  policy checks the shape, not the intent ([Gateway](#gateway)). The no-match answer `x-mimic-error: no-route` tells
+  any client that the edge is mimic. See [Gateway](Gateway#disable-unlist-upgrade) for what disabling and
+  unlisting leave behind.
 - **Release.** Images are rebuilt from the tagged commit; arm64 gets image checks and a scan but no kind
   e2e; repository admins can bypass the tag ruleset (a signature names its tag); signing depends on the public
   Sigstore service. This wiki is not versioned: `docs/wiki/` at a release tag documents that release.

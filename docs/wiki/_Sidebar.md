@@ -14,6 +14,7 @@
 - [Egress endpoint](Egress-endpoint)
 - [TLS interception](TLS-interception)
 - [Mesh](Mesh)
+- [Gateway](Gateway)
 
 **Run**
 - [Configuration](Configuration)

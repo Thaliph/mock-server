@@ -306,6 +306,72 @@ request. Check the controller and the sidecar's `mesh view pull failed` lines, a
 line in the sidecar log.** While the fields are removed, a response the sidecar cannot frame closes the
 connection. Fix the response, or switch the mesh off for that workload.
 
+## Gateway
+
+Read the status of the Gateway first ([Gateway](Gateway#reading-the-status)):
+
+```bash
+kubectl -n <ns> get gateway <name> -o json | jq '.status.conditions, [.status.listeners[] | {name, conditions}]'
+```
+
+**`helm install` or `helm upgrade` fails with `gateway.enabled`.** The message names the missing requirement:
+`mesh.enabled: true`, `image.digest`, a non-empty `gateway.namespaces`, or the Gateway API CRDs. Install the CRDs
+before the chart ([Install](Install#gateway-api-optional)). Each namespace of `gateway.namespaces` must exist
+before the install, because the chart renders a RoleBinding in it.
+
+**A Gateway has `Accepted: False`, reason `NamespaceNotAllowed`.** Its namespace is not in `gateway.namespaces`, so
+the controller creates no object for it. Add the namespace to `gateway.namespaces` with `helm upgrade`, or create
+the Gateway in a listed namespace.
+
+**A Gateway or a listener has `Accepted: False`, reason `UnsupportedValue`.** The message names the first field
+that mimic does not support, as `unsupported: <field path>`. For an annotation it names the key, never the value.
+Remove the field. The fields that mimic refuses are in [What is refused](Gateway#what-is-refused-and-why): an unknown
+field, `spec.tls`, `spec.allowedListeners`, `spec.infrastructure.labels`, an annotation other than
+`mimic.platform.io/replicas`, listener `filters`, `allowedRoutes.namespaces.from: Selector`, a name longer than 63
+characters, a `spec` larger than 64 KiB. If only some listeners are refused, the Gateway stays `Accepted: True` with
+reason `ListenersNotValid`, and the refused listeners get no port.
+
+**Log line `gateway object not managed`, the Gateway has `Programmed: False`, reason `Invalid`.** An object of the
+generated name exists in the namespace without the labels `app.kubernetes.io/managed-by: mimic` and
+`mimic.platform.io/gateway: <gateway>`. The message names it (`Deployment web-mimic exists and is not managed by
+mimic`). The controller does not change or delete it, and
+`mimic_gateway_reconciles_total{result="conflict"}` grows. The WARN has `gateway`, `kind` and `name`, once per
+streak. If you do not need that object, delete it. Else, give the Gateway another name. The next reconcile applies
+the three objects.
+
+**Log line `gateway reconcile failed`.** A request of the controller to the API server failed for that Gateway. The
+`error` field is the status reason and code of the API server (`kind` is the object). The controller tries again
+after 1 s, then doubles the wait up to 30 s, and logs one WARN per Gateway and streak.
+`mimic_gateway_reconciles_total{result="error"}` grows. Common causes:
+
+- `422` `Invalid`: the admission policy `<release>-gateway` refused the apply. During a chart upgrade, an old
+  controller replica applies the old image digest until it is replaced: wait for the rollout. A namespace user who
+  added a container to a generated object also makes the apply fail.
+
+**A Gateway stays `Programmed: False`, reason `Pending` (`<a> of <r> replicas available`).** The gateway Deployment
+is missing, is rolling, or has no available replica. Look at the Deployment and its pods:
+
+```bash
+kubectl -n <ns> get deploy,pods -l mimic.platform.io/gateway=<gateway>
+kubectl -n <ns> describe deploy <gateway>-mimic
+```
+
+- Pods do not start: check the events of the Deployment and of its pods. A `ResourceQuota` of the namespace counts
+  the gateway pods.
+- A pod restarts with ERROR `gateway listener failed`: the gateway could not bind the port that the line names.
+- Reason `NoResources` (`replica creation failed`): the Deployment has a `ReplicaFailure` condition. Its message
+  gives the cause.
+- Reason `AddressNotAssigned` (`no address assigned`): the Service has no address. A `LoadBalancer` Service gets an
+  ingress address only from a load balancer implementation of the cluster. Without one, use `ClusterIP` or
+  `NodePort` (`gateway.serviceType`).
+
+**A `kubectl scale` or an HPA on a gateway Deployment has no effect.** The controller forces the replica count of
+the Gateway at the next reconcile, at least every 5 minutes. Set `mimic.platform.io/replicas` in
+`spec.infrastructure.annotations` of the Gateway ([Gateway](Gateway#replicas)).
+
+**The gateway answers every request `404` with `x-mimic-error: no-route`.** That is the expected answer until
+routing comes with #457.
+
 ## No data
 
 **`GET /v1/workloads/<ns>/<dep>` returns `404`.** The controller holds nothing for that deployment.
