@@ -23,6 +23,8 @@ use crate::mesh::tests::{Lines, hub};
 
 const GATEWAYS: &str = "/apis/gateway.networking.k8s.io/v1/gateways";
 const CLASSES: &str = "/apis/gateway.networking.k8s.io/v1/gatewayclasses";
+const DEPLOYMENTS: &str = "/apis/apps/v1/deployments";
+const SERVICES: &str = "/api/v1/services";
 
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -50,7 +52,8 @@ fn client(present: &watch::Sender<bool>, seen: &Arc<Mutex<Vec<String>>>) -> kube
             let uri = request.uri().clone();
             seen.lock().unwrap().push(uri.to_string());
             let path = uri.path();
-            let served = path == CLASSES || (path == GATEWAYS && *present.borrow());
+            let objects = path == DEPLOYMENTS || path == SERVICES;
+            let served = path == CLASSES || objects || (path == GATEWAYS && *present.borrow());
             if !served {
                 return Ok::<_, Infallible>(
                     http::Response::builder()
@@ -62,7 +65,7 @@ fn client(present: &watch::Sender<bool>, seen: &Arc<Mutex<Vec<String>>>) -> kube
             }
             if uri.query().unwrap_or("").contains("watch=true") {
                 let mut gone = present.subscribe();
-                let classes = path == CLASSES;
+                let classes = path == CLASSES || objects;
                 let stream = futures::stream::once(async move {
                     if classes {
                         std::future::pending::<()>().await;
@@ -74,6 +77,16 @@ fn client(present: &watch::Sender<bool>, seen: &Arc<Mutex<Vec<String>>>) -> kube
                     .status(200)
                     .body(StreamBody::new(stream).boxed_unsync())
                     .unwrap());
+            }
+            if objects {
+                let kind = if path == SERVICES {
+                    "ServiceList"
+                } else {
+                    "DeploymentList"
+                };
+                let version = if path == SERVICES { "v1" } else { "apps/v1" };
+                return Ok(reply(&json!({"apiVersion": version, "kind": kind,
+                                        "metadata": {"resourceVersion": "5"}, "items": []})));
             }
             Ok(reply(&if path == CLASSES {
                 list(

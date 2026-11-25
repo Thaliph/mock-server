@@ -1,11 +1,15 @@
-//! The cluster side of the gateway reconciler: the server-side applies of the status of
-//! Gateways and GatewayClasses.
+//! The cluster side of the gateway reconciler: the server-side applies of the generated objects
+//! and of the status of Gateways and GatewayClasses, the reads and deletes of the objects.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams,
+    Preconditions, PropagationPolicy,
+};
+use mimic_core::gateway::input::ObjectKind;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
@@ -63,6 +67,30 @@ pub type ClusterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>>
 
 /// What the reconciler asks of the cluster.
 pub trait Cluster: Send + Sync {
+    /// Server-side apply, [`FIELD_MANAGER`], force. Returns the object the API server answers.
+    fn apply<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+        body: &'a Value,
+    ) -> ClusterFuture<'a, Value>;
+    /// A 404 is `Ok(None)`.
+    fn get<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterFuture<'a, Option<Value>>;
+    /// Background propagation, the UID as precondition. A 404 or a 409 (another object of
+    /// that name now) is `Ok(())`.
+    fn delete<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+        uid: &'a str,
+    ) -> ClusterFuture<'a, ()>;
     /// Server-side apply on the status subresource, [`FIELD_MANAGER`], force.
     fn apply_status<'a>(
         &'a self,
@@ -84,6 +112,19 @@ fn gateway_api(kind: &str) -> ApiResource {
     ))
 }
 
+fn object_api(kind: ObjectKind) -> ApiResource {
+    let (group, version) = match kind {
+        ObjectKind::Deployment => ("apps", "v1"),
+        ObjectKind::Service => ("", "v1"),
+        ObjectKind::PodDisruptionBudget => ("policy", "v1"),
+    };
+    ApiResource::from_gvk(&GroupVersionKind::gvk(group, version, kind.as_str()))
+}
+
+fn json(object: DynamicObject) -> Result<Value, ApiError> {
+    serde_json::to_value(object).map_err(|_| ApiError::unavailable())
+}
+
 /// The real cluster. `client` is set once the cluster client is available.
 pub struct KubeCluster {
     client: Arc<OnceCell<kube::Client>>,
@@ -98,9 +139,75 @@ impl KubeCluster {
     fn client(&self) -> Result<kube::Client, ApiError> {
         self.client.get().cloned().ok_or_else(ApiError::unavailable)
     }
+
+    fn objects(&self, kind: ObjectKind, namespace: &str) -> Result<Api<DynamicObject>, ApiError> {
+        Ok(Api::namespaced_with(
+            self.client()?,
+            namespace,
+            &object_api(kind),
+        ))
+    }
 }
 
 impl Cluster for KubeCluster {
+    fn apply<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+        body: &'a Value,
+    ) -> ClusterFuture<'a, Value> {
+        Box::pin(async move {
+            let api = self.objects(kind, namespace)?;
+            let answer = api
+                .patch(name, &apply_params(), &Patch::Apply(body))
+                .await
+                .map_err(|e| ApiError::from(&e))?;
+            json(answer)
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterFuture<'a, Option<Value>> {
+        Box::pin(async move {
+            let api = self.objects(kind, namespace)?;
+            match api.get_opt(name).await {
+                Ok(Some(object)) => json(object).map(Some),
+                Ok(None) => Ok(None),
+                Err(e) => Err(ApiError::from(&e)),
+            }
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+        uid: &'a str,
+    ) -> ClusterFuture<'a, ()> {
+        Box::pin(async move {
+            let api = self.objects(kind, namespace)?;
+            let params = DeleteParams {
+                propagation_policy: Some(PropagationPolicy::Background),
+                preconditions: Some(Preconditions {
+                    uid: Some(uid.to_string()),
+                    resource_version: None,
+                }),
+                ..DeleteParams::default()
+            };
+            match api.delete(name, &params).await {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(status)) if status.code == 404 || status.code == 409 => Ok(()),
+                Err(e) => Err(ApiError::from(&e)),
+            }
+        })
+    }
+
     fn apply_status<'a>(
         &'a self,
         target: StatusTarget<'a>,

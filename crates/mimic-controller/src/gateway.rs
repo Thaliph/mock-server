@@ -17,6 +17,8 @@ pub use reconcile::Reconciler;
 pub use watch::start;
 
 #[cfg(test)]
+mod fake;
+#[cfg(test)]
 mod tests_config;
 #[cfg(test)]
 mod tests_convert;

@@ -1,5 +1,6 @@
-//! GW-15 (classes and refused Gateways), GW-17 (their counts): the passes of the gateway
-//! reconciler against a recording cluster, without a cluster.
+//! GW-10 to GW-14 (objects, ownership, deletion, failures), GW-15 (classes and refused Gateways)
+//! and GW-17 (counts and lines): the passes of the gateway reconciler against a recording
+//! cluster and the fake API of `fake.rs`, without a cluster.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -12,8 +13,12 @@ use prometheus_client::registry::Registry;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
+use mimic_core::gateway::input::ObjectKind;
+use mimic_core::gateway::{accept, objects};
+
 use super::cluster::{ApiError, Cluster, ClusterFuture, StatusTarget};
 use super::convert;
+use super::fake::{Request, Rig};
 use super::metrics::GatewayMetrics;
 use super::reconcile::Reconciler;
 use crate::mesh::Event;
@@ -47,6 +52,56 @@ impl Recorder {
 }
 
 impl Cluster for Recorder {
+    fn apply<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+        body: &'a Value,
+    ) -> ClusterFuture<'a, Value> {
+        Box::pin(async move {
+            let what = format!("apply {} {namespace}/{name}", kind.as_str());
+            self.calls.lock().unwrap().push(Call {
+                what,
+                body: body.clone(),
+            });
+            Ok(body.clone())
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterFuture<'a, Option<Value>> {
+        Box::pin(async move {
+            let what = format!("get {} {namespace}/{name}", kind.as_str());
+            self.calls.lock().unwrap().push(Call {
+                what,
+                body: Value::Null,
+            });
+            Ok(None)
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        kind: ObjectKind,
+        namespace: &'a str,
+        name: &'a str,
+        uid: &'a str,
+    ) -> ClusterFuture<'a, ()> {
+        Box::pin(async move {
+            let what = format!("delete {} {namespace}/{name} {uid}", kind.as_str());
+            self.calls.lock().unwrap().push(Call {
+                what,
+                body: Value::Null,
+            });
+            Ok(())
+        })
+    }
+
     fn apply_status<'a>(
         &'a self,
         target: StatusTarget<'a>,
@@ -130,7 +185,15 @@ pub(super) fn key(namespace: &str, name: &str) -> (String, String) {
     (namespace.to_string(), name.to_string())
 }
 
-/// A reconciler with the CRD present and both tables listed with `classes` and `gateways`.
+/// Lists no Deployment and no Service.
+pub(super) fn no_objects(r: &Reconciler) {
+    r.feed_deployments(Event::Init);
+    r.feed_deployments(Event::InitDone);
+    r.feed_services(Event::Init);
+    r.feed_services(Event::InitDone);
+}
+
+/// A reconciler with the CRD present and the tables listed with `classes` and `gateways`.
 pub(super) fn reconciler(
     settings: Settings,
     cluster: &Arc<Recorder>,
@@ -150,6 +213,7 @@ pub(super) fn reconciler(
         r.feed_gateways(Event::InitApply(key(&g.namespace, &g.name), g));
     }
     r.feed_gateways(Event::InitDone);
+    no_objects(&r);
     (r, metrics)
 }
 
@@ -189,7 +253,7 @@ async fn gw_15_a_not_listed_gateway_gets_its_status_and_no_object_request() {
         vec![class("mimic")],
         vec![web.clone()],
     );
-    assert_eq!(r.pass(NOW).await, None);
+    r.pass(NOW).await;
     assert_eq!(
         cluster.whats(),
         ["status class mimic", "status gateway other/web"]
@@ -225,7 +289,7 @@ async fn gw_15_a_not_listed_gateway_gets_its_status_and_no_object_request() {
     r.feed_classes(Event::Apply(key("", "mimic"), mimic));
     r.feed_gateways(Event::Apply(key("other", "web"), written(web, body)));
     cluster.calls.lock().unwrap().clear();
-    assert_eq!(r.pass(NOW).await, None);
+    r.pass(NOW).await;
     assert_eq!(cluster.whats(), Vec::<String>::new());
 }
 
@@ -253,7 +317,7 @@ async fn gw_15_other_controllers_get_no_request() {
     }));
     let (k, g) = convert::gateway(&gw).expect("every Gateway converts");
     r.feed_gateways(Event::Apply(k, g));
-    assert_eq!(r.pass(NOW).await, None);
+    r.pass(NOW).await;
     assert_eq!(cluster.whats(), Vec::<String>::new());
 }
 
@@ -263,6 +327,7 @@ async fn gw_15_no_pass_without_the_crd_or_a_full_list() {
     let refused = gateway("shop", "web", vec![listener("tcp", 9000, "TCP")]);
     let metrics = GatewayMetrics::register(&mut Registry::default());
     let r = Reconciler::new(settings(&["shop"]), cluster.clone(), metrics);
+    no_objects(&r);
     r.crd(true);
     r.feed_classes(Event::Init);
     r.feed_classes(Event::InitApply(key("", "mimic"), class("mimic")));
@@ -290,9 +355,8 @@ async fn gw_15_no_pass_without_the_crd_or_a_full_list() {
 }
 
 #[tokio::test]
-async fn gw_15_an_accepted_gateway_or_one_of_an_unknown_class_gets_nothing_here() {
+async fn gw_15_a_gateway_of_an_unknown_class_gets_nothing() {
     let cluster = Arc::new(Recorder::default());
-    let accepted = gateway("shop", "web", vec![listener("http", 80, "HTTP")]);
     let mut stray = gateway("shop", "stray", vec![listener("tcp", 9000, "TCP")]);
     stray.class = "unknown".into();
     let mut mimic = class("mimic");
@@ -300,15 +364,11 @@ async fn gw_15_an_accepted_gateway_or_one_of_an_unknown_class_gets_nothing_here(
         json!({"type": "Accepted", "status": "True", "reason": "Accepted",
         "message": "", "observedGeneration": 1, "lastTransitionTime": NOW}),
     ];
-    let (r, metrics) = reconciler(
-        settings(&["shop"]),
-        &cluster,
-        vec![mimic],
-        vec![accepted, stray],
-    );
+    let (r, metrics) = reconciler(settings(&["shop"]), &cluster, vec![mimic], vec![stray]);
     r.pass(NOW).await;
     assert_eq!(cluster.whats(), Vec::<String>::new());
     assert_eq!(count(&metrics, "invalid"), 0);
+    assert_eq!(state(&metrics, "not_accepted"), 0);
 }
 
 fn count(metrics: &GatewayMetrics, result: &str) -> u64 {
@@ -328,6 +388,7 @@ async fn gw_17_refused_gateways_are_counted_without_names() {
     let mut registry = Registry::with_prefix("mimic");
     let metrics = GatewayMetrics::register(&mut registry);
     let r = Reconciler::new(settings(&["shop"]), cluster.clone(), metrics.clone());
+    no_objects(&r);
     r.crd(true);
     r.feed_classes(Event::Init);
     r.feed_classes(Event::InitApply(key("", "mimic"), class("mimic")));
@@ -392,38 +453,719 @@ async fn gw_17_the_series_exist_before_the_first_pass() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn gw_15_a_failed_status_apply_is_logged_at_debug_and_tried_again_after_30_s() {
-    let lines = Lines::default();
-    let _guard = tracing::subscriber::set_default(
+// Step 6 (GW-10 to GW-14, GW-15, GW-17): the objects of accepted Gateways, against the fake API of
+// `fake.rs`. Fixture: class `mimic`, namespaces `{shop}`, Gateway `shop/web` (`uid-web`, HTTP 80).
+
+const CANARY: &str = "canary-4e0b77c1";
+
+fn class_object(name: &str, controller: &str) -> Value {
+    json!({"metadata": {"name": name}, "spec": {"controllerName": controller}})
+}
+
+fn gateway_object(namespace: &str, name: &str, listeners: Value) -> Value {
+    json!({"metadata": {"namespace": namespace, "name": name, "uid": format!("uid-{name}")},
+           "spec": {"gatewayClassName": "mimic", "listeners": listeners}})
+}
+
+fn http(port: u16) -> Value {
+    json!([{"name": "http", "port": port, "protocol": "HTTP"}])
+}
+
+fn fixture(replicas: usize) -> Rig {
+    let rig = Rig::new(replicas, &settings(&["shop"]));
+    rig.api.put(
+        "GatewayClass",
+        class_object("mimic", mimic_core::gateway::CONTROLLER_NAME),
+    );
+    rig.api
+        .put("Gateway", gateway_object("shop", "web", http(80)));
+    rig
+}
+
+/// The Deployment `name` of `shop` has `available` replicas, current.
+fn ready(rig: &Rig, name: &str, available: u32) {
+    rig.api.edit("Deployment", "shop", name, |d| {
+        let generation = d["metadata"]["generation"].clone();
+        d["status"] = json!({"observedGeneration": generation, "replicas": 2,
+                             "availableReplicas": available});
+    });
+}
+
+/// The calls but the class status.
+fn whats(rig: &Rig) -> Vec<String> {
+    rig.api
+        .whats()
+        .into_iter()
+        .filter(|w| !w.starts_with("status GatewayClass"))
+        .collect()
+}
+
+/// The object applies and gets.
+fn applies(rig: &Rig) -> Vec<String> {
+    rig.api
+        .whats()
+        .into_iter()
+        .filter(|w| w.starts_with("apply ") || w.starts_with("get "))
+        .collect()
+}
+
+fn s(list: &[&str]) -> Vec<String> {
+    list.iter().map(|w| w.to_string()).collect()
+}
+
+/// The objects `mimic_core` generates for the Gateway the store holds.
+fn generated(rig: &Rig, name: &str) -> objects::Objects {
+    let stored = rig.api.get("Gateway", "shop", name).unwrap();
+    let (_, gw) = convert::gateway(&serde_json::from_value(stored).unwrap()).unwrap();
+    let acceptance = accept::gateway(&gw, &class("mimic"), &settings(&["shop"]));
+    objects::objects(&gw, &acceptance, &settings(&["shop"])).expect("accepted")
+}
+
+/// The `Programmed` condition of the last status apply of `gateway`.
+fn programmed_of(rig: &Rig, gateway: &str) -> Value {
+    let what = format!("status Gateway {gateway}");
+    let call = rig
+        .api
+        .calls()
+        .into_iter()
+        .rev()
+        .find(|c| c.what == what)
+        .expect("a status apply");
+    call.body["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "Programmed")
+        .cloned()
+        .unwrap()
+}
+
+/// Converged: the objects applied, the Deployment available, the status written and read.
+async fn converged(rig: &Rig) {
+    rig.round(0).await;
+    ready(rig, "web-mimic", 2);
+    rig.round(0).await;
+    rig.round(0).await;
+    rig.api.clear();
+}
+
+fn lines_of(lines: &Lines) -> String {
+    String::from_utf8(lines.0.lock().unwrap().clone()).unwrap()
+}
+
+fn json_lines(lines: &Lines) -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .json()
-            .with_max_level(tracing::Level::DEBUG)
             .with_writer(lines.clone())
             .finish(),
+    )
+}
+
+#[tokio::test]
+async fn gw_10_an_accepted_gateway_gets_three_applies_and_its_status() {
+    let params = super::cluster::apply_params();
+    assert_eq!(params.field_manager.as_deref(), Some("mimic-gateway"));
+    assert!(params.force, "server-side apply with force");
+    let rig = fixture(1);
+    rig.round(0).await;
+    assert_eq!(
+        whats(&rig),
+        s(&[
+            "get Deployment shop/web-mimic",
+            "get Service shop/web-mimic",
+            "get PodDisruptionBudget shop/web-mimic",
+            "apply Deployment shop/web-mimic",
+            "apply Service shop/web-mimic",
+            "apply PodDisruptionBudget shop/web-mimic",
+            "status Gateway shop/web",
+        ])
     );
-    let cluster = Arc::new(Recorder::default());
-    *cluster.fail.lock().unwrap() = true;
-    let (r, _) = reconciler(
-        settings(&["shop"]),
-        &cluster,
-        vec![],
-        vec![gateway("other", "web", vec![])],
+    let expected = generated(&rig, "web");
+    let body = |what: &str| {
+        rig.api
+            .calls()
+            .into_iter()
+            .find(|c| c.what == what)
+            .unwrap()
+            .body
+    };
+    assert_eq!(body("apply Deployment shop/web-mimic"), expected.deployment);
+    assert_eq!(body("apply Service shop/web-mimic"), expected.service);
+    assert_eq!(
+        body("apply PodDisruptionBudget shop/web-mimic"),
+        expected.pod_disruption_budget
     );
-    r.feed_classes(Event::Apply(key("", "mimic"), class("mimic")));
-    let start = Instant::now();
-    let due = r.pass(NOW).await.expect("a retry");
-    assert_eq!(due - start, Duration::from_secs(30));
-    let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
-    let debug: Vec<&str> = text
+    let programmed = programmed_of(&rig, "shop/web");
+    assert_eq!(
+        (
+            &programmed["status"],
+            &programmed["reason"],
+            &programmed["message"]
+        ),
+        (
+            &json!("False"),
+            &json!("Pending"),
+            &json!("0 of 2 replicas available")
+        )
+    );
+}
+
+#[tokio::test]
+async fn gw_10_programmed_with_the_address_once_ready() {
+    let lines = Lines::default();
+    let _guard = json_lines(&lines);
+    let rig = fixture(1);
+    rig.round(0).await;
+    ready(&rig, "web-mimic", 2);
+    rig.api.clear();
+    rig.round(0).await;
+    assert_eq!(whats(&rig), s(&["status Gateway shop/web"]));
+    let programmed = programmed_of(&rig, "shop/web");
+    assert_eq!(
+        (
+            &programmed["status"],
+            &programmed["reason"],
+            &programmed["message"]
+        ),
+        (
+            &json!("True"),
+            &json!("Programmed"),
+            &json!("2 of 2 replicas available")
+        )
+    );
+    let status = rig.api.get("Gateway", "shop", "web").unwrap()["status"].clone();
+    assert_eq!(
+        status["addresses"],
+        json!([{"type": "IPAddress", "value": "10.96.0.10"}])
+    );
+    for _ in 0..3 {
+        rig.round(0).await;
+    }
+    let text = lines_of(&lines);
+    let info: Vec<&str> = text
         .lines()
-        .filter(|l| l.contains("gateway status not applied"))
+        .filter(|l| l.contains("gateway programmed"))
         .collect();
-    assert_eq!(debug.len(), 2, "the class and the Gateway");
-    assert!(debug.iter().all(|l| l.contains(r#""level":"DEBUG""#)));
-    assert!(debug[1].contains(r#""gateway":"other/web""#), "the key");
-    assert!(
-        debug[1].contains(r#""error":"InternalError 500""#),
-        "the error"
+    assert_eq!(info.len(), 1, "once per transition");
+    assert!(info[0].contains(r#""gateway":"shop/web""#) && info[0].contains(r#""generation":1"#));
+}
+
+#[tokio::test]
+async fn gw_10_republications_change_nothing() {
+    let rig = fixture(1);
+    converged(&rig).await;
+    let versions = rig.api.versions();
+    for _ in 0..10 {
+        rig.round(0).await;
+    }
+    assert_eq!(rig.api.whats(), Vec::<String>::new());
+    assert_eq!(rig.api.versions(), versions);
+}
+
+#[tokio::test]
+async fn gw_10_a_port_change_applies_the_deployment_and_service() {
+    let rig = fixture(1);
+    converged(&rig).await;
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["spec"]["listeners"] = http(8080);
+    });
+    rig.round(0).await;
+    let calls = whats(&rig);
+    assert_eq!(
+        calls[..2],
+        s(&[
+            "apply Deployment shop/web-mimic",
+            "apply Service shop/web-mimic"
+        ])
     );
+    assert!(
+        calls[2..].iter().all(|w| w.starts_with("status ")),
+        "{calls:?}"
+    );
+    let service = rig.api.get("Service", "shop", "web-mimic").unwrap();
+    assert_eq!(service["spec"]["ports"][0]["port"], 8080);
+    let deployment = rig.api.get("Deployment", "shop", "web-mimic").unwrap();
+    assert_eq!(
+        deployment["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"],
+        "8080"
+    );
+}
+
+#[tokio::test]
+async fn gw_10_a_gateway_status_change_alone_applies_no_object() {
+    let rig = fixture(1);
+    converged(&rig).await;
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["status"]["conditions"][1]["message"] = json!("edited");
+    });
+    rig.round(0).await;
+    assert_eq!(
+        whats(&rig),
+        s(&["status Gateway shop/web"]),
+        "the status restored"
+    );
+}
+
+#[tokio::test]
+async fn gw_10_an_edit_of_the_deployment_spec_or_labels_applies_it_again() {
+    let rig = fixture(1);
+    converged(&rig).await;
+    rig.api.edit("Deployment", "shop", "web-mimic", |d| {
+        d["spec"]["replicas"] = json!(5);
+    });
+    rig.round(0).await;
+    assert_eq!(applies(&rig), s(&["apply Deployment shop/web-mimic"]));
+    rig.api.clear();
+    rig.api.edit("Service", "shop", "web-mimic", |d| {
+        d["metadata"]["labels"]["team"] = json!("x");
+    });
+    rig.round(0).await;
+    assert_eq!(applies(&rig), s(&["apply Service shop/web-mimic"]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn gw_10_the_resync_applies_again() {
+    let rig = fixture(1);
+    converged(&rig).await;
+    let versions = rig.api.versions();
+    tokio::time::sleep(Duration::from_secs(301)).await;
+    rig.round(0).await;
+    let applies: Vec<String> = whats(&rig)
+        .into_iter()
+        .filter(|w| w.starts_with("apply "))
+        .collect();
+    assert_eq!(
+        applies,
+        s(&[
+            "apply Deployment shop/web-mimic",
+            "apply Service shop/web-mimic",
+            "apply PodDisruptionBudget shop/web-mimic",
+        ])
+    );
+    assert_eq!(
+        rig.api.versions(),
+        versions,
+        "an equal apply changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn gw_11_two_replicas_converge() {
+    let single = fixture(1);
+    converged(&single).await;
+    let pair = fixture(2);
+    for i in [0, 1] {
+        pair.round(i).await;
+    }
+    ready(&pair, "web-mimic", 2);
+    let mut quiet = 0;
+    let mut rounds = 0;
+    while quiet < 2 {
+        let before = pair.api.calls().len();
+        for i in [0, 1] {
+            pair.round(i).await;
+        }
+        quiet = if pair.api.calls().len() == before {
+            quiet + 1
+        } else {
+            0
+        };
+        rounds += 1;
+        assert!(rounds < 10, "no convergence: {:?}", pair.api.whats());
+    }
+    let store = |rig: &Rig| rig.api.objects.lock().unwrap().clone();
+    assert_eq!(store(&pair), store(&single));
+    // Every status write of a replica that changed the store: one per transition.
+    let gateway = pair.api.get("Gateway", "shop", "web").unwrap();
+    assert_eq!(
+        gateway["metadata"]["resourceVersion"],
+        single.api.get("Gateway", "shop", "web").unwrap()["metadata"]["resourceVersion"]
+    );
+    let versions = pair.api.versions();
+    pair.api.clear();
+    for _ in 0..10 {
+        for i in [0, 1] {
+            pair.round(i).await;
+        }
+    }
+    assert_eq!(pair.api.whats(), Vec::<String>::new());
+    assert_eq!(pair.api.versions(), versions);
+}
+
+/// A Deployment `name` of `shop` that is not mimic's.
+fn squatter(rig: &Rig, name: &str) {
+    rig.api.put(
+        "Deployment",
+        json!({"metadata": {"namespace": "shop", "name": name, "labels": {"app": "other"}},
+               "spec": {"selector": {"matchLabels": {"app": "other"}},
+                        "template": {"metadata": {"labels": {"app": "other"}},
+                                     "spec": {"containers": [{"name": "a", "image": "a"}]}}}}),
+    );
+}
+
+#[tokio::test]
+async fn gw_12_an_unmanaged_object_blocks_the_gateway() {
+    let lines = Lines::default();
+    let _guard = json_lines(&lines);
+    let rig = fixture(1);
+    squatter(&rig, "web-mimic");
+    let squatted = rig.api.get("Deployment", "shop", "web-mimic").unwrap();
+    for _ in 0..3 {
+        rig.round(0).await;
+    }
+    let writes: Vec<String> = whats(&rig)
+        .into_iter()
+        .filter(|w| w.starts_with("apply ") || w.starts_with("delete "))
+        .collect();
+    assert_eq!(writes, Vec::<String>::new());
+    assert_eq!(
+        rig.api.get("Deployment", "shop", "web-mimic").unwrap(),
+        squatted
+    );
+    let programmed = programmed_of(&rig, "shop/web");
+    assert_eq!(
+        (
+            &programmed["status"],
+            &programmed["reason"],
+            &programmed["message"]
+        ),
+        (
+            &json!("False"),
+            &json!("Invalid"),
+            &json!("Deployment web-mimic exists and is not managed by mimic")
+        )
+    );
+    assert_eq!(count(&rig.metrics[0], "conflict"), 3);
+    let text = lines_of(&lines);
+    let warns: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("gateway object not managed"))
+        .collect();
+    assert_eq!(warns.len(), 1, "one WARN per streak");
+    for field in [
+        r#""gateway":"shop/web""#,
+        r#""kind":"Deployment""#,
+        r#""name":"web-mimic""#,
+        r#""level":"WARN""#,
+    ] {
+        assert!(warns[0].contains(field), "{field}");
+    }
+
+    rig.api.remove("Deployment", "shop", "web-mimic");
+    rig.api.clear();
+    rig.round(0).await;
+    let applies: Vec<String> = whats(&rig)
+        .into_iter()
+        .filter(|w| w.starts_with("apply "))
+        .collect();
+    assert_eq!(applies.len(), 3, "{applies:?}");
+    assert_eq!(count(&rig.metrics[0], "ok"), 1);
+}
+
+#[tokio::test]
+async fn gw_12_objects_of_an_older_gateway_are_adopted() {
+    let rig = fixture(1);
+    let old = generated(&rig, "web");
+    let owned = |mut o: Value| {
+        o["metadata"]["ownerReferences"][0]["uid"] = json!("uid-old");
+        o
+    };
+    rig.api.put("Deployment", owned(old.deployment));
+    rig.api.put("Service", owned(old.service));
+    rig.api
+        .put("PodDisruptionBudget", owned(old.pod_disruption_budget));
+    rig.round(0).await;
+    let applies: Vec<Request> = rig
+        .api
+        .calls()
+        .into_iter()
+        .filter(|c| c.what.starts_with("apply "))
+        .collect();
+    assert_eq!(applies.len(), 3);
+    for kind in ["Deployment", "Service", "PodDisruptionBudget"] {
+        let held = rig.api.get(kind, "shop", "web-mimic").unwrap();
+        let owners = held["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(owners.len(), 1, "{kind}");
+        assert_eq!(owners[0]["uid"], "uid-web", "{kind}");
+    }
+    assert_eq!(count(&rig.metrics[0], "conflict"), 0);
+}
+
+/// The deletes of the three objects `name` of `shop`, with their UIDs.
+fn deletes_of(rig: &Rig, name: &str) -> Vec<String> {
+    ["Deployment", "Service", "PodDisruptionBudget"]
+        .iter()
+        .map(|kind| {
+            let uid = rig.api.get(kind, "shop", name).unwrap()["metadata"]["uid"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            format!("delete {kind} shop/{name} {uid}")
+        })
+        .collect()
+}
+
+fn deletes(rig: &Rig) -> Vec<String> {
+    rig.api
+        .whats()
+        .into_iter()
+        .filter(|w| w.starts_with("delete "))
+        .collect()
+}
+
+#[tokio::test]
+async fn gw_13_not_accepted_or_another_class_deletes_the_managed_objects() {
+    // (a) The only listener changed to TCP.
+    let rig = fixture(1);
+    converged(&rig).await;
+    let expected = deletes_of(&rig, "web-mimic");
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["spec"]["listeners"] = json!([{"name": "tcp", "port": 9000, "protocol": "TCP"}]);
+    });
+    rig.round(0).await;
+    assert_eq!(deletes(&rig), expected);
+    assert!(
+        rig.api
+            .whats()
+            .contains(&"get PodDisruptionBudget shop/web-mimic".to_string())
+    );
+    assert_eq!(rig.api.get("Deployment", "shop", "web-mimic"), None);
+
+    // (b) The class changed to one of another controller.
+    let rig = fixture(1);
+    converged(&rig).await;
+    let expected = deletes_of(&rig, "web-mimic");
+    rig.api.put(
+        "GatewayClass",
+        class_object("istio", "istio.io/gateway-controller"),
+    );
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["spec"]["gatewayClassName"] = json!("istio");
+    });
+    rig.round(0).await;
+    assert_eq!(deletes(&rig), expected);
+    assert_eq!(rig.api.get("Service", "shop", "web-mimic"), None);
+}
+
+/// Managed Deployment, Service and PodDisruptionBudget `<gateway>-mimic` of `namespace`, owned
+/// by a Gateway of UID `owner`.
+fn managed(rig: &Rig, namespace: &str, gateway: &str, owner: &str) {
+    let gw: Gateway = Gateway {
+        uid: owner.into(),
+        ..super::tests_reconcile::gateway(namespace, gateway, vec![listener("http", 80, "HTTP")])
+    };
+    let all = settings(&["shop", namespace]);
+    let acceptance = accept::gateway(&gw, &class("mimic"), &all);
+    let objects = objects::objects(&gw, &acceptance, &all).unwrap();
+    rig.api.put("Deployment", objects.deployment);
+    rig.api.put("Service", objects.service);
+    rig.api
+        .put("PodDisruptionBudget", objects.pod_disruption_budget);
+}
+
+#[tokio::test]
+async fn gw_13_orphans_are_deleted_with_their_pod_disruption_budget() {
+    let rig = fixture(1);
+    converged(&rig).await;
+    managed(&rig, "shop", "ghost", "uid-x");
+    let expected = deletes_of(&rig, "ghost-mimic");
+    rig.round(0).await;
+    assert_eq!(deletes(&rig), expected);
+    assert_eq!(
+        rig.api.get("PodDisruptionBudget", "shop", "ghost-mimic"),
+        None
+    );
+    assert!(rig.api.get("Deployment", "shop", "web-mimic").is_some());
+}
+
+#[tokio::test]
+async fn gw_13_what_is_never_deleted() {
+    // An unmanaged object of a generated name, and managed objects in a namespace not listed.
+    let rig = fixture(1);
+    squatter(&rig, "web-mimic");
+    managed(&rig, "other", "edge", "uid-x");
+    rig.api
+        .put("Gateway", gateway_object("other", "edge", json!([])));
+    for _ in 0..3 {
+        rig.round(0).await;
+    }
+    assert_eq!(deletes(&rig), Vec::<String>::new());
+
+    // A deleted Gateway: the garbage collector deletes its objects.
+    let rig = fixture(1);
+    converged(&rig).await;
+    rig.api.remove("Gateway", "shop", "web");
+    rig.replicas[0].feed_gateways(Event::Delete(key("shop", "web")));
+    for _ in 0..3 {
+        rig.round(0).await;
+    }
+    assert_eq!(rig.api.whats(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn gw_13_no_delete_before_the_first_list_or_while_the_crd_is_absent() {
+    let rig = fixture(1);
+    managed(&rig, "shop", "ghost", "uid-x");
+    let r = &rig.replicas[0];
+    // (a) Everything listed but the Services.
+    rig.read_partial(0);
+    r.pass(NOW).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new(), "services not listed");
+    // (b) Listed, the CRD absent.
+    rig.read(0);
+    r.crd(false);
+    r.pass(NOW).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new(), "the CRD absent");
+    // Listed and present: the deletes.
+    let expected = deletes_of(&rig, "ghost-mimic");
+    rig.round(0).await;
+    assert_eq!(deletes(&rig), expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gw_14_failures_back_off_and_warn_once_per_streak() {
+    let lines = Lines::default();
+    let _guard = json_lines(&lines);
+    let rig = fixture(1);
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["spec"]["listeners"][0]["hostname"] = json!(format!("{CANARY}.example.com"));
+    });
+    let mut bad = gateway_object("shop", "bad", http(81));
+    bad["spec"]["infrastructure"] = json!({"annotations": {"example.com/x": CANARY}});
+    rig.api.put("Gateway", bad);
+    let apply = "apply Deployment shop/web-mimic";
+    rig.api.fail(apply, "InternalError", 500);
+    rig.api.fail(apply, "Invalid", 422);
+    for _ in 0..6 {
+        rig.api.fail(apply, "InternalError", 500);
+    }
+    rig.api
+        .fail("status Gateway shop/bad", "InternalError", 500);
+    let start = Instant::now();
+    rig.read(0);
+    tokio::spawn(rig.replicas[0].clone().run());
+    tokio::time::sleep(Duration::from_secs(130)).await;
+
+    let tries: Vec<(u64, bool)> = rig
+        .api
+        .calls()
+        .into_iter()
+        .filter(|c| c.what == apply)
+        .map(|c| ((c.at - start).as_millis() as u64, c.ok))
+        .collect();
+    let expected = [0, 1, 3, 7, 15, 31, 61, 91, 121];
+    assert_eq!(tries.len(), expected.len(), "{tries:?}");
+    for ((at, ok), want) in tries.iter().zip(expected) {
+        assert!(at.abs_diff(want * 1000) <= 10, "{tries:?}");
+        assert_eq!(*ok, want == 121, "{tries:?}");
+    }
+    // 8 for `web`, 1 for `bad`.
+    assert_eq!(count(&rig.metrics[0], "error"), 9);
+    let text = lines_of(&lines);
+    let warns = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains("gateway reconcile failed"))
+            .map(str::to_string)
+            .collect()
+    };
+    let first = warns(&text);
+    assert_eq!(first.len(), 2, "one per Gateway and streak");
+    let web = first
+        .iter()
+        .find(|l| l.contains(r#""gateway":"shop/web""#))
+        .unwrap();
+    assert!(
+        web.contains(r#""kind":"Deployment""#) && web.contains(r#""error":"InternalError 500""#)
+    );
+    let bad = first
+        .iter()
+        .find(|l| l.contains(r#""gateway":"shop/bad""#))
+        .unwrap();
+    assert!(bad.contains(r#""kind":"Gateway""#));
+
+    // A new failure after the success: a new streak, a new WARN.
+    rig.api
+        .fail("apply Service shop/web-mimic", "InternalError", 500);
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["spec"]["listeners"][0]["port"] = json!(8080);
+    });
+    rig.read(0);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let text = lines_of(&lines);
+    assert_eq!(warns(&text).len(), 3);
+    assert!(
+        !text.contains(CANARY),
+        "no hostname or annotation value in a log line"
+    );
+}
+
+#[tokio::test]
+async fn gw_15_no_object_request_outside_the_listed_namespaces() {
+    let rig = fixture(1);
+    rig.api.remove("Gateway", "shop", "web");
+    rig.api
+        .put("Gateway", gateway_object("other", "web", http(80)));
+    managed(&rig, "other", "ghost", "uid-x");
+    rig.round(0).await;
+    assert_eq!(whats(&rig), s(&["status Gateway other/web"]));
+}
+
+#[tokio::test]
+async fn gw_17_states_results_and_programmed_lines() {
+    let lines = Lines::default();
+    let _guard = json_lines(&lines);
+    let rig = fixture(1);
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["spec"]["listeners"][0]["hostname"] = json!("shop.example.com");
+    });
+    rig.api
+        .put("Gateway", gateway_object("shop", "slow", http(80)));
+    rig.api.put(
+        "Gateway",
+        gateway_object(
+            "shop",
+            "tcp",
+            json!([{"name": "tcp", "port": 9000, "protocol": "TCP"}]),
+        ),
+    );
+    rig.round(0).await;
+    ready(&rig, "web-mimic", 2);
+    ready(&rig, "slow-mimic", 0);
+    rig.round(0).await;
+    rig.round(0).await;
+    let states: Vec<i64> = ["programmed", "pending", "not_accepted"]
+        .iter()
+        .map(|s| state(&rig.metrics[0], s))
+        .collect();
+    assert_eq!(states, [1, 1, 1]);
+    let mut encoded = String::new();
+    prometheus_client::encoding::text::encode(&mut encoded, &rig.registry).unwrap();
+    let results: BTreeSet<&str> = encoded
+        .lines()
+        .filter(|l| l.starts_with("mimic_gateway_reconciles_total{"))
+        .filter_map(|l| l.split('"').nth(1))
+        .collect();
+    assert_eq!(
+        results,
+        BTreeSet::from(["conflict", "error", "invalid", "ok"])
+    );
+    for name in ["web", "slow", "tcp", "shop", "example.com", "namespace="] {
+        assert!(!encoded.contains(name), "no series names {name}");
+    }
+
+    // Programmed True, False, True: two INFO lines.
+    ready(&rig, "web-mimic", 0);
+    rig.round(0).await;
+    rig.round(0).await;
+    ready(&rig, "web-mimic", 2);
+    rig.round(0).await;
+    rig.round(0).await;
+    let text = lines_of(&lines);
+    let info: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("gateway programmed"))
+        .collect();
+    assert_eq!(info.len(), 2);
+    assert!(info.iter().all(|l| l.contains(r#""gateway":"shop/web""#)));
 }

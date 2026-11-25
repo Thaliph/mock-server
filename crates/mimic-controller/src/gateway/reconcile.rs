@@ -6,13 +6,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use mimic_core::gateway::input::{Gateway, GatewayClass, Observed};
+use mimic_core::gateway::input::{DeploymentState, Gateway, GatewayClass, Observed, ServiceState};
 use mimic_core::gateway::status::Plan;
 use mimic_core::gateway::{Settings, accept, status};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::cluster::{Cluster, StatusTarget};
+use super::convert::Seen;
 use super::metrics::{GatewayMetrics, STATES};
 use crate::mesh::Event;
 use crate::mesh::convert::Key;
@@ -26,6 +27,8 @@ const RETRY: Duration = Duration::from_secs(30);
 struct Tables {
     classes: Table<GatewayClass>,
     gateways: Table<Gateway>,
+    deployments: Table<Seen<DeploymentState>>,
+    services: Table<Seen<ServiceState>>,
     /// The `gateways` CRD is served: false until the first look.
     crd: bool,
 }
@@ -80,6 +83,18 @@ impl Reconciler {
 
     pub fn feed_gateways(&self, event: Event<Gateway>) {
         if lock(&self.tables).gateways.feed(event) {
+            self.changed();
+        }
+    }
+
+    pub fn feed_deployments(&self, event: Event<Seen<DeploymentState>>) {
+        if lock(&self.tables).deployments.feed(event) {
+            self.changed();
+        }
+    }
+
+    pub fn feed_services(&self, event: Event<Seen<ServiceState>>) {
+        if lock(&self.tables).services.feed(event) {
             self.changed();
         }
     }

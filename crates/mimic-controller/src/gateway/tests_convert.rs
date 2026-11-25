@@ -1,5 +1,5 @@
 //! GW-02: `Gateway` and `GatewayClass` objects as the input structs of
-//! `mimic_core::gateway::input`.
+//! `mimic_core::gateway::input`; GW-08: the gateway Deployments and Services as their `Seen`.
 
 use kube::api::DynamicObject;
 use mimic_core::gateway::input::{
@@ -290,4 +290,128 @@ fn gw_02_only_mimic_classes_convert() {
     let mut nameless = class("x", mimic, false);
     nameless.metadata.name = None;
     assert_eq!(convert::class(&nameless), None);
+}
+
+fn deployment(labels: Value) -> k8s_openapi::api::apps::v1::Deployment {
+    serde_json::from_value(json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"namespace": "shop", "name": "web-mimic", "uid": "uid-d", "generation": 3,
+                     "labels": labels,
+                     "ownerReferences": [
+                         {"apiVersion": "v1", "kind": "ConfigMap", "name": "c", "uid": "uid-c"},
+                         {"apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
+                          "name": "web", "uid": "uid-web", "controller": true}]},
+        "spec": {"replicas": 2, "selector": {"matchLabels": {"mimic.platform.io/gateway": "web"}},
+                 "template": {"metadata": {"labels": {"mimic.platform.io/gateway": "web"}},
+                              "spec": {"containers": [{"name": "gateway", "image": "i"}]}}},
+        "status": {"observedGeneration": 2, "availableReplicas": 1, "replicas": 2,
+                   "conditions": [{"type": "ReplicaFailure", "status": "True"},
+                                  {"type": "Available", "status": "False"}]},
+    }))
+    .unwrap()
+}
+
+fn managed_labels() -> Value {
+    json!({"app.kubernetes.io/managed-by": "mimic", "mimic.platform.io/gateway": "web"})
+}
+
+#[test]
+fn gw_08_deployment_and_service_convert_to_their_seen_state() {
+    use mimic_core::gateway::input::{DeploymentState, Ingress, ServiceState};
+
+    let (key, seen) = convert::deployment(&deployment(managed_labels())).unwrap();
+    assert_eq!(key, ("shop".to_string(), "web-mimic".to_string()));
+    let expected = convert::Seen {
+        uid: "uid-d".into(),
+        gateway: "web".into(),
+        managed: true,
+        owner: Some("uid-web".into()),
+        digest: seen.digest,
+        state: DeploymentState {
+            generation: 3,
+            observed_generation: 2,
+            available_replicas: 1,
+            replica_failure: true,
+        },
+    };
+    assert_eq!(seen, expected);
+
+    // The digest: the same without a status change, another with a label change.
+    let mut moved = deployment(managed_labels());
+    moved.status = None;
+    moved.metadata.resource_version = Some("99".into());
+    let (_, still) = convert::deployment(&moved).unwrap();
+    assert_eq!(still.digest, seen.digest);
+    assert_eq!(still.state.available_replicas, 0);
+    let mut labels = managed_labels();
+    labels["team"] = json!("x");
+    let (_, relabelled) = convert::deployment(&deployment(labels)).unwrap();
+    assert_ne!(relabelled.digest, seen.digest);
+    let mut scaled = deployment(managed_labels());
+    scaled.spec.as_mut().unwrap().replicas = Some(3);
+    assert_ne!(convert::deployment(&scaled).unwrap().1.digest, seen.digest);
+
+    // Managed only with both labels.
+    let (_, unmanaged) =
+        convert::deployment(&deployment(json!({"mimic.platform.io/gateway": "web"}))).unwrap();
+    assert!(!unmanaged.managed);
+    assert!(convert::managed_for(&managed_labels(), "web"));
+    assert!(!convert::managed_for(&managed_labels(), "shop"));
+    assert!(!convert::managed_for(
+        &json!({"mimic.platform.io/gateway": "web"}),
+        "web"
+    ));
+
+    let service = |spec: Value, status: Value| -> k8s_openapi::api::core::v1::Service {
+        serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"namespace": "shop", "name": "web-mimic", "uid": "uid-s",
+                         "labels": managed_labels()},
+            "spec": spec, "status": status,
+        }))
+        .unwrap()
+    };
+    let (_, dual) = convert::service(&service(
+        json!({"clusterIPs": ["10.96.0.10", "fd00::10"]}),
+        json!({}),
+    ))
+    .unwrap();
+    assert_eq!(
+        dual.state,
+        ServiceState {
+            service_type: "ClusterIP".into(),
+            cluster_ips: vec!["10.96.0.10".into(), "fd00::10".into()],
+            ingress: vec![],
+        }
+    );
+    assert_eq!(dual.owner, None);
+    let (_, balanced) = convert::service(&service(
+        json!({"type": "LoadBalancer", "clusterIPs": ["None"]}),
+        json!({"loadBalancer": {"ingress": [{"ip": "192.0.2.1"}, {"hostname": "lb.example.com"}]}}),
+    ))
+    .unwrap();
+    assert_eq!(
+        balanced.state,
+        ServiceState {
+            service_type: "LoadBalancer".into(),
+            cluster_ips: vec![],
+            ingress: vec![
+                Ingress {
+                    ip: Some("192.0.2.1".into()),
+                    hostname: None
+                },
+                Ingress {
+                    ip: None,
+                    hostname: Some("lb.example.com".into())
+                },
+            ],
+        }
+    );
+    assert_eq!(balanced.digest, {
+        let again = service(
+            json!({"type": "LoadBalancer", "clusterIPs": ["None"]}),
+            json!({}),
+        );
+        convert::service(&again).unwrap().1.digest
+    });
 }

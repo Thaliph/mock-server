@@ -3,13 +3,18 @@
 //! annotation, `managedFields` or annotation value (but the replicas one) leaves the object. A
 //! field the converter does not know is kept as its path only.
 
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::DynamicObject;
 use mimic_core::gateway::input::{
-    Gateway, GatewayClass, Infrastructure, Listener, ObservedStatus, RouteKind,
+    DeploymentState, Gateway, GatewayClass, Infrastructure, Ingress, Listener, ObservedStatus,
+    RouteKind, ServiceState,
 };
-use mimic_core::gateway::{CONTROLLER_NAME, REPLICAS_ANNOTATION};
+use mimic_core::gateway::{CONTROLLER_NAME, GATEWAY_LABEL, REPLICAS_ANNOTATION};
 use mimic_core::mesh::input::GATEWAY_GROUP;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::mesh::convert::{Key, MAX_SPEC_BYTES, key, list, port, text, unknown};
 
@@ -172,4 +177,73 @@ pub fn class(object: &DynamicObject) -> Option<(Key, GatewayClass)> {
         observed: list(status, "conditions").to_vec(),
     };
     Some(((String::new(), name), class))
+}
+
+/// The label that marks an object as mimic's (with [`GATEWAY_LABEL`]).
+const MANAGED_BY: &str = "app.kubernetes.io/managed-by";
+
+/// What the reconciler keeps of a watched gateway Deployment or Service: never the object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen<S> {
+    pub uid: String,
+    /// The value of `mimic.platform.io/gateway`.
+    pub gateway: String,
+    /// `app.kubernetes.io/managed-by` is `mimic`.
+    pub managed: bool,
+    /// The UID of the controller owner reference of kind `Gateway`.
+    pub owner: Option<String>,
+    /// [`digest`] of the labels, owner references and `spec`: a status change leaves it.
+    pub digest: u64,
+    pub state: S,
+}
+
+/// The object is managed by mimic for the Gateway `gateway`: both labels (§7.10).
+pub fn managed_for(labels: &Value, gateway: &str) -> bool {
+    labels[MANAGED_BY] == "mimic" && labels[GATEWAY_LABEL] == gateway
+}
+
+/// The first 8 bytes of the SHA-256 of `{labels, ownerReferences, spec}` of a typed object, so
+/// that the watch and the answer of an apply give the same value.
+pub fn digest(meta: &ObjectMeta, spec: &impl serde::Serialize) -> u64 {
+    let parts = json!({
+        "labels": meta.labels,
+        "ownerReferences": meta.owner_references,
+        "spec": spec,
+    });
+    let hash = Sha256::digest(parts.to_string().as_bytes());
+    let mut first = [0; 8];
+    first.copy_from_slice(&hash[..8]);
+    u64::from_be_bytes(first)
+}
+
+fn seen<S>(meta: &ObjectMeta, digest: u64, state: S) -> Option<(Key, Seen<S>)> {
+    let key = key(meta)?;
+    let label = |name: &str| meta.labels.as_ref().and_then(|l| l.get(name)).cloned();
+    let owner = meta
+        .owner_references
+        .iter()
+        .flatten()
+        .find(|o| o.controller == Some(true) && o.kind == "Gateway")
+        .map(|o| o.uid.clone());
+    let seen = Seen {
+        uid: meta.uid.clone().unwrap_or_default(),
+        gateway: label(GATEWAY_LABEL).unwrap_or_default(),
+        managed: label(MANAGED_BY).as_deref() == Some("mimic"),
+        owner,
+        digest,
+        state,
+    };
+    Some((key, seen))
+}
+
+/// A gateway Deployment: its replicas and generations.
+pub fn deployment(object: &Deployment) -> Option<(Key, Seen<DeploymentState>)> {
+    let _ = (object, seen::<DeploymentState>);
+    None
+}
+
+/// A gateway Service: its type and addresses.
+pub fn service(object: &Service) -> Option<(Key, Seen<ServiceState>)> {
+    let _ = object;
+    None
 }
