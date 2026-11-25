@@ -36,6 +36,8 @@ namespace is `ResolvedRefs: False` (`RefNotPermitted`). Installing or removing t
 controller looks again every 30 s (`gateway api crds found`). Older or experimental-channel CRDs are not
 supported (see [Mesh](Mesh#routes)).
 
+The [gateway](Gateway) (`gateway.enabled`) needs these CRDs at install: without them the chart fails.
+
 ## Try it on kind
 
 To try mimic on a laptop you need [kind](https://kind.sigs.k8s.io/) and Docker. The defaults are enough for

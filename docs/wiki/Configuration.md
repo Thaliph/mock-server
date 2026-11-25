@@ -70,6 +70,11 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `mesh.enabled` | `true` | Kill switch of the mesh view: `false` sets `MIMIC_MESH=off` on the controller; it serves no view (`404`), watches nothing and its ClusterRole drops the mesh rules. |
 | `mesh.staleAfter`, `mesh.startupWait` | `60s`, `2s` | `MIMIC_MESH_STALE_AFTER` and `MIMIC_MESH_STARTUP_WAIT`: the controller hands them to the sidecars it injects, with `MIMIC_MESH` (from `mesh.enabled`). A sidecar's view is stale after `staleAfter` without contact; a sidecar without a view waits `startupWait` for its first one before `/readyz` answers `200`. |
 | `mesh.clusterName`, `mesh.watchTimeout`, `mesh.debounce`, `mesh.viewCacheBytes`, `mesh.maxServices`, `mesh.maxEndpoints`, `mesh.maxViewBytes`, `mesh.maxWatches` | `local`, `30s`, `100ms`, `64Mi`, `1024`, `10000`, `4Mi`, `10000` | The variables of the same names below (`MIMIC_CLUSTER_NAME`, `MIMIC_MESH_WATCH_TIMEOUT`, ...). |
+| `gateway.enabled` | `false` | The [gateway](Gateway): renders the GatewayClass `mimic`, its RBAC, its admission policy and the `MIMIC_GATEWAY_*` variables. Needs `mesh.enabled`, `image.digest`, a non-empty `gateway.namespaces` and the Gateway API CRDs at install; else the chart fails with a message that names the missing one. |
+| `gateway.namespaces` | `[]` | Namespaces whose Gateways get objects. Each must exist at install (the chart renders a RoleBinding in it). `MIMIC_GATEWAY_NAMESPACES`, sorted. |
+| `gateway.serviceType` | `ClusterIP` | `ClusterIP`, `NodePort` or `LoadBalancer`. `MIMIC_GATEWAY_SERVICE_TYPE`. |
+| `gateway.maxReplicas` | `10` | 1-100. `MIMIC_GATEWAY_MAX_REPLICAS`. |
+| `gateway.resources` | requests `100m` / `64Mi`; limit memory `128Mi` | Resources of the gateway container. `MIMIC_GATEWAY_RESOURCES`. |
 | `inject.initImage.repository` | `ghcr.io/thaliph/mimic-init` | |
 | `inject.initImage.tag` / `.digest` | `""` / `""` | Tag defaults to the appVersion; digest wins. |
 | `inject.sidecarResources` | requests `50m` / `64Mi`; limit memory `128Mi` | Resources of `mimic-sidecar` in injected pods (JSON in `MIMIC_INJECT_SIDECAR_RESOURCES`). |
@@ -157,6 +162,10 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_SIDECAR_API_MAX_WATCHES` | `10000` | Held view requests at once per replica, 1-1000000; over it `503` with `Retry-After: 1`. |
 | `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD` | `2` | Held view requests at once per pod, 1-100; over it `503` `watch_limit` at once. Not set by the chart. |
 | `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT` | `25` | Share of `MIMIC_SIDECAR_API_MAX_WATCHES` one namespace may hold at once, 1-100 %, at least the per-pod cap. Not set by the chart. |
+| `MIMIC_GATEWAY_NAMESPACES` | empty | Namespaces whose Gateways of a mimic class get objects ([Gateway](Gateway)): comma-separated DNS-1123 labels, at most 256, distinct. Empty: no Gateway, GatewayClass, labelled Deployment or Service is watched. Set with `MIMIC_MESH=off`: exit 2 (chart: `gateway.namespaces`). |
+| `MIMIC_GATEWAY_SERVICE_TYPE` | `ClusterIP` | `type` of the gateway Services: `ClusterIP`, `NodePort` or `LoadBalancer` (chart: `gateway.serviceType`). |
+| `MIMIC_GATEWAY_MAX_REPLICAS` | `10` | Highest `mimic.platform.io/replicas` accepted, 1-100 (chart: `gateway.maxReplicas`). |
+| `MIMIC_GATEWAY_RESOURCES` | `{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | Gateway container `resources`, JSON (chart: `gateway.resources`). The gateway image is `MIMIC_INJECT_SIDECAR_IMAGE` and its `MIMIC_LOG` is `MIMIC_INJECT_SIDECAR_LOG`. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API; plain HTTP, loopback peers only. |
 
 ### Sidecar
@@ -202,6 +211,19 @@ Set by the webhook; the defaults are what it sets unless noted.
 | `MIMIC_MOCK_PASSTHROUGH` | empty | Destinations a mocked pod still reaches for real, the `spec.tls.exclude` grammar. Set by the webhook from `spec.mock.passthrough`. |
 | `MIMIC_MOCK_MAX_PENDING` | `1024` | Mocked requests pending at once; more get `599` (`overload`). 1-65536. Sized with the 128 Mi sidecar limit. |
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Set by the webhook from `spec.discovery.redact`. At most 64 names. |
+
+### Gateway role
+
+The gateway Deployment sets `MIMIC_ROLE=gateway` ([Gateway](Gateway#the-gateway-pod)). In this role the sidecar
+variables above are ignored and none is required, except `MIMIC_MAX_CONNECTIONS` (over all listeners). The common
+variables apply.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIMIC_ROLE` | `sidecar` | `sidecar` or `gateway`; anything else exits 2. The webhook never sets `gateway`. |
+| `MIMIC_GATEWAY_PORTS` | required in the gateway role | Listener ports, comma-separated: 1 to 64 distinct numbers from 1 to 65535, not the admin port. Set by the controller. |
+| `MIMIC_GATEWAY_HEADER_TIMEOUT` | `10s` | Time for a request head on a gateway listener, 1s-5m. Not set by the controller. |
+| `MIMIC_GATEWAY_IDLE_TIMEOUT` | `60s` | An idle keep-alive connection of a gateway listener is closed after this time, 1s-1h. Not set by the controller. |
 
 ### `mimic-init` and `mimic-trust`
 

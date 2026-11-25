@@ -19,9 +19,11 @@
 | M4 | [Fault injection](m4-faults.md) | #452 | `FLT-01` to `FLT-32` (§12.28) | delivered with #452 |
 | M5 | [The admission contract in the inbound sidecar](m5-admission.md) | #453 | `ADM-01` to `ADM-34` (§12.29) | delivered with #453 |
 | M5 | [Signalling: metrics, dashboards, load tests counting refusals](m5-admission.md#signalling-454) | #454 | `ADM-50` to `ADM-66` (§12.29) | in progress |
+| M6 | [The GatewayClass `mimic` and the Gateway reconciler](m6-gateway.md) | #456 | `GW-01` to `GW-30` (§12.30) | delivered with #456 |
 
-The autoscaling (#455) of M5 and the north-south gateway (M6) are not started. Mesh
-traffic management beyond these milestones is v2.
+The autoscaling (#455) of M5 is not started. Of the north-south gateway (M6), the GatewayClass and the Gateway
+reconciler are #456; the HTTP data plane (#457) and HTTPS listeners (#458) are not started. Mesh traffic management
+beyond these milestones is v2.
 
 ## One request through the mesh, and which milestone added each step
 
@@ -67,6 +69,6 @@ caller's sidecar retries it on another pod at the "proxy-level failure" edge abo
 
 | Layer | Modules |
 |---|---|
-| `mimic-core` (pure: no tokio, no I/O, no clock; times and random draws are passed in) | `mesh::input`, `mesh::policy`, `mesh::view`, `mesh::route`, `mesh::lb`, `mesh::retry`, `mesh::timeout`, `mesh::mirror`, `mesh::outlier`, `mesh::fault`, `mesh::admission`, `mesh::strip`, `mesh::head` |
+| `mimic-core` (pure: no tokio, no I/O, no clock; times and random draws are passed in) | `gateway::input`, `gateway::accept`, `gateway::objects`, `gateway::status` (M6), `mesh::input`, `mesh::policy`, `mesh::view`, `mesh::route`, `mesh::lb`, `mesh::retry`, `mesh::timeout`, `mesh::mirror`, `mesh::outlier`, `mesh::fault`, `mesh::admission`, `mesh::strip`, `mesh::head` |
 | `mimic-controller` | `mesh::watch` (reflectors), `mesh::convert` (objects to input structs), `mesh::hub` (debounce, build, cache, long-poll), `mesh::status` (`MimicConfig` and `HTTPRoute` status), `mesh::config`, `mesh::metrics` |
 | `mimic-sidecar` | `mesh::follow` (long-poll), `mesh::store` (state file), `mesh::router` (per-port tables, budgets, outlier state, breaker counts), `mesh::serve` (per-request path), `mesh::dial` (L4 and TLS), `mesh::pool`, `mesh::replay` (body bytes held for retries and mirrors), `mesh::gate` (the HTTP/1 head reader in front of `hyper`), `mesh::admit` (the pod's admission state and its queue timer), `mesh::metrics` |

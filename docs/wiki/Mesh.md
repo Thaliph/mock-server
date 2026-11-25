@@ -1129,4 +1129,5 @@ INFO line `admission contract changed` are in [Monitoring](Monitoring#admission-
 - **M5**: the admission contract is in ([Admission contract](#admission-contract)), and so are its metrics, the line
   `admission contract changed`, the dashboard rows and load tests counting refusals (#454,
   [Monitoring](Monitoring#admission-metrics)); the HPA (#455) is coming.
-- **M6**: north-south gateway.
+- **M6**: north-south gateway. The GatewayClass `mimic` and the Gateway reconciler are in ([Gateway](Gateway)):
+  each Gateway gets its own gateway pods, which answer `404` `no-route`. Routing comes with #457, HTTPS with #458.

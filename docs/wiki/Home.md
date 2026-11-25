@@ -77,6 +77,7 @@ readable through a small API. [Concepts](Concepts) explains the parts.
 | [Egress aggregation](Egress-aggregation) | Outbound calls per pod, merged by the controller, outbound documents, fallback to older controllers |
 | [Reading the API](Reading-the-API) | The read API endpoints (reports, OpenAPI documents, load test runs) and example output |
 | [Load test](Load-test) | Load-testing a mocked deployment: the `MimicLoadTest`, safety guarantees, results |
+| [Gateway](Gateway) | The mimic Gateway: enabling it, creating a Gateway, the generated objects, reading the status, what is refused |
 | [Monitoring](Monitoring) | Scrape objects, Valkey exporter, bundled Prometheus and Grafana, dashboards |
 | [Operations](Operations) | Metrics, logs, probes, sizing, Valkey, retention, scaling, shutdown |
 | [Security](Security) | Threat model summary, what reaches Valkey, RBAC, network, accepted limits |
