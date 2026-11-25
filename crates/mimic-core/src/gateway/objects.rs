@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use super::accept::Acceptance;
 use super::input::Gateway;
 use super::{
-    ADMIN_PORT, ADMIN_PORT_NAME, GATEWAY_API_VERSION, GATEWAY_LABEL, MAX_NAME, Settings, UID,
+    ADMIN_PORT, ADMIN_PORT_NAME, GATEWAY_API_VERSION, GATEWAY_LABEL, MANAGED_BY, MANAGER, MAX_NAME,
+    Settings, UID,
 };
 use crate::inject::literal;
 
@@ -83,7 +84,7 @@ pub fn objects(gw: &Gateway, acceptance: &Acceptance, settings: &Settings) -> Op
     let ports = acceptance.ports();
     let metadata = json!({
         "labels": {
-            "app.kubernetes.io/managed-by": "mimic",
+            MANAGED_BY: MANAGER,
             "app.kubernetes.io/name": APP_NAME,
             "gateway.networking.k8s.io/gateway-class-name": gw.class,
             "gateway.networking.k8s.io/gateway-name": gw.name,

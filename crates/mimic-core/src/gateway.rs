@@ -39,6 +39,10 @@ pub const MAX_LISTENERS: usize = 64;
 
 /// The label naming the Gateway of a generated object; the selector of its pods.
 pub const GATEWAY_LABEL: &str = "mimic.platform.io/gateway";
+/// The label that, with [`GATEWAY_LABEL`], marks an object as mimic's.
+pub const MANAGED_BY: &str = "app.kubernetes.io/managed-by";
+/// The value of [`MANAGED_BY`] on the generated objects.
+pub const MANAGER: &str = "mimic";
 /// Name of the admin container port.
 pub const ADMIN_PORT_NAME: &str = "mimic-admin";
 /// User and group of the gateway pod.
@@ -64,6 +68,12 @@ impl ServiceType {
             ServiceType::LoadBalancer => "LoadBalancer",
         }
     }
+}
+
+/// An object with `labels` is managed by mimic for the Gateway `gateway` (§7.10 "Apply,
+/// ownership and deletion"): it carries both labels of the generated objects.
+pub fn managed_for(labels: &Value, gateway: &str) -> bool {
+    labels[MANAGED_BY] == MANAGER && labels[GATEWAY_LABEL] == gateway
 }
 
 /// The controller configuration the pure functions read (§10.2).

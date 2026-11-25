@@ -5,8 +5,8 @@ use super::REPLICAS_ANNOTATION;
 use super::accept::{Acceptance, class as accept_class, gateway};
 use super::input::*;
 use super::testkit::*;
+use crate::condition::Condition;
 use crate::mesh::input::GATEWAY_GROUP;
-use crate::mesh::policy::Condition;
 
 fn cond(ok: bool, reason: &str, message: &str) -> Condition {
     Condition {

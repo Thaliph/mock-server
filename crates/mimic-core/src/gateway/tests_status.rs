@@ -6,7 +6,7 @@ use super::accept::{Acceptance, gateway};
 use super::input::*;
 use super::status::{self, Plan, programmed};
 use super::testkit::*;
-use crate::mesh::policy::Condition;
+use crate::condition::Condition;
 
 const T0: &str = "2026-01-01T00:00:00Z";
 const T1: &str = "2026-11-24T10:00:00Z";

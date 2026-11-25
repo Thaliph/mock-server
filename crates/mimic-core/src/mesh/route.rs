@@ -9,7 +9,7 @@ use super::input::{
     BackendRef, GATEWAY_GROUP, HeaderModifier, Mirror, NameMatch, ReferenceGrant, Route,
     RouteFilter, RouteMatch, RouteRule, Service,
 };
-use super::policy::Condition;
+use crate::condition::{Condition, bounded};
 mod apply;
 mod table;
 
@@ -168,9 +168,6 @@ pub struct Compiled {
     name: String,
     rules: Vec<RuleView>,
 }
-
-/// The longest `ResolvedRefs` message.
-const MAX_MESSAGE: usize = 1024;
 
 /// Header names a modifier may not touch (besides the `x-mimic-` prefix).
 const REFUSED_HEADERS: [&str; 9] = [
@@ -380,15 +377,6 @@ pub fn compile(route: &Route, services: &[Service], grants: Option<&[ReferenceGr
         name: format!("{}/{}", route.namespace, route.name),
         rules: if unsupported.is_none() { rules } else { vec![] },
     }
-}
-
-/// `text` cut to 1024 bytes on a character boundary (status messages).
-pub(crate) fn bounded(text: &str) -> String {
-    let mut end = text.len().min(MAX_MESSAGE);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
 }
 
 fn compile_rule(rule: &RouteRule, resolver: &mut Resolver) -> RuleView {

@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mimic_runtime::testing::{Process, wait_status};
+use mimic_runtime::testing::{Process, run_within, wait_status};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_mimic-sidecar");
 
@@ -42,45 +42,11 @@ pub fn gateway(ports: &[u16], extra: &[(&str, &str)]) -> (Process, SocketAddr) {
     (process, admin)
 }
 
-/// Runs the binary with only `PATH` and `env`, like `testing::run`, but kills it and fails
-/// after 10 s: a value wrongly accepted starts a gateway that never exits.
+/// Runs the binary with only `PATH` and `env`; kills it and fails after 10 s: a value wrongly
+/// accepted starts a gateway that never exits.
 pub fn run_bounded(env: &[(&str, &str)]) -> (Option<i32>, String, String) {
-    use std::process::{Command, Stdio};
-    let mut command = Command::new(BIN);
-    command
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in env {
-        command.env(k, v);
-    }
-    let mut child = command.spawn().expect("binary starts");
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("still running after 10 s: {env:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    (status.code(), out.join().unwrap(), err.join().unwrap())
+    let (status, out, err) = run_within(BIN, &[], env, Duration::from_secs(10));
+    (status.code(), out, err)
 }
 
 pub fn local(port: u16) -> SocketAddr {

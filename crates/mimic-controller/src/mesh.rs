@@ -27,4 +27,4 @@ mod tests_route;
 #[cfg(test)]
 mod tests_route_status;
 #[cfg(test)]
-mod tests_watch;
+pub(crate) mod tests_watch;

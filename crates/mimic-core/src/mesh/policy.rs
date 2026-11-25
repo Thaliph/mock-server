@@ -10,6 +10,7 @@ use super::input::{
     Config, FaultSpec, MIMIC_GROUP, ReferenceGrant, RouteMatch, Snapshot, TargetKind,
 };
 use super::route::{MatchView, match_unsupported, match_view};
+pub use crate::condition::Condition;
 
 /// `loadBalancer.slowStart` when no `MimicConfig` sets it, in seconds.
 pub const DEFAULT_SLOW_START_SECS: u32 = 30;
@@ -523,57 +524,6 @@ pub fn consents(
                 })
         })
     })
-}
-
-/// One status condition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Condition {
-    pub ok: bool,
-    pub reason: String,
-    pub message: String,
-}
-
-impl Condition {
-    pub(crate) fn ok(reason: &str) -> Condition {
-        Condition {
-            ok: true,
-            reason: reason.into(),
-            message: String::new(),
-        }
-    }
-
-    pub(crate) fn refused(reason: &str, message: String) -> Condition {
-        Condition {
-            ok: false,
-            reason: reason.into(),
-            message,
-        }
-    }
-
-    /// The condition as a `metav1.Condition` of type `kind`: `message` always present (a required
-    /// field) and cut to 1024 bytes; `previous` is the cluster's condition of the same type, whose
-    /// `lastTransitionTime` stays while the `status` does not change, else it is `now` (RTE-14).
-    pub fn to_json(
-        &self,
-        kind: &str,
-        generation: i64,
-        previous: Option<&serde_json::Value>,
-        now: &str,
-    ) -> serde_json::Value {
-        let status = if self.ok { "True" } else { "False" };
-        let since = previous
-            .filter(|p| p["status"] == status)
-            .and_then(|p| p["lastTransitionTime"].as_str())
-            .unwrap_or(now);
-        serde_json::json!({
-            "type": kind,
-            "status": status,
-            "reason": self.reason,
-            "message": super::route::bounded(&self.message),
-            "observedGeneration": generation,
-            "lastTransitionTime": since,
-        })
-    }
 }
 
 /// `status.conditions` of a `MimicConfig`.

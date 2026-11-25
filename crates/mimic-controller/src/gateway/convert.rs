@@ -11,7 +11,9 @@ use mimic_core::gateway::input::{
     DeploymentState, Gateway, GatewayClass, Infrastructure, Ingress, Listener, ObservedStatus,
     RouteKind, ServiceState,
 };
-use mimic_core::gateway::{CONTROLLER_NAME, GATEWAY_LABEL, REPLICAS_ANNOTATION};
+use mimic_core::gateway::{
+    CONTROLLER_NAME, GATEWAY_LABEL, MANAGED_BY, MANAGER, REPLICAS_ANNOTATION,
+};
 use mimic_core::mesh::input::GATEWAY_GROUP;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -179,9 +181,6 @@ pub fn class(object: &DynamicObject) -> Option<(Key, GatewayClass)> {
     Some(((String::new(), name), class))
 }
 
-/// The label that marks an object as mimic's (with [`GATEWAY_LABEL`]).
-const MANAGED_BY: &str = "app.kubernetes.io/managed-by";
-
 /// What the reconciler keeps of a watched gateway Deployment or Service: never the object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen<S> {
@@ -195,11 +194,6 @@ pub struct Seen<S> {
     /// [`digest`] of the labels, owner references and `spec`: a status change leaves it.
     pub digest: u64,
     pub state: S,
-}
-
-/// The object is managed by mimic for the Gateway `gateway`: both labels (§7.10).
-pub fn managed_for(labels: &Value, gateway: &str) -> bool {
-    labels[MANAGED_BY] == "mimic" && labels[GATEWAY_LABEL] == gateway
 }
 
 /// The first 8 bytes of the SHA-256 of `{labels, ownerReferences, spec}` of a typed object, so
@@ -228,7 +222,7 @@ fn seen<S>(meta: &ObjectMeta, digest: u64, state: S) -> Option<(Key, Seen<S>)> {
     let seen = Seen {
         uid: meta.uid.clone().unwrap_or_default(),
         gateway: label(GATEWAY_LABEL).unwrap_or_default(),
-        managed: label(MANAGED_BY).as_deref() == Some("mimic"),
+        managed: label(MANAGED_BY).as_deref() == Some(MANAGER),
         owner,
         digest,
         state,

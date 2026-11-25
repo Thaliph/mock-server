@@ -6,10 +6,9 @@
 use serde_json::{Value, json};
 
 use super::accept::{self, Acceptance, ListenerAcceptance};
-use super::input::{Gateway, GatewayClass, Observed};
+use super::input::{Gateway, GatewayClass, Observed, ObservedStatus};
 use super::{GATEWAY_API_VERSION, MAX_ADDRESSES};
-use crate::mesh::policy::Condition;
-use crate::mesh::route::bounded;
+use crate::condition::{Condition, bounded};
 
 /// Longest address value (the CRD's maximum).
 const MAX_ADDRESS: usize = 253;
@@ -59,6 +58,14 @@ pub fn programmed(acceptance: &Acceptance, observed: &Observed) -> Condition {
         }
         _ => Condition::refused("Pending", replicas),
     }
+}
+
+/// The cluster's status has `Programmed: True` (for the log line of a transition, §7.10).
+pub fn was_programmed(observed: &ObservedStatus) -> bool {
+    observed
+        .conditions
+        .iter()
+        .any(|c| c["type"] == "Programmed" && c["status"] == "True")
 }
 
 /// The Service's addresses: its `clusterIPs` for `ClusterIP` and `NodePort`, the ingress `ip`s

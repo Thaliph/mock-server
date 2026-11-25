@@ -2,6 +2,7 @@
 //! converted at once into the input structs of the hub, so that only the fields the view uses
 //! are kept in memory.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::core::PartialObjectMeta;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event as Watched};
+use mimic_core::mesh::input::GATEWAY_GROUP;
 
 use super::convert::{self, Key};
 use super::hub::{Event, Hub};
@@ -30,12 +32,13 @@ fn key_of<K: kube::Resource>(object: &K) -> Option<Key> {
 /// for an object that is not (or no longer) one of ours: it is removed. `crd` is the API of a
 /// kind served by a CRD: a watch on a deleted CRD fails with an error that is not a 404 (the
 /// API server's 404 body is plain text, read as a broken event stream), so after any watch
-/// error the resource is looked up and a 404 ends the watch.
+/// error the resource is looked up and a 404 ends the watch. `failed` logs the other errors.
 pub(crate) async fn forward<K, T, S>(
     events: S,
     convert: impl Fn(&K) -> Option<(Key, T)>,
     feed: impl Fn(Event<T>),
     crd: Option<&Api<DynamicObject>>,
+    failed: fn(&watcher::Error),
 ) where
     K: kube::Resource,
     S: Stream<Item = Result<Watched<K>, watcher::Error>>,
@@ -72,9 +75,43 @@ pub(crate) async fn forward<K, T, S>(
                 {
                     return;
                 }
-                tracing::warn!(error = %error, "mesh watch error");
+                failed(&error);
             }
         }
+    }
+}
+
+/// The log line of a failed mesh watch.
+fn mesh_error(error: &watcher::Error) {
+    tracing::warn!(error = %error, "mesh watch error");
+}
+
+/// A Gateway API resource (`gateway.networking.k8s.io`).
+pub(crate) fn gateway_api(version: &str, kind: &str) -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(GATEWAY_GROUP, version, kind))
+}
+
+/// Watches the resource of `api` for as long as its CRD is installed: a `list` with `limit=1`
+/// every `look`; served, `present(true)`, the `watch`, then `present(false)` once it ends (a
+/// deleted CRD); a 404, `present(false)`; any other error goes to `failed`.
+pub(crate) async fn while_crd<F: Future<Output = ()>>(
+    api: Api<DynamicObject>,
+    look: Duration,
+    present: impl Fn(bool),
+    watch: impl Fn(Api<DynamicObject>) -> F,
+    failed: impl Fn(&kube::Error),
+) {
+    loop {
+        match api.list(&ListParams::default().limit(1)).await {
+            Ok(_) => {
+                present(true);
+                watch(api.clone()).await;
+                present(false);
+            }
+            Err(kube::Error::Api(status)) if status.code == 404 => present(false),
+            Err(error) => failed(&error),
+        }
+        tokio::time::sleep(look).await;
     }
 }
 
@@ -101,7 +138,14 @@ async fn services(client: kube::Client, hub: Arc<Hub>) {
     loop {
         let api = Api::<Service>::all(client.clone());
         let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-        forward(events, convert::service, |e| hub.feed_services(e), None).await;
+        forward(
+            events,
+            convert::service,
+            |e| hub.feed_services(e),
+            None,
+            mesh_error,
+        )
+        .await;
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -110,7 +154,14 @@ async fn slices(client: kube::Client, hub: Arc<Hub>) {
     loop {
         let api = Api::<EndpointSlice>::all(client.clone());
         let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-        forward(events, convert::slice, |e| hub.feed_slices(e), None).await;
+        forward(
+            events,
+            convert::slice,
+            |e| hub.feed_slices(e),
+            None,
+            mesh_error,
+        )
+        .await;
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -125,6 +176,7 @@ async fn deployments(client: kube::Client, hub: Arc<Hub>) {
             |o| key_of(o).map(|key| (key, ())),
             |e| hub.feed_deployments(e),
             None,
+            mesh_error,
         )
         .await;
         tokio::time::sleep(RETRY).await;
@@ -140,7 +192,14 @@ async fn configs(client: kube::Client, hub: Arc<Hub>) {
     loop {
         let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
         let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-        forward(events, convert::config, |e| hub.feed_configs(e), None).await;
+        forward(
+            events,
+            convert::config,
+            |e| hub.feed_configs(e),
+            None,
+            mesh_error,
+        )
+        .await;
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -148,26 +207,32 @@ async fn configs(client: kube::Client, hub: Arc<Hub>) {
 /// `ReferenceGrant`s, when the Gateway API CRD exists: it may be installed after the controller
 /// started (and removed), so it is looked for again every [`RETRY`].
 async fn grants(client: kube::Client, hub: Arc<Hub>) {
-    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
-        "gateway.networking.k8s.io",
-        "v1beta1",
-        "ReferenceGrant",
-    ));
-    loop {
-        let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
-        match api.list(&ListParams::default().limit(1)).await {
-            Ok(_) => {
-                let events =
-                    watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
-                forward(events, convert::grant, |e| hub.feed_grants(e), Some(&api)).await;
-                // Gone while watched: nobody consents until it is back.
+    let api = Api::<DynamicObject>::all_with(client, &gateway_api("v1beta1", "ReferenceGrant"));
+    let hub = &*hub;
+    while_crd(
+        api,
+        RETRY,
+        // Absent, or gone while watched: nobody consents until it is back. A list says present.
+        |present| {
+            if !present {
                 hub.grants_absent();
             }
-            Err(kube::Error::Api(status)) if status.code == 404 => hub.grants_absent(),
-            Err(error) => tracing::warn!(error = %error, "ReferenceGrant CRD lookup failed"),
-        }
-        tokio::time::sleep(RETRY).await;
-    }
+        },
+        |api| async move {
+            let events =
+                watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
+            forward(
+                events,
+                convert::grant,
+                |e| hub.feed_grants(e),
+                Some(&api),
+                mesh_error,
+            )
+            .await;
+        },
+        |error| tracing::warn!(error = %error, "ReferenceGrant CRD lookup failed"),
+    )
+    .await;
 }
 
 /// How long to wait between two looks for the `HTTPRoute` CRD.
@@ -177,35 +242,36 @@ pub(crate) const CRD_LOOK: Duration = Duration::from_secs(30);
 /// started (and removed), so it is looked for again every [`CRD_LOOK`] (RTE-18). The hub logs
 /// the changes of presence.
 pub(super) async fn routes(client: kube::Client, hub: Arc<Hub>) {
-    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
-        "gateway.networking.k8s.io",
-        "v1",
-        "HTTPRoute",
-    ));
-    loop {
-        let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
-        match api.list(&ListParams::default().limit(1)).await {
-            Ok(_) => {
-                let events =
-                    watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
-                forward(
-                    events,
-                    convert::route_and_status,
-                    |e| {
-                        let (route, status) = e.split();
-                        hub.feed_routes(route);
-                        hub.feed_route_status(status);
-                    },
-                    Some(&api),
-                )
-                .await;
+    let api = Api::<DynamicObject>::all_with(client, &gateway_api("v1", "HTTPRoute"));
+    let hub = &*hub;
+    while_crd(
+        api,
+        CRD_LOOK,
+        // The first route event says present.
+        |present| {
+            if !present {
                 hub.routes_absent();
             }
-            Err(kube::Error::Api(status)) if status.code == 404 => hub.routes_absent(),
-            Err(error) => tracing::warn!(error = %error, "HTTPRoute CRD lookup failed"),
-        }
-        tokio::time::sleep(CRD_LOOK).await;
-    }
+        },
+        |api| async move {
+            let events =
+                watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
+            forward(
+                events,
+                convert::route_and_status,
+                |e| {
+                    let (route, status) = e.split();
+                    hub.feed_routes(route);
+                    hub.feed_route_status(status);
+                },
+                Some(&api),
+                mesh_error,
+            )
+            .await;
+        },
+        |error| tracing::warn!(error = %error, "HTTPRoute CRD lookup failed"),
+    )
+    .await;
 }
 
 /// Wakes the hub when the `MimicWorkload`s change what a sidecar's mode is.

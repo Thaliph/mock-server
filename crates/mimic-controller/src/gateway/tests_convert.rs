@@ -355,9 +355,9 @@ fn gw_08_deployment_and_service_convert_to_their_seen_state() {
     let (_, unmanaged) =
         convert::deployment(&deployment(json!({"mimic.platform.io/gateway": "web"}))).unwrap();
     assert!(!unmanaged.managed);
-    assert!(convert::managed_for(&managed_labels(), "web"));
-    assert!(!convert::managed_for(&managed_labels(), "shop"));
-    assert!(!convert::managed_for(
+    assert!(mimic_core::gateway::managed_for(&managed_labels(), "web"));
+    assert!(!mimic_core::gateway::managed_for(&managed_labels(), "shop"));
+    assert!(!mimic_core::gateway::managed_for(
         &json!({"mimic.platform.io/gateway": "web"}),
         "web"
     ));

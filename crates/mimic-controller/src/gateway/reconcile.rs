@@ -14,14 +14,14 @@ use mimic_core::gateway::input::{
     DeploymentState, Gateway, GatewayClass, ObjectKind, Observed, ServiceState,
 };
 use mimic_core::gateway::status::Plan;
-use mimic_core::gateway::{Settings, accept, objects, status};
+use mimic_core::gateway::{Settings, accept, managed_for, objects, status};
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::cluster::{ApiError, Cluster, StatusTarget};
-use super::convert::{self, Seen, managed_for};
-use super::metrics::{GatewayMetrics, STATES};
+use super::convert::{self, Seen};
+use super::metrics::{GatewayMetrics, GatewayState, Outcome};
 use crate::mesh::Event;
 use crate::mesh::convert::Key;
 use crate::mesh::table::Table;
@@ -59,6 +59,16 @@ impl Picture {
     fn class_of(&self, gw: &Gateway) -> Option<&GatewayClass> {
         self.classes.get(&(String::new(), gw.class.clone()))
     }
+
+    /// The watched Deployment `key` when it is managed for the Gateway `gateway`.
+    fn deployment(&self, key: &Key, gateway: &str) -> Option<&Seen<DeploymentState>> {
+        self.deployments.get(key).filter(|s| mine(s, gateway))
+    }
+
+    /// The watched Service `key` when it is managed for the Gateway `gateway`.
+    fn service(&self, key: &Key, gateway: &str) -> Option<&Seen<ServiceState>> {
+        self.services.get(key).filter(|s| mine(s, gateway))
+    }
 }
 
 /// What a pass keeps for the next one (in memory, one per replica).
@@ -72,7 +82,7 @@ struct State {
     /// The first object of a generated name that is not managed, of each Gateway.
     unmanaged: BTreeMap<Key, (ObjectKind, String)>,
     /// The state of each Gateway of a mimic class at its last pass, for the gauge.
-    states: BTreeMap<Key, &'static str>,
+    states: BTreeMap<Key, GatewayState>,
     resync_at: Instant,
 }
 
@@ -323,7 +333,7 @@ impl Reconciler {
             .conflicts
             .retain(|key| picture.gateways.contains_key(key));
         state.states = states;
-        for kind in STATES {
+        for kind in GatewayState::ALL {
             let n = state.states.values().filter(|s| **s == kind).count();
             self.metrics.set(kind, n);
         }
@@ -348,7 +358,7 @@ impl Reconciler {
         acceptance: &Acceptance,
         now: &str,
         at: Instant,
-    ) -> (&'static str, &'static str) {
+    ) -> (Outcome, GatewayState) {
         let key = (gw.namespace.clone(), gw.name.clone());
         let name = objects::name(&gw.name);
         let object_key = (gw.namespace.clone(), name.clone());
@@ -367,14 +377,10 @@ impl Reconciler {
         };
         let observed = Observed {
             deployment: picture
-                .deployments
-                .get(&object_key)
-                .filter(|s| mine(s, &gw.name))
+                .deployment(&object_key, &gw.name)
                 .map(|s| s.state.clone()),
             service: picture
-                .services
-                .get(&object_key)
-                .filter(|s| mine(s, &gw.name))
+                .service(&object_key, &gw.name)
                 .map(|s| s.state.clone()),
             unmanaged: state.unmanaged.get(&key).cloned(),
         };
@@ -388,12 +394,7 @@ impl Reconciler {
             };
             match self.cluster.apply_status(target, &body).await {
                 Ok(()) => {
-                    let was = gw
-                        .observed
-                        .conditions
-                        .iter()
-                        .any(|c| c["type"] == "Programmed" && c["status"] == "True");
-                    if programmed.ok && !was {
+                    if programmed.ok && !status::was_programmed(&gw.observed) {
                         tracing::info!(
                             gateway = name_of(&key),
                             generation = gw.generation,
@@ -410,25 +411,25 @@ impl Reconciler {
             }
         }
         let kept = if !acceptance.is_accepted() {
-            "not_accepted"
+            GatewayState::NotAccepted
         } else if programmed.ok {
-            "programmed"
+            GatewayState::Programmed
         } else {
-            "pending"
+            GatewayState::Pending
         };
         let result = match outcome {
             Err(failure) => {
                 state.failed(&key, &failure, at);
-                "error"
+                Outcome::Error
             }
             Ok(()) => {
                 state.failing.remove(&key);
                 if state.unmanaged.contains_key(&key) {
-                    "conflict"
+                    Outcome::Conflict
                 } else if !acceptance.is_accepted() {
-                    "invalid"
+                    Outcome::Invalid
                 } else {
-                    "ok"
+                    Outcome::Ok
                 }
             }
         };
@@ -548,18 +549,12 @@ impl Reconciler {
             (
                 ObjectKind::Deployment,
                 picture
-                    .deployments
-                    .get(object_key)
-                    .filter(|s| mine(s, gateway))
+                    .deployment(object_key, gateway)
                     .map(|s| s.uid.clone()),
             ),
             (
                 ObjectKind::Service,
-                picture
-                    .services
-                    .get(object_key)
-                    .filter(|s| mine(s, gateway))
-                    .map(|s| s.uid.clone()),
+                picture.service(object_key, gateway).map(|s| s.uid.clone()),
             ),
         ];
         let mut deleted = false;

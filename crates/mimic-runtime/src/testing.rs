@@ -136,22 +136,57 @@ impl Drop for Process {
     }
 }
 
-/// Runs `bin` to completion and returns its exit status, stdout and stderr.
+/// How long [`run`] lets a process run: a value wrongly accepted starts a server that never exits.
+pub const RUN_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Runs `bin` to completion and returns its exit status, stdout and stderr; kills it and fails
+/// after [`RUN_DEADLINE`].
 pub fn run(bin: &str, args: &[&str], env: &[(&str, &str)]) -> (ExitStatus, String, String) {
+    run_within(bin, args, env, RUN_DEADLINE)
+}
+
+/// [`run`] with only `PATH` and `env` in the environment and no stdin; kills the process and
+/// fails after `deadline`.
+pub fn run_within(
+    bin: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    deadline: Duration,
+) -> (ExitStatus, String, String) {
     let mut command = Command::new(bin);
     command
         .args(args)
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default());
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, v) in env {
         command.env(k, v);
     }
-    let out = command.output().expect("binary runs");
-    (
-        out.status,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    let mut child = command.spawn().expect("binary runs");
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let out = read(Box::new(child.stdout.take().unwrap()));
+    let err = read(Box::new(child.stderr.take().unwrap()));
+    let until = Instant::now() + deadline;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > until {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{bin} still running after {deadline:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    (status, out.join().unwrap(), err.join().unwrap())
 }
 
 /// Minimal HTTP/1.1 GET; returns the status code and the body.

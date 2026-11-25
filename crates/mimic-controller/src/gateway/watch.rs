@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Service;
-use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
+use kube::api::{Api, DynamicObject};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher;
 use mimic_core::gateway::GATEWAY_LABEL;
@@ -15,18 +15,15 @@ use super::cluster::ApiError;
 use super::convert;
 use super::reconcile::Reconciler;
 use crate::mesh::Hub;
-use crate::mesh::watch::{CRD_LOOK, RETRY, forward};
+use crate::mesh::watch::{CRD_LOOK, RETRY, forward, gateway_api, while_crd};
 
-fn resource(kind: &str) -> ApiResource {
-    ApiResource::from_gvk(&GroupVersionKind::gvk(
-        "gateway.networking.k8s.io",
-        "v1",
-        kind,
-    ))
+/// The log line of a failed gateway watch: the API status reason and code only.
+fn failed(error: &watcher::Error) {
+    tracing::warn!(error = %ApiError::from(error), "gateway watch error");
 }
 
 async fn classes(client: kube::Client, reconciler: Arc<Reconciler>) {
-    let resource = resource("GatewayClass");
+    let resource = gateway_api("v1", "GatewayClass");
     loop {
         let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
         let events = watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
@@ -35,6 +32,7 @@ async fn classes(client: kube::Client, reconciler: Arc<Reconciler>) {
             convert::class,
             |e| reconciler.feed_classes(e),
             Some(&api),
+            failed,
         )
         .await;
         tokio::time::sleep(RETRY).await;
@@ -53,6 +51,7 @@ async fn deployments(client: kube::Client, reconciler: Arc<Reconciler>) {
             convert::deployment,
             |e| reconciler.feed_deployments(e),
             None,
+            failed,
         )
         .await;
         tokio::time::sleep(RETRY).await;
@@ -69,6 +68,7 @@ async fn services(client: kube::Client, reconciler: Arc<Reconciler>) {
             convert::service,
             |e| reconciler.feed_services(e),
             None,
+            failed,
         )
         .await;
         tokio::time::sleep(RETRY).await;
@@ -79,37 +79,31 @@ async fn services(client: kube::Client, reconciler: Arc<Reconciler>) {
 /// removed), so it is looked for again every [`CRD_LOOK`] (GW-15). The hub logs the changes of
 /// presence.
 pub(crate) async fn gateways(client: kube::Client, hub: Arc<Hub>, reconciler: Arc<Reconciler>) {
-    let resource = resource("Gateway");
-    loop {
-        let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
-        match api.list(&ListParams::default().limit(1)).await {
-            Ok(_) => {
-                reconciler.crd(true);
-                hub.gateway_crd(true);
-                let events =
-                    watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
-                forward(
-                    events,
-                    convert::gateway,
-                    |e| reconciler.feed_gateways(e),
-                    Some(&api),
-                )
-                .await;
-                // Gone while watched: nothing is written until a new full list.
-                reconciler.crd(false);
-                hub.gateway_crd(false);
-            }
-            Err(kube::Error::Api(status)) if status.code == 404 => {
-                reconciler.crd(false);
-                hub.gateway_crd(false);
-            }
-            Err(error) => {
-                let error = ApiError::from(&error);
-                tracing::warn!(error = %error, "gateway CRD lookup failed");
-            }
-        }
-        tokio::time::sleep(CRD_LOOK).await;
-    }
+    let api = Api::<DynamicObject>::all_with(client, &gateway_api("v1", "Gateway"));
+    let reconciler = &*reconciler;
+    while_crd(
+        api,
+        CRD_LOOK,
+        // Absent, or gone while watched: nothing is written until a new full list.
+        |present| {
+            reconciler.crd(present);
+            hub.gateway_crd(present);
+        },
+        |api| async move {
+            let events =
+                watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
+            forward(
+                events,
+                convert::gateway,
+                |e| reconciler.feed_gateways(e),
+                Some(&api),
+                failed,
+            )
+            .await;
+        },
+        |error| tracing::warn!(error = %ApiError::from(error), "gateway CRD lookup failed"),
+    )
+    .await;
 }
 
 /// Starts the reflectors and the reconciler; nothing without a reconciler (the gateway is off).

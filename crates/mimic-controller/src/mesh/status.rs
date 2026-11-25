@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
+use mimic_core::condition::bounded;
 use mimic_core::mesh::input::{ParentRef, Route, Snapshot};
 use mimic_core::mesh::policy::{Condition, ConfigStatus, statuses};
 use mimic_core::mesh::route::{Compiled, compile};
@@ -28,8 +29,6 @@ pub const FIELD_MANAGER: &str = "mimic-mesh";
 
 /// A failed apply is tried again after this long without a new publication.
 const RETRY: Duration = Duration::from_secs(30);
-/// `status.conditions[].message` is at most this long in the CRD.
-const MAX_MESSAGE: usize = 1024;
 
 /// Forced: `status.conditions` belongs to this manager alone, so a conflict is no second owner
 /// to respect.
@@ -74,17 +73,8 @@ impl StatusSink for KubeSink {
     }
 }
 
-/// `message` cut to the 1024 bytes of the CRD, on a character boundary.
-fn cut(message: &str) -> String {
-    let mut end = message.len().min(MAX_MESSAGE);
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    message[..end].to_string()
-}
-
 fn condition(kind: &str, c: &Condition, generation: i64) -> Value {
-    let message = cut(&c.message);
+    let message = bounded(&c.message);
     let mut value = json!({
         "type": kind,
         "status": if c.ok { "True" } else { "False" },
@@ -208,11 +198,7 @@ impl RouteSink for KubeRouteSink {
                 .client
                 .get()
                 .ok_or_else(|| PatchError::Other("no Kubernetes client yet".into()))?;
-            let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
-                "gateway.networking.k8s.io",
-                "v1",
-                "HTTPRoute",
-            ));
+            let resource = super::watch::gateway_api("v1", "HTTPRoute");
             let api = Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &resource);
             match api
                 .patch_status(name, &route_patch_params(), &Patch::Merge(body))

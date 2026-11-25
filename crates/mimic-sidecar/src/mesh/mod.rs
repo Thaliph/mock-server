@@ -263,18 +263,31 @@ fn duration(
     min: Duration,
     max: Duration,
 ) -> Result<Duration, ConfigError> {
+    let reason = format!(
+        "expected a duration from {}ms to {}ms",
+        min.as_millis(),
+        max.as_millis()
+    );
+    duration_in(env, var, default, min..=max, &reason)
+}
+
+/// The duration `var` (default `default`) when it is in `range`, else `reason`, naming the
+/// variable and its value.
+pub(crate) fn duration_in(
+    env: &Env,
+    var: &str,
+    default: Duration,
+    range: std::ops::RangeInclusive<Duration>,
+    reason: &str,
+) -> Result<Duration, ConfigError> {
     let value = env.duration_or(var, default)?;
-    if (min..=max).contains(&value) {
+    if range.contains(&value) {
         return Ok(value);
     }
     Err(ConfigError::invalid(
         var,
         env.optional(var).unwrap_or_default(),
-        format!(
-            "expected a duration from {}ms to {}ms",
-            min.as_millis(),
-            max.as_millis()
-        ),
+        reason,
     ))
 }
 

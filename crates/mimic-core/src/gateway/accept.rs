@@ -6,9 +6,8 @@ use std::collections::BTreeSet;
 
 use super::input::{Gateway, GatewayClass, Infrastructure, Listener, RouteKind};
 use super::{ADMIN_PORT, DEFAULT_REPLICAS, MAX_LISTENERS, MAX_NAME, REPLICAS_ANNOTATION, Settings};
+use crate::condition::{Condition, bounded};
 use crate::mesh::input::GATEWAY_GROUP;
-use crate::mesh::policy::Condition;
-use crate::mesh::route::bounded;
 
 /// The acceptance of one listener.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -19,7 +19,10 @@ use serve::Gateway;
 
 const BINARY: &str = "mimic-sidecar";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_ADMIN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 15100);
+const DEFAULT_ADMIN: SocketAddr = SocketAddr::new(
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    mimic_core::gateway::ADMIN_PORT,
+);
 
 /// The whole process of the gateway role.
 pub fn main(env: &Env) -> ExitCode {

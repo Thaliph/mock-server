@@ -1,221 +1,22 @@
 //! GW-10 to GW-14 (objects, ownership, deletion, failures), GW-15 (classes and refused Gateways)
-//! and GW-17 (counts and lines): the passes of the gateway reconciler against a recording
-//! cluster and the fake API of `fake.rs`, without a cluster.
+//! and GW-17 (counts and lines): the passes of the gateway reconciler against the fake API of
+//! `fake.rs`, without a cluster.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kube::api::DynamicObject;
-use mimic_core::gateway::input::{Gateway, GatewayClass, Infrastructure, Listener};
-use mimic_core::gateway::{ServiceType, Settings};
+use mimic_core::gateway::input::Gateway;
+use mimic_core::gateway::{accept, objects};
 use prometheus_client::registry::Registry;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use mimic_core::gateway::input::ObjectKind;
-use mimic_core::gateway::{accept, objects};
-
-use super::cluster::{ApiError, Cluster, ClusterFuture, StatusTarget};
 use super::convert;
-use super::fake::{Request, Rig};
+use super::fake::{NOW, Request, Rig, class, gateway, key, listener, settings};
 use super::metrics::GatewayMetrics;
-use super::reconcile::Reconciler;
 use crate::mesh::Event;
 use crate::mesh::metrics::label;
 use crate::mesh::tests::Lines;
-
-pub(super) const NOW: &str = "2026-11-25T10:00:00Z";
-
-/// A request the reconciler sent: `status <target>` with its body.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct Call {
-    pub what: String,
-    pub body: Value,
-}
-
-/// Records each request and answers it; `fail` makes every request fail with a 500.
-#[derive(Default)]
-pub(super) struct Recorder {
-    pub calls: Mutex<Vec<Call>>,
-    pub fail: Mutex<bool>,
-}
-
-impl Recorder {
-    pub fn calls(&self) -> Vec<Call> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    pub fn whats(&self) -> Vec<String> {
-        self.calls().into_iter().map(|c| c.what).collect()
-    }
-}
-
-impl Cluster for Recorder {
-    fn apply<'a>(
-        &'a self,
-        kind: ObjectKind,
-        namespace: &'a str,
-        name: &'a str,
-        body: &'a Value,
-    ) -> ClusterFuture<'a, Value> {
-        Box::pin(async move {
-            let what = format!("apply {} {namespace}/{name}", kind.as_str());
-            self.calls.lock().unwrap().push(Call {
-                what,
-                body: body.clone(),
-            });
-            Ok(body.clone())
-        })
-    }
-
-    fn get<'a>(
-        &'a self,
-        kind: ObjectKind,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> ClusterFuture<'a, Option<Value>> {
-        Box::pin(async move {
-            let what = format!("get {} {namespace}/{name}", kind.as_str());
-            self.calls.lock().unwrap().push(Call {
-                what,
-                body: Value::Null,
-            });
-            Ok(None)
-        })
-    }
-
-    fn delete<'a>(
-        &'a self,
-        kind: ObjectKind,
-        namespace: &'a str,
-        name: &'a str,
-        uid: &'a str,
-    ) -> ClusterFuture<'a, ()> {
-        Box::pin(async move {
-            let what = format!("delete {} {namespace}/{name} {uid}", kind.as_str());
-            self.calls.lock().unwrap().push(Call {
-                what,
-                body: Value::Null,
-            });
-            Ok(())
-        })
-    }
-
-    fn apply_status<'a>(
-        &'a self,
-        target: StatusTarget<'a>,
-        body: &'a Value,
-    ) -> ClusterFuture<'a, ()> {
-        Box::pin(async move {
-            let what = match target {
-                StatusTarget::Gateway { namespace, name } => {
-                    format!("status gateway {namespace}/{name}")
-                }
-                StatusTarget::Class { name } => format!("status class {name}"),
-            };
-            self.calls.lock().unwrap().push(Call {
-                what,
-                body: body.clone(),
-            });
-            if *self.fail.lock().unwrap() {
-                Err(ApiError {
-                    reason: "InternalError".into(),
-                    code: 500,
-                })
-            } else {
-                Ok(())
-            }
-        })
-    }
-}
-
-pub(super) fn settings(namespaces: &[&str]) -> Settings {
-    Settings {
-        namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
-        max_replicas: 10,
-        service_type: ServiceType::ClusterIP,
-        image: "ghcr.io/thaliph/mimic-sidecar@sha256:00".into(),
-        log: "info".into(),
-        resources: json!({"requests": {"cpu": "100m", "memory": "64Mi"},
-                          "limits": {"memory": "128Mi"}}),
-    }
-}
-
-pub(super) fn class(name: &str) -> GatewayClass {
-    GatewayClass {
-        name: name.into(),
-        generation: 1,
-        has_parameters_ref: false,
-        observed: vec![],
-    }
-}
-
-pub(super) fn listener(name: &str, port: u16, protocol: &str) -> Listener {
-    Listener {
-        name: name.into(),
-        hostname: None,
-        port,
-        protocol: protocol.into(),
-        allowed_from: None,
-        kinds: None,
-        unknown_fields: vec![],
-    }
-}
-
-pub(super) fn gateway(namespace: &str, name: &str, listeners: Vec<Listener>) -> Gateway {
-    Gateway {
-        namespace: namespace.into(),
-        name: name.into(),
-        uid: format!("uid-{name}"),
-        generation: 1,
-        class: "mimic".into(),
-        listeners,
-        has_addresses: false,
-        has_tls: false,
-        allowed_listeners_from: None,
-        infrastructure: Infrastructure::default(),
-        unknown_fields: vec![],
-        oversize: false,
-        observed: Default::default(),
-    }
-}
-
-pub(super) fn key(namespace: &str, name: &str) -> (String, String) {
-    (namespace.to_string(), name.to_string())
-}
-
-/// Lists no Deployment and no Service.
-pub(super) fn no_objects(r: &Reconciler) {
-    r.feed_deployments(Event::Init);
-    r.feed_deployments(Event::InitDone);
-    r.feed_services(Event::Init);
-    r.feed_services(Event::InitDone);
-}
-
-/// A reconciler with the CRD present and the tables listed with `classes` and `gateways`.
-pub(super) fn reconciler(
-    settings: Settings,
-    cluster: &Arc<Recorder>,
-    classes: Vec<GatewayClass>,
-    gateways: Vec<Gateway>,
-) -> (Arc<Reconciler>, GatewayMetrics) {
-    let metrics = GatewayMetrics::register(&mut Registry::default());
-    let r = Reconciler::new(settings, cluster.clone(), metrics.clone());
-    r.crd(true);
-    r.feed_classes(Event::Init);
-    for c in classes {
-        r.feed_classes(Event::InitApply(key("", &c.name), c));
-    }
-    r.feed_classes(Event::InitDone);
-    r.feed_gateways(Event::Init);
-    for g in gateways {
-        r.feed_gateways(Event::InitApply(key(&g.namespace, &g.name), g));
-    }
-    r.feed_gateways(Event::InitDone);
-    no_objects(&r);
-    (r, metrics)
-}
 
 /// `(type, status, reason)` of the top-level conditions of a Gateway status body.
 fn conditions(body: &Value) -> Vec<(String, String, String)> {
@@ -234,31 +35,31 @@ fn triple(kind: &str, status: &str, reason: &str) -> (String, String, String) {
     (kind.into(), status.into(), reason.into())
 }
 
-/// What the cluster holds once the body of a Gateway status apply is written.
-fn written(mut gw: Gateway, body: &Value) -> Gateway {
-    let list = |f: &str| body["status"][f].as_array().cloned().unwrap_or_default();
-    gw.observed.conditions = list("conditions");
-    gw.observed.listeners = list("listeners");
-    gw.observed.addresses = list("addresses");
-    gw
+/// A rig of one replica with the namespaces `{shop}`, the class `mimic` and no Gateway.
+fn mimic_only() -> Rig {
+    let rig = Rig::new(1, &settings(&["shop"]));
+    rig.api.put(
+        "GatewayClass",
+        class_object("mimic", mimic_core::gateway::CONTROLLER_NAME),
+    );
+    rig
+}
+
+fn tcp_only() -> Value {
+    json!([{"name": "tcp", "port": 9000, "protocol": "TCP"}])
 }
 
 #[tokio::test]
 async fn gw_15_a_not_listed_gateway_gets_its_status_and_no_object_request() {
-    let cluster = Arc::new(Recorder::default());
-    let web = gateway("other", "web", vec![listener("http", 80, "HTTP")]);
-    let (r, _) = reconciler(
-        settings(&["shop"]),
-        &cluster,
-        vec![class("mimic")],
-        vec![web.clone()],
-    );
-    r.pass(NOW).await;
+    let rig = mimic_only();
+    rig.api
+        .put("Gateway", gateway_object("other", "web", http(80)));
+    rig.round(0).await;
     assert_eq!(
-        cluster.whats(),
-        ["status class mimic", "status gateway other/web"]
+        rig.api.whats(),
+        s(&["status GatewayClass mimic", "status Gateway other/web"])
     );
-    let calls = cluster.calls();
+    let calls = rig.api.calls();
     assert_eq!(
         calls[0].body["status"]["conditions"][0]["status"], "True",
         "the class is accepted"
@@ -281,94 +82,76 @@ async fn gw_15_a_not_listed_gateway_gets_its_status_and_no_object_request() {
     );
 
     // The cluster holds what was written: Keep, no request.
-    let mut mimic = class("mimic");
-    mimic.observed = calls[0].body["status"]["conditions"]
-        .as_array()
-        .unwrap()
-        .clone();
-    r.feed_classes(Event::Apply(key("", "mimic"), mimic));
-    r.feed_gateways(Event::Apply(key("other", "web"), written(web, body)));
-    cluster.calls.lock().unwrap().clear();
-    r.pass(NOW).await;
-    assert_eq!(cluster.whats(), Vec::<String>::new());
-}
-
-fn object(value: Value) -> DynamicObject {
-    serde_json::from_value(value).unwrap()
+    rig.api.clear();
+    rig.round(0).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new());
 }
 
 #[tokio::test]
 async fn gw_15_other_controllers_get_no_request() {
-    let cluster = Arc::new(Recorder::default());
-    let (r, _) = reconciler(settings(&["shop"]), &cluster, vec![], vec![]);
-    let istio = object(json!({
-        "apiVersion": "gateway.networking.k8s.io/v1", "kind": "GatewayClass",
-        "metadata": {"name": "istio", "generation": 1},
-        "spec": {"controllerName": "istio.io/gateway-controller"},
-    }));
-    if let Some((k, c)) = convert::class(&istio) {
-        r.feed_classes(Event::Apply(k, c));
-    }
-    let gw = object(json!({
-        "apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
-        "metadata": {"namespace": "shop", "name": "edge", "uid": "u", "generation": 1},
-        "spec": {"gatewayClassName": "istio",
-                 "listeners": [{"name": "tcp", "port": 9000, "protocol": "TCP"}]},
-    }));
-    let (k, g) = convert::gateway(&gw).expect("every Gateway converts");
-    r.feed_gateways(Event::Apply(k, g));
-    r.pass(NOW).await;
-    assert_eq!(cluster.whats(), Vec::<String>::new());
+    let rig = Rig::new(1, &settings(&["shop"]));
+    rig.api.put(
+        "GatewayClass",
+        class_object("istio", "istio.io/gateway-controller"),
+    );
+    let mut edge = gateway_object("shop", "edge", tcp_only());
+    edge["spec"]["gatewayClassName"] = json!("istio");
+    rig.api.put("Gateway", edge);
+    rig.round(0).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new());
+}
+
+/// Lists no Deployment and no Service on replica 0.
+fn no_objects(rig: &Rig) {
+    let r = &rig.replicas[0];
+    r.feed_deployments(Event::Init);
+    r.feed_deployments(Event::InitDone);
+    r.feed_services(Event::Init);
+    r.feed_services(Event::InitDone);
 }
 
 #[tokio::test]
 async fn gw_15_no_pass_without_the_crd_or_a_full_list() {
-    let cluster = Arc::new(Recorder::default());
+    let rig = mimic_only();
+    let r = &rig.replicas[0];
     let refused = gateway("shop", "web", vec![listener("tcp", 9000, "TCP")]);
-    let metrics = GatewayMetrics::register(&mut Registry::default());
-    let r = Reconciler::new(settings(&["shop"]), cluster.clone(), metrics);
-    no_objects(&r);
+    no_objects(&rig);
     r.crd(true);
     r.feed_classes(Event::Init);
     r.feed_classes(Event::InitApply(key("", "mimic"), class("mimic")));
     r.feed_classes(Event::InitDone);
     r.feed_gateways(Event::Init);
     r.feed_gateways(Event::InitApply(key("shop", "web"), refused.clone()));
-    r.pass(NOW).await;
-    assert_eq!(cluster.whats(), Vec::<String>::new(), "gateways not listed");
+    rig.pass(0).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new(), "gateways not listed");
     r.feed_gateways(Event::InitDone);
     r.crd(false);
-    r.pass(NOW).await;
-    assert_eq!(cluster.whats(), Vec::<String>::new(), "the CRD absent");
+    rig.pass(0).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new(), "the CRD absent");
     // Back: the table was emptied, and a pass waits for a new full list.
     r.crd(true);
-    r.pass(NOW).await;
-    assert_eq!(cluster.whats(), Vec::<String>::new(), "no list since");
+    rig.pass(0).await;
+    assert_eq!(rig.api.whats(), Vec::<String>::new(), "no list since");
     r.feed_gateways(Event::Init);
     r.feed_gateways(Event::InitApply(key("shop", "web"), refused));
     r.feed_gateways(Event::InitDone);
-    r.pass(NOW).await;
+    rig.pass(0).await;
     assert_eq!(
-        cluster.whats(),
-        ["status class mimic", "status gateway shop/web"]
+        rig.api.whats(),
+        s(&["status GatewayClass mimic", "status Gateway shop/web"])
     );
 }
 
 #[tokio::test]
 async fn gw_15_a_gateway_of_an_unknown_class_gets_nothing() {
-    let cluster = Arc::new(Recorder::default());
-    let mut stray = gateway("shop", "stray", vec![listener("tcp", 9000, "TCP")]);
-    stray.class = "unknown".into();
-    let mut mimic = class("mimic");
-    mimic.observed = vec![
-        json!({"type": "Accepted", "status": "True", "reason": "Accepted",
-        "message": "", "observedGeneration": 1, "lastTransitionTime": NOW}),
-    ];
-    let (r, metrics) = reconciler(settings(&["shop"]), &cluster, vec![mimic], vec![stray]);
-    r.pass(NOW).await;
-    assert_eq!(cluster.whats(), Vec::<String>::new());
-    assert_eq!(count(&metrics, "invalid"), 0);
-    assert_eq!(state(&metrics, "not_accepted"), 0);
+    let rig = mimic_only();
+    let mut stray = gateway_object("shop", "stray", tcp_only());
+    stray["spec"]["gatewayClassName"] = json!("unknown");
+    rig.api.put("Gateway", stray);
+    rig.round(0).await;
+    assert_eq!(rig.api.whats(), s(&["status GatewayClass mimic"]));
+    assert_eq!(count(&rig.metrics[0], "invalid"), 0);
+    assert_eq!(state(&rig.metrics[0], "not_accepted"), 0);
 }
 
 fn count(metrics: &GatewayMetrics, result: &str) -> u64 {
@@ -384,38 +167,27 @@ fn state(metrics: &GatewayMetrics, state: &str) -> i64 {
 
 #[tokio::test]
 async fn gw_17_refused_gateways_are_counted_without_names() {
-    let cluster = Arc::new(Recorder::default());
-    let mut registry = Registry::with_prefix("mimic");
-    let metrics = GatewayMetrics::register(&mut registry);
-    let r = Reconciler::new(settings(&["shop"]), cluster.clone(), metrics.clone());
-    no_objects(&r);
-    r.crd(true);
-    r.feed_classes(Event::Init);
-    r.feed_classes(Event::InitApply(key("", "mimic"), class("mimic")));
-    r.feed_classes(Event::InitDone);
-    r.feed_gateways(Event::Init);
-    r.feed_gateways(Event::InitApply(
-        key("shop", "web"),
-        gateway("shop", "web", vec![listener("tcp", 9000, "TCP")]),
-    ));
-    r.feed_gateways(Event::InitDone);
-    r.pass(NOW).await;
+    let rig = mimic_only();
+    rig.api
+        .put("Gateway", gateway_object("shop", "web", tcp_only()));
+    rig.round(0).await;
     assert_eq!(
-        cluster.whats(),
-        ["status class mimic", "status gateway shop/web"]
+        rig.api.whats(),
+        s(&["status GatewayClass mimic", "status Gateway shop/web"])
     );
+    let metrics = &rig.metrics[0];
     let results: Vec<u64> = ["ok", "invalid", "conflict", "error"]
         .iter()
-        .map(|r| count(&metrics, r))
+        .map(|r| count(metrics, r))
         .collect();
     assert_eq!(results, [0, 1, 0, 0]);
     let states: Vec<i64> = ["programmed", "pending", "not_accepted"]
         .iter()
-        .map(|s| state(&metrics, s))
+        .map(|s| state(metrics, s))
         .collect();
     assert_eq!(states, [0, 0, 1]);
     let mut encoded = String::new();
-    prometheus_client::encoding::text::encode(&mut encoded, &registry).unwrap();
+    prometheus_client::encoding::text::encode(&mut encoded, &rig.registry).unwrap();
     assert!(
         encoded.contains(r#"mimic_gateway_reconciles_total{result="invalid"} 1"#),
         "the counter series"
@@ -427,9 +199,35 @@ async fn gw_17_refused_gateways_are_counted_without_names() {
     }
 
     // The Gateway is deleted: the gauge follows.
-    r.feed_gateways(Event::Delete(key("shop", "web")));
-    r.pass(NOW).await;
-    assert_eq!(state(&metrics, "not_accepted"), 0);
+    rig.api.remove("Gateway", "shop", "web");
+    rig.round(0).await;
+    assert_eq!(state(metrics, "not_accepted"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gw_14_an_api_that_fails_every_request_is_warned_once_per_key() {
+    let lines = Lines::default();
+    let _guard = json_lines(&lines);
+    let rig = fixture(1);
+    let versions = rig.api.versions();
+    rig.api.fail_all("InternalError", 500);
+    rig.round(0).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    rig.round(0).await;
+    assert_eq!(rig.api.versions(), versions, "nothing written");
+    assert_eq!(count(&rig.metrics[0], "error"), 2, "web, at 0 s and 2 s");
+    let warns: Vec<String> = lines_of(&lines)
+        .lines()
+        .filter(|l| l.contains("gateway reconcile failed"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(warns.len(), 2, "the class and the Gateway, once each");
+    assert!(warns.iter().any(|l| l.contains(r#""kind":"GatewayClass""#)));
+    assert!(
+        warns
+            .iter()
+            .any(|l| l.contains(r#""gateway":"shop/web""#) && l.contains(r#""kind":"Deployment""#))
+    );
 }
 
 #[tokio::test]
@@ -978,7 +776,7 @@ async fn gw_13_not_accepted_or_another_class_deletes_the_managed_objects() {
 fn managed(rig: &Rig, namespace: &str, gateway: &str, owner: &str) {
     let gw: Gateway = Gateway {
         uid: owner.into(),
-        ..super::tests_reconcile::gateway(namespace, gateway, vec![listener("http", 80, "HTTP")])
+        ..super::fake::gateway(namespace, gateway, vec![listener("http", 80, "HTTP")])
     };
     let all = settings(&["shop", namespace]);
     let acceptance = accept::gateway(&gw, &class("mimic"), &all);

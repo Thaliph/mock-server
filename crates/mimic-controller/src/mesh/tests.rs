@@ -502,6 +502,16 @@ async fn msh_26_a_view_larger_than_the_cache_is_served_and_not_cached() {
 #[derive(Clone, Default)]
 pub(crate) struct Lines(pub(crate) Arc<Mutex<Vec<u8>>>);
 
+impl Lines {
+    /// The captured lines that hold `text`.
+    pub(crate) fn count(&self, text: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|l| l.contains(text))
+            .count()
+    }
+}
+
 impl std::io::Write for Lines {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(data);

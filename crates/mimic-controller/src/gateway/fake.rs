@@ -2,7 +2,7 @@
 //! records each call, answers an apply by replacing `labels`, `ownerReferences` and `spec`,
 //! moves `resourceVersion` and `generation` only on a change, and fails the calls scripted.
 //! `Rig` runs one `Reconciler` per replica on it, fed from the store through the real
-//! converters.
+//! converters. The input fixtures of the gateway tests are here too.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::DynamicObject;
-use mimic_core::gateway::input::ObjectKind;
-use mimic_core::gateway::{GATEWAY_LABEL, Settings};
+use mimic_core::gateway::input::{Gateway, GatewayClass, Infrastructure, Listener, ObjectKind};
+use mimic_core::gateway::{GATEWAY_LABEL, ServiceType, Settings};
 use prometheus_client::registry::Registry;
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -23,7 +23,63 @@ use super::reconcile::Reconciler;
 use crate::mesh::Event;
 use crate::mesh::convert::Key;
 
-pub(super) use super::tests_reconcile::NOW;
+/// The clock of every status the tests compute.
+pub(super) const NOW: &str = "2026-11-25T10:00:00Z";
+
+pub(super) fn settings(namespaces: &[&str]) -> Settings {
+    Settings {
+        namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
+        max_replicas: 10,
+        service_type: ServiceType::ClusterIP,
+        image: "ghcr.io/thaliph/mimic-sidecar@sha256:00".into(),
+        log: "info".into(),
+        resources: json!({"requests": {"cpu": "100m", "memory": "64Mi"},
+                          "limits": {"memory": "128Mi"}}),
+    }
+}
+
+pub(super) fn class(name: &str) -> GatewayClass {
+    GatewayClass {
+        name: name.into(),
+        generation: 1,
+        has_parameters_ref: false,
+        observed: vec![],
+    }
+}
+
+pub(super) fn listener(name: &str, port: u16, protocol: &str) -> Listener {
+    Listener {
+        name: name.into(),
+        hostname: None,
+        port,
+        protocol: protocol.into(),
+        allowed_from: None,
+        kinds: None,
+        unknown_fields: vec![],
+    }
+}
+
+pub(super) fn gateway(namespace: &str, name: &str, listeners: Vec<Listener>) -> Gateway {
+    Gateway {
+        namespace: namespace.into(),
+        name: name.into(),
+        uid: format!("uid-{name}"),
+        generation: 1,
+        class: "mimic".into(),
+        listeners,
+        has_addresses: false,
+        has_tls: false,
+        allowed_listeners_from: None,
+        infrastructure: Infrastructure::default(),
+        unknown_fields: vec![],
+        oversize: false,
+        observed: Default::default(),
+    }
+}
+
+pub(super) fn key(namespace: &str, name: &str) -> Key {
+    (namespace.to_string(), name.to_string())
+}
 
 /// `(kind, namespace, name)`; `namespace` is empty for a GatewayClass.
 pub(super) type Id = (String, String, String);
@@ -44,6 +100,8 @@ pub(super) struct FakeApi {
     pub calls: Mutex<Vec<Request>>,
     /// The next call whose `what` starts with the prefix fails with the error.
     pub errors: Mutex<Vec<(String, ApiError)>>,
+    /// Set by [`FakeApi::fail_all`].
+    always: Mutex<Option<ApiError>>,
     uids: Mutex<u64>,
     /// Service addresses given so far.
     addresses: Mutex<u64>,
@@ -79,6 +137,14 @@ impl FakeApi {
                 code,
             },
         ));
+    }
+
+    /// Every call fails with `reason` and `code` from now on.
+    pub fn fail_all(&self, reason: &str, code: u16) {
+        *self.always.lock().unwrap() = Some(ApiError {
+            reason: reason.into(),
+            code,
+        });
     }
 
     pub fn calls(&self) -> Vec<Request> {
@@ -183,7 +249,9 @@ impl FakeApi {
             let index = errors
                 .iter()
                 .position(|(p, _)| what.starts_with(p.as_str()));
-            index.map(|i| errors.remove(i).1)
+            index
+                .map(|i| errors.remove(i).1)
+                .or_else(|| self.always.lock().unwrap().clone())
         };
         self.calls.lock().unwrap().push(Request {
             what,
@@ -290,9 +358,13 @@ impl Cluster for Replica {
                 format!("status {kind} {namespace}/{name}")
             };
             self.api.call(what, body)?;
-            self.api.edit(kind, namespace, name, |o| {
-                o["status"] = body["status"].clone();
-            });
+            // An object the store does not hold (another API server feeds the watches): only
+            // recorded.
+            if self.api.get(kind, namespace, name).is_some() {
+                self.api.edit(kind, namespace, name, |o| {
+                    o["status"] = body["status"].clone();
+                });
+            }
             Ok(())
         })
     }

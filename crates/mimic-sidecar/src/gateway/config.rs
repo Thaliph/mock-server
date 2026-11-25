@@ -5,16 +5,16 @@ use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
+use mimic_core::gateway::ADMIN_PORT;
 use mimic_runtime::config::{ConfigError, Env};
 
 use crate::listener;
+use crate::mesh::duration_in;
 
 const ROLE_VAR: &str = "MIMIC_ROLE";
 const PORTS_VAR: &str = "MIMIC_GATEWAY_PORTS";
 const HEADER_TIMEOUT_VAR: &str = "MIMIC_GATEWAY_HEADER_TIMEOUT";
 const IDLE_TIMEOUT_VAR: &str = "MIMIC_GATEWAY_IDLE_TIMEOUT";
-/// The admin listener's port (spec §9): never a gateway listener.
-const ADMIN_PORT: u16 = 15100;
 const HEADER_TIMEOUT_RANGE: RangeInclusive<Duration> =
     Duration::from_secs(1)..=Duration::from_secs(5 * 60);
 const IDLE_TIMEOUT_RANGE: RangeInclusive<Duration> =
@@ -64,14 +64,14 @@ impl GatewayConfig {
     pub fn from_env(env: &Env) -> Result<GatewayConfig, ConfigError> {
         Ok(GatewayConfig {
             ports: ports(env.required(PORTS_VAR)?)?,
-            header_timeout: timeout(
+            header_timeout: duration_in(
                 env,
                 HEADER_TIMEOUT_VAR,
                 Duration::from_secs(10),
                 HEADER_TIMEOUT_RANGE,
                 "expected a duration from 1s to 5m",
             )?,
-            idle_timeout: timeout(
+            idle_timeout: duration_in(
                 env,
                 IDLE_TIMEOUT_VAR,
                 Duration::from_secs(60),
@@ -106,7 +106,7 @@ fn ports(value: &str) -> Result<Vec<u16>, ConfigError> {
             .filter(|_| digits)
             .ok_or_else(|| invalid("expected comma-separated numbers from 1 to 65535"))?;
         if port == ADMIN_PORT {
-            return Err(invalid("15100 is the admin port"));
+            return Err(invalid(&format!("{ADMIN_PORT} is the admin port")));
         }
         if !seen.insert(port) {
             return Err(invalid("a port is listed twice"));
@@ -117,24 +117,6 @@ fn ports(value: &str) -> Result<Vec<u16>, ConfigError> {
         return Err(invalid("more than 64 ports"));
     }
     Ok(ports)
-}
-
-fn timeout(
-    env: &Env,
-    var: &str,
-    default: Duration,
-    range: RangeInclusive<Duration>,
-    reason: &str,
-) -> Result<Duration, ConfigError> {
-    let timeout = env.duration_or(var, default)?;
-    if !range.contains(&timeout) {
-        return Err(ConfigError::invalid(
-            var,
-            env.optional(var).unwrap_or_default(),
-            reason,
-        ));
-    }
-    Ok(timeout)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! lives here; the binaries are adapters around it.
 
 pub mod compact;
+pub mod condition;
 pub mod discovery;
 pub mod fd;
 pub mod gateway;

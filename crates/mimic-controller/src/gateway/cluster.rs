@@ -13,6 +13,8 @@ use mimic_core::gateway::input::ObjectKind;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+use crate::mesh::watch::gateway_api;
+
 /// The field manager of every apply of the gateway reconciler.
 pub const FIELD_MANAGER: &str = "mimic-gateway";
 
@@ -51,6 +53,19 @@ impl From<&kube::Error> for ApiError {
                 },
                 code: status.code,
             },
+            _ => ApiError::unavailable(),
+        }
+    }
+}
+
+impl From<&kube::runtime::watcher::Error> for ApiError {
+    fn from(error: &kube::runtime::watcher::Error) -> ApiError {
+        use kube::runtime::watcher::Error;
+        match error {
+            Error::InitialListFailed(e) | Error::WatchStartFailed(e) | Error::WatchFailed(e) => {
+                ApiError::from(e)
+            }
+            Error::WatchError(status) => ApiError::from(&kube::Error::Api(status.clone())),
             _ => ApiError::unavailable(),
         }
     }
@@ -102,14 +117,6 @@ pub trait Cluster: Send + Sync {
 /// Forced: the class's controller is the only writer of a Gateway's status (§7.10).
 pub fn apply_params() -> PatchParams {
     PatchParams::apply(FIELD_MANAGER).force()
-}
-
-fn gateway_api(kind: &str) -> ApiResource {
-    ApiResource::from_gvk(&GroupVersionKind::gvk(
-        "gateway.networking.k8s.io",
-        "v1",
-        kind,
-    ))
 }
 
 fn object_api(kind: ObjectKind) -> ApiResource {
@@ -220,12 +227,12 @@ impl Cluster for KubeCluster {
                     Api::<DynamicObject>::namespaced_with(
                         client,
                         namespace,
-                        &gateway_api("Gateway"),
+                        &gateway_api("v1", "Gateway"),
                     ),
                     name,
                 ),
                 StatusTarget::Class { name } => (
-                    Api::<DynamicObject>::all_with(client, &gateway_api("GatewayClass")),
+                    Api::<DynamicObject>::all_with(client, &gateway_api("v1", "GatewayClass")),
                     name,
                 ),
             };
