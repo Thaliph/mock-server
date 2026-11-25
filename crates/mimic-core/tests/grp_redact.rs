@@ -110,11 +110,11 @@ fn grp_14_entropy_thresholds() {
         f(8, s(&"a".repeat(4096))),
     ]);
     let out = run(&plain(), &m);
-    for i in 0..3 {
-        assert_eq!(out.fields[i].value, s("mimic-secret"));
+    for field in &out.fields[..3] {
+        assert_eq!(field.value, s("mimic-secret"));
     }
-    for i in 3..8 {
-        assert_eq!(out.fields[i].value, m.fields[i].value);
+    for (got, sent) in out.fields[3..8].iter().zip(&m.fields[3..8]) {
+        assert_eq!(got.value, sent.value);
     }
 
     let all: Vec<u8> = (0..=255u8).collect();
@@ -126,11 +126,11 @@ fn grp_14_entropy_thresholds() {
         f(5, Value::Bytes((0..15).collect())),
     ]);
     let out = run(&plain(), &m);
-    for i in 0..3 {
-        assert_eq!(out.fields[i].value, s("mimic-secret"));
+    for field in &out.fields[..3] {
+        assert_eq!(field.value, s("mimic-secret"));
     }
-    for i in 3..5 {
-        assert_eq!(out.fields[i].value, m.fields[i].value);
+    for (got, sent) in out.fields[3..5].iter().zip(&m.fields[3..5]) {
+        assert_eq!(got.value, sent.value);
     }
 }
 
