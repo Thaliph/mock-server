@@ -281,19 +281,7 @@ pub fn route_condition(
     previous: Option<&Value>,
     now: &str,
 ) -> Value {
-    let status = if c.ok { "True" } else { "False" };
-    let since = previous
-        .filter(|p| p["status"] == status)
-        .and_then(|p| p["lastTransitionTime"].as_str())
-        .unwrap_or(now);
-    json!({
-        "type": kind,
-        "status": status,
-        "reason": c.reason,
-        "message": cut(&c.message),
-        "observedGeneration": generation,
-        "lastTransitionTime": since,
-    })
+    c.to_json(kind, generation, previous, now)
 }
 
 /// `parent` as the route writes it, which is how its entry is told from another.

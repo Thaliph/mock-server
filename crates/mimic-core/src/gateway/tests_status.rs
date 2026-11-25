@@ -386,8 +386,9 @@ fn gw_09_observed_generation_and_message_cut() {
             "{c}"
         );
     }
+    // An empty message is written, not omitted.
     assert_eq!(
-        find(&body["status"]["conditions"], "Accepted")["message"],
+        find(&body["status"]["listeners"][0]["conditions"], "Accepted")["message"],
         json!("")
     );
 

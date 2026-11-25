@@ -1,8 +1,21 @@
 //! The objects of an accepted Gateway (spec §7.10 "Generated objects").
 
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::MAX_NAME;
+use super::accept::Acceptance;
+use super::input::Gateway;
+use super::{
+    ADMIN_PORT, ADMIN_PORT_NAME, GATEWAY_API_VERSION, GATEWAY_LABEL, MAX_NAME, Settings, UID,
+};
+use crate::inject::literal;
+
+/// `app.kubernetes.io/name` of the generated objects and pods.
+const APP_NAME: &str = "mimic-gateway";
+/// The pod label that keeps the webhook away (§7.1).
+const INJECT_LABEL: &str = "mimic.platform.io/inject";
+/// The gateway's entry point.
+const COMMAND: &str = "/usr/local/bin/mimic-sidecar";
 
 /// Characters of the Gateway name kept in the hashed form.
 const HASHED_PREFIX: usize = 46;
@@ -56,17 +69,143 @@ fn hex(bytes: &[u8], digits: usize) -> String {
 /// The three objects of an accepted Gateway, as server-side apply bodies.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Objects {
-    pub deployment: serde_json::Value,
-    pub service: serde_json::Value,
-    pub pod_disruption_budget: serde_json::Value,
+    pub deployment: Value,
+    pub service: Value,
+    pub pod_disruption_budget: Value,
 }
 
-/// The objects of `gw` (GW-05, GW-06); `None` exactly when it is not accepted (GW-07).
-pub fn objects(
-    gw: &super::input::Gateway,
-    acceptance: &super::accept::Acceptance,
-    settings: &super::Settings,
-) -> Option<Objects> {
-    let _ = (gw, acceptance, settings);
-    None
+/// The objects of `gw` (GW-05, GW-06); `None` exactly when it is not accepted (GW-07). The
+/// listener order is never read: the ports are the sorted ones of the acceptance.
+pub fn objects(gw: &Gateway, acceptance: &Acceptance, settings: &Settings) -> Option<Objects> {
+    if !acceptance.is_accepted() {
+        return None;
+    }
+    let ports = acceptance.ports();
+    let metadata = json!({
+        "labels": {
+            "app.kubernetes.io/managed-by": "mimic",
+            "app.kubernetes.io/name": APP_NAME,
+            "gateway.networking.k8s.io/gateway-class-name": gw.class,
+            "gateway.networking.k8s.io/gateway-name": gw.name,
+            GATEWAY_LABEL: gw.name,
+        },
+        "name": name(&gw.name),
+        "namespace": gw.namespace,
+        // No `blockOwnerDeletion`: the admission policy refuses it (§7.10).
+        "ownerReferences": [{
+            "apiVersion": GATEWAY_API_VERSION,
+            "controller": true,
+            "kind": "Gateway",
+            "name": gw.name,
+            "uid": gw.uid,
+        }],
+    });
+    let selector = json!({GATEWAY_LABEL: gw.name});
+    let ports_env = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut container_ports: Vec<Value> = ports
+        .iter()
+        .map(|p| json!({"containerPort": p, "protocol": "TCP"}))
+        .collect();
+    container_ports
+        .push(json!({"containerPort": ADMIN_PORT, "name": ADMIN_PORT_NAME, "protocol": "TCP"}));
+    let service_ports: Vec<Value> = ports
+        .iter()
+        .map(|p| {
+            json!({
+                "name": format!("{}-{p}", protocol(acceptance, *p)),
+                "port": p,
+                "protocol": "TCP",
+                "targetPort": p,
+            })
+        })
+        .collect();
+    let deployment = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": metadata,
+        "spec": {
+            "replicas": acceptance.replicas,
+            "selector": {"matchLabels": selector},
+            "strategy": {"rollingUpdate": {"maxSurge": 1, "maxUnavailable": 0}, "type": "RollingUpdate"},
+            "template": {
+                "metadata": {"labels": {
+                    "app.kubernetes.io/name": APP_NAME,
+                    GATEWAY_LABEL: gw.name,
+                    INJECT_LABEL: "disabled",
+                }},
+                "spec": {
+                    "automountServiceAccountToken": false,
+                    "containers": [{
+                        "command": [COMMAND],
+                        "env": [
+                            {"name": "MIMIC_GATEWAY_PORTS", "value": ports_env},
+                            {"name": "MIMIC_LOG", "value": literal(&settings.log)},
+                            {"name": "MIMIC_ROLE", "value": "gateway"},
+                        ],
+                        "image": settings.image,
+                        "livenessProbe": {"httpGet": {"path": "/healthz", "port": ADMIN_PORT}},
+                        "name": "gateway",
+                        "ports": container_ports,
+                        "readinessProbe": {"httpGet": {"path": "/readyz", "port": ADMIN_PORT}},
+                        "resources": settings.resources,
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {"drop": ["ALL"]},
+                            "readOnlyRootFilesystem": true,
+                        },
+                    }],
+                    "enableServiceLinks": false,
+                    "securityContext": {
+                        "runAsGroup": UID,
+                        "runAsNonRoot": true,
+                        "runAsUser": UID,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                        // Binds ports below 1024 without a capability; allowed by `restricted`.
+                        "sysctls": [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}],
+                    },
+                    "topologySpreadConstraints": [{
+                        "labelSelector": {"matchLabels": selector},
+                        "maxSkew": 1,
+                        "topologyKey": "kubernetes.io/hostname",
+                        "whenUnsatisfiable": "ScheduleAnyway",
+                    }],
+                },
+            },
+        },
+    });
+    let service = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": metadata,
+        "spec": {
+            "ports": service_ports,
+            "selector": selector,
+            "type": settings.service_type.as_str(),
+        },
+    });
+    let pod_disruption_budget = json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": metadata,
+        "spec": {"maxUnavailable": 1, "selector": {"matchLabels": selector}},
+    });
+    Some(Objects {
+        deployment,
+        service,
+        pod_disruption_budget,
+    })
+}
+
+/// The protocol of the first accepted listener on `port`, in lower case (`http`).
+fn protocol(acceptance: &Acceptance, port: u16) -> String {
+    acceptance
+        .listeners
+        .iter()
+        .find(|l| l.accepted.ok && l.port == port)
+        .map(|l| l.protocol.to_ascii_lowercase())
+        .unwrap_or_default()
 }
