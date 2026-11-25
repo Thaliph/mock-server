@@ -39,7 +39,9 @@ impl Frame {
     /// The `(identifier, value)` pairs of a SETTINGS frame.
     pub fn settings(&self) -> Vec<(u16, u32)> {
         self.payload
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     u16::from_be_bytes([c[0], c[1]]),

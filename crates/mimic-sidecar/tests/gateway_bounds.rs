@@ -88,8 +88,9 @@ fn gw_19_a_slow_or_silent_head_is_closed_at_the_header_timeout() {
     let port = free_port();
     let _gateway = bounded(&[port]);
     let slow = std::thread::spawn(move || {
-        let mut a = connect(port);
+        // Before the connect: the server's timer starts at its accept, which can come first.
         let start = Instant::now();
+        let mut a = connect(port);
         let mut writer = a.try_clone().unwrap();
         std::thread::spawn(move || {
             for byte in b"GET / HTTP/1.1\r\n" {
@@ -101,8 +102,9 @@ fn gw_19_a_slow_or_silent_head_is_closed_at_the_header_timeout() {
         });
         closed_after(&mut a, start)
     });
+    let start = Instant::now();
     let mut b = connect(port);
-    let silent = closed_after(&mut b, Instant::now());
+    let silent = closed_after(&mut b, start);
     let slow = slow.join().unwrap();
     for (name, t) in [("byte by byte", slow), ("silent", silent)] {
         assert!(
@@ -253,7 +255,10 @@ fn gw_19_h2_stream_limit_and_reset_flood() {
     let mut answered = 0;
     let start = Instant::now();
     while answered < 100 || refused.is_empty() {
-        assert!(start.elapsed() < Duration::from_secs(5), "{refused:?}, {answered} answered");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{refused:?}, {answered} answered"
+        );
         let frame = h2_frames::read_frame(&mut c).expect("the frames in time");
         match frame.kind {
             RST_STREAM if frame.rst_code() == REFUSED_STREAM => refused.push(frame.stream),
@@ -289,7 +294,9 @@ async fn gw_19_rss_stays_under_64_mib() {
         clients.push(tokio::net::TcpStream::connect(addr).await.unwrap());
     }
     let answers = futures::future::join_all(clients.into_iter().map(|mut c| async move {
-        c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+            .await
+            .unwrap();
         let mut head = Vec::new();
         let mut buf = [0u8; 512];
         while !head.windows(4).any(|w| w == b"\r\n\r\n") {

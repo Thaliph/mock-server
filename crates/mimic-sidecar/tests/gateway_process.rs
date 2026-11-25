@@ -10,10 +10,12 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use common::capture_logs;
-use common::gateway_rig::{BIN, connect, free_port, gateway, get, local, ports_value, read_head};
+use common::gateway_rig::{
+    BIN, connect, free_port, gateway, get, local, ports_value, read_head, run_bounded,
+};
 use mimic_runtime::admin;
 use mimic_runtime::metrics::Metrics;
-use mimic_runtime::testing::{Process, http_get, run, wait_status};
+use mimic_runtime::testing::{Process, http_get, wait_status};
 use mimic_sidecar::gateway::config::GatewayConfig;
 use mimic_sidecar::gateway::serve::Gateway;
 use tower::ServiceExt;
@@ -114,8 +116,8 @@ fn gw_18_invalid_gateway_variables_exit_2_naming_the_variable() {
         if let Some(value) = value {
             env.push((var, value));
         }
-        let (status, stdout, stderr) = run(BIN, &[], &env);
-        assert_eq!(status.code(), Some(2), "{var}={value:?}: {stderr}");
+        let (code, stdout, stderr) = run_bounded(&env);
+        assert_eq!(code, Some(2), "{var}={value:?}: {stderr}");
         assert!(stderr.contains(var), "{var}={value:?}: {stderr}");
         assert!(!stdout.contains("admin listening"), "{var}={value:?}");
     }
@@ -140,7 +142,11 @@ fn gw_18_a_bound_port_exits_1_with_one_error() {
     let value = ports_value(&[free, port]);
     let mut process = Process::spawn(
         BIN,
-        &[ADMIN, ("MIMIC_ROLE", "gateway"), ("MIMIC_GATEWAY_PORTS", &value)],
+        &[
+            ADMIN,
+            ("MIMIC_ROLE", "gateway"),
+            ("MIMIC_GATEWAY_PORTS", &value),
+        ],
     );
     let status = process.wait_exit(Duration::from_secs(5));
     assert_eq!(status.code(), Some(1), "{:?}", process.lines());
@@ -182,7 +188,9 @@ async fn gw_20_readyz_is_503_until_every_listener_is_bound() {
         gateway.readiness(),
     );
     assert_eq!(readyz(&router).await, 503);
-    let listeners = gateway.bind(false).unwrap_or_else(|e| panic!("{}", e.source));
+    let listeners = gateway
+        .bind(false)
+        .unwrap_or_else(|e| panic!("{}", e.source));
     assert_eq!(listeners.len(), 2);
     assert_eq!(readyz(&router).await, 200);
     gateway.shutdown();

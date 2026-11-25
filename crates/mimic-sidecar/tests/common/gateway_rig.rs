@@ -42,6 +42,47 @@ pub fn gateway(ports: &[u16], extra: &[(&str, &str)]) -> (Process, SocketAddr) {
     (process, admin)
 }
 
+/// Runs the binary with only `PATH` and `env`, like `testing::run`, but kills it and fails
+/// after 10 s: a value wrongly accepted starts a gateway that never exits.
+pub fn run_bounded(env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(BIN);
+    command
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let mut child = command.spawn().expect("binary starts");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("still running after 10 s: {env:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status.code(), out.join().unwrap(), err.join().unwrap())
+}
+
 pub fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -77,11 +118,12 @@ impl Head {
         assert_eq!(self.status, 404, "{self:?}");
         let mut fields = self.fields.clone();
         fields.sort();
-        let mut want: Vec<(String, String)> = [("content-length", "0"), ("x-mimic-error", "no-route")]
-            .iter()
-            .chain(extra)
-            .map(|(n, v)| (n.to_string(), v.to_string()))
-            .collect();
+        let mut want: Vec<(String, String)> =
+            [("content-length", "0"), ("x-mimic-error", "no-route")]
+                .iter()
+                .chain(extra)
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect();
         want.sort();
         assert_eq!(fields, want, "{self:?}");
         assert!(self.rest.is_empty(), "{self:?}");
@@ -133,7 +175,12 @@ pub fn closed(stream: &mut TcpStream) -> bool {
         match stream.read(&mut buf) {
             Ok(0) => return true,
             Ok(_) => continue,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 return false;
             }
             Err(_) => return true,
