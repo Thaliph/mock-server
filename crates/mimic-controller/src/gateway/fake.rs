@@ -32,7 +32,6 @@ pub(super) type Id = (String, String, String);
 /// shop/web`, `status GatewayClass mimic`.
 #[derive(Debug, Clone)]
 pub(super) struct Request {
-    pub replica: usize,
     pub what: String,
     pub body: Value,
     pub ok: bool,
@@ -178,7 +177,7 @@ impl FakeApi {
     }
 
     /// Records the call, and fails it when scripted.
-    fn call(&self, replica: usize, what: String, body: &Value) -> Result<(), ApiError> {
+    fn call(&self, what: String, body: &Value) -> Result<(), ApiError> {
         let failure = {
             let mut errors = self.errors.lock().unwrap();
             let index = errors
@@ -187,7 +186,6 @@ impl FakeApi {
             index.map(|i| errors.remove(i).1)
         };
         self.calls.lock().unwrap().push(Request {
-            replica,
             what,
             body: body.clone(),
             ok: failure.is_none(),
@@ -227,7 +225,6 @@ impl FakeApi {
 }
 
 pub(super) struct Replica {
-    pub id: usize,
     pub api: Arc<FakeApi>,
 }
 
@@ -241,7 +238,7 @@ impl Cluster for Replica {
     ) -> ClusterFuture<'a, Value> {
         Box::pin(async move {
             let what = format!("apply {} {namespace}/{name}", kind.as_str());
-            self.api.call(self.id, what, body)?;
+            self.api.call(what, body)?;
             Ok(self.api.apply(kind.as_str(), namespace, name, body))
         })
     }
@@ -254,7 +251,7 @@ impl Cluster for Replica {
     ) -> ClusterFuture<'a, Option<Value>> {
         Box::pin(async move {
             let what = format!("get {} {namespace}/{name}", kind.as_str());
-            self.api.call(self.id, what, &Value::Null)?;
+            self.api.call(what, &Value::Null)?;
             Ok(self.api.get(kind.as_str(), namespace, name))
         })
     }
@@ -268,7 +265,7 @@ impl Cluster for Replica {
     ) -> ClusterFuture<'a, ()> {
         Box::pin(async move {
             let what = format!("delete {} {namespace}/{name} {uid}", kind.as_str());
-            self.api.call(self.id, what, &Value::Null)?;
+            self.api.call(what, &Value::Null)?;
             let held = self.api.get(kind.as_str(), namespace, name);
             if held.is_some_and(|o| o["metadata"]["uid"] == uid) {
                 self.api.remove(kind.as_str(), namespace, name);
@@ -292,7 +289,7 @@ impl Cluster for Replica {
             } else {
                 format!("status {kind} {namespace}/{name}")
             };
-            self.api.call(self.id, what, body)?;
+            self.api.call(what, body)?;
             self.api.edit(kind, namespace, name, |o| {
                 o["status"] = body["status"].clone();
             });
@@ -330,10 +327,7 @@ impl Rig {
             } else {
                 GatewayMetrics::register(&mut Registry::default())
             };
-            let cluster = Arc::new(Replica {
-                id,
-                api: api.clone(),
-            });
+            let cluster = Arc::new(Replica { api: api.clone() });
             replicas.push(Reconciler::new(settings.clone(), cluster, m.clone()));
             metrics.push(m);
         }

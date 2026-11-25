@@ -642,6 +642,13 @@ async fn gw_10_programmed_with_the_address_once_ready() {
     for _ in 0..3 {
         rig.round(0).await;
     }
+    // A status rewritten while it stays programmed: no new line.
+    rig.api.edit("Gateway", "shop", "web", |g| {
+        g["status"]["conditions"][0]["message"] = json!("edited");
+    });
+    rig.api.clear();
+    rig.round(0).await;
+    assert_eq!(whats(&rig), s(&["status Gateway shop/web"]));
     let text = lines_of(&lines);
     let info: Vec<&str> = text
         .lines()
@@ -864,6 +871,24 @@ async fn gw_12_an_unmanaged_object_blocks_the_gateway() {
 }
 
 #[tokio::test]
+async fn gw_12_an_object_with_the_gateway_label_only_is_not_managed() {
+    let rig = fixture(1);
+    let mut taken = generated(&rig, "web").service;
+    taken["metadata"]["labels"] = json!({"mimic.platform.io/gateway": "web"});
+    rig.api.put("Service", taken);
+    rig.round(0).await;
+    let writes: Vec<String> = whats(&rig)
+        .into_iter()
+        .filter(|w| w.starts_with("apply ") || w.starts_with("delete "))
+        .collect();
+    assert_eq!(writes, Vec::<String>::new());
+    assert_eq!(
+        programmed_of(&rig, "shop/web")["message"],
+        "Service web-mimic exists and is not managed by mimic"
+    );
+}
+
+#[tokio::test]
 async fn gw_12_objects_of_an_older_gateway_are_adopted() {
     let rig = fixture(1);
     let old = generated(&rig, "web");
@@ -1060,6 +1085,18 @@ async fn gw_14_failures_back_off_and_warn_once_per_streak() {
         assert!(at.abs_diff(want * 1000) <= 10, "{tries:?}");
         assert_eq!(*ok, want == 121, "{tries:?}");
     }
+    // Skipped whole while failing: no status before the objects are applied.
+    let statuses: Vec<u64> = rig
+        .api
+        .calls()
+        .into_iter()
+        .filter(|c| c.what == "status Gateway shop/web")
+        .map(|c| (c.at - start).as_millis() as u64)
+        .collect();
+    assert!(
+        !statuses.is_empty() && statuses.iter().all(|at| *at >= 121_000),
+        "{statuses:?}"
+    );
     // 8 for `web`, 1 for `bad`.
     assert_eq!(count(&rig.metrics[0], "error"), 9);
     let text = lines_of(&lines);
@@ -1098,6 +1135,34 @@ async fn gw_14_failures_back_off_and_warn_once_per_streak() {
         !text.contains(CANARY),
         "no hostname or annotation value in a log line"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn gw_14_a_retry_left_untaken_does_not_spin() {
+    let rig = fixture(1);
+    let mut stray = generated(&rig, "web").deployment;
+    stray["metadata"]["name"] = json!("stray");
+    stray["metadata"]["labels"]["mimic.platform.io/gateway"] = json!("ghost");
+    rig.api.put("Deployment", stray);
+    rig.api
+        .fail("delete Deployment shop/stray", "InternalError", 500);
+    rig.round(0).await;
+    assert!(
+        rig.api.get("Deployment", "shop", "stray").is_some(),
+        "the delete failed"
+    );
+    // `ghost` now names a Gateway of another class: `stray` is no longer swept.
+    rig.api.put(
+        "GatewayClass",
+        class_object("istio", "istio.io/gateway-controller"),
+    );
+    let mut ghost = gateway_object("shop", "ghost", http(80));
+    ghost["spec"]["gatewayClassName"] = json!("istio");
+    rig.api.put("Gateway", ghost);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    rig.read(0);
+    let next = rig.replicas[0].pass(NOW).await.expect("the resync");
+    assert!(next > Instant::now(), "a due instant in the past");
 }
 
 #[tokio::test]

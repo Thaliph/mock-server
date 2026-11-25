@@ -238,12 +238,58 @@ fn seen<S>(meta: &ObjectMeta, digest: u64, state: S) -> Option<(Key, Seen<S>)> {
 
 /// A gateway Deployment: its replicas and generations.
 pub fn deployment(object: &Deployment) -> Option<(Key, Seen<DeploymentState>)> {
-    let _ = (object, seen::<DeploymentState>);
-    None
+    let status = object.status.as_ref();
+    let state = DeploymentState {
+        generation: object.metadata.generation.unwrap_or(0),
+        observed_generation: status.and_then(|s| s.observed_generation).unwrap_or(0),
+        available_replicas: status
+            .and_then(|s| s.available_replicas)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0),
+        replica_failure: status
+            .and_then(|s| s.conditions.as_ref())
+            .into_iter()
+            .flatten()
+            .any(|c| c.type_ == "ReplicaFailure" && c.status == "True"),
+    };
+    seen(
+        &object.metadata,
+        digest(&object.metadata, &object.spec),
+        state,
+    )
 }
 
 /// A gateway Service: its type and addresses.
 pub fn service(object: &Service) -> Option<(Key, Seen<ServiceState>)> {
-    let _ = object;
-    None
+    let spec = object.spec.as_ref();
+    let state = ServiceState {
+        service_type: spec
+            .and_then(|s| s.type_.clone())
+            .unwrap_or_else(|| "ClusterIP".into()),
+        cluster_ips: spec
+            .and_then(|s| s.cluster_ips.as_ref())
+            .into_iter()
+            .flatten()
+            // `None` is how a headless Service says it has no address.
+            .filter(|ip| *ip != "None")
+            .cloned()
+            .collect(),
+        ingress: object
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|l| l.ingress.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|i| Ingress {
+                ip: i.ip.clone(),
+                hostname: i.hostname.clone(),
+            })
+            .collect(),
+    };
+    seen(
+        &object.metadata,
+        digest(&object.metadata, &object.spec),
+        state,
+    )
 }

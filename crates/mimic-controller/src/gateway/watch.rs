@@ -1,12 +1,15 @@
-//! The reflectors of the gateway reconciler (spec §7.10 "What is read"): `gatewayclasses` and
-//! `gateways`, cluster-wide, each event converted at once into the input structs, so that only
-//! the fields the reconciler uses are kept in memory.
+//! The reflectors of the gateway reconciler (spec §7.10 "What is read"): `gatewayclasses`,
+//! `gateways`, and the `deployments` and `services` with the gateway label, cluster-wide, each
+//! event converted at once, so that only the fields the reconciler uses are kept in memory.
 
 use std::sync::Arc;
 
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Service;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher;
+use mimic_core::gateway::GATEWAY_LABEL;
 
 use super::cluster::ApiError;
 use super::convert;
@@ -32,6 +35,40 @@ async fn classes(client: kube::Client, reconciler: Arc<Reconciler>) {
             convert::class,
             |e| reconciler.feed_classes(e),
             Some(&api),
+        )
+        .await;
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
+/// The objects with the gateway label: the full objects, for the Deployment status and the
+/// Service addresses; only their [`convert::Seen`] is kept.
+async fn deployments(client: kube::Client, reconciler: Arc<Reconciler>) {
+    loop {
+        let api = Api::<Deployment>::all(client.clone());
+        let config = watcher::Config::default().labels(GATEWAY_LABEL);
+        let events = watcher::watcher(api, config).default_backoff();
+        forward(
+            events,
+            convert::deployment,
+            |e| reconciler.feed_deployments(e),
+            None,
+        )
+        .await;
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
+async fn services(client: kube::Client, reconciler: Arc<Reconciler>) {
+    loop {
+        let api = Api::<Service>::all(client.clone());
+        let config = watcher::Config::default().labels(GATEWAY_LABEL);
+        let events = watcher::watcher(api, config).default_backoff();
+        forward(
+            events,
+            convert::service,
+            |e| reconciler.feed_services(e),
+            None,
         )
         .await;
         tokio::time::sleep(RETRY).await;
@@ -81,6 +118,8 @@ pub fn start(client: kube::Client, hub: Arc<Hub>, reconciler: Option<Arc<Reconci
         return;
     };
     tokio::spawn(classes(client.clone(), reconciler.clone()));
+    tokio::spawn(deployments(client.clone(), reconciler.clone()));
+    tokio::spawn(services(client.clone(), reconciler.clone()));
     tokio::spawn(gateways(client, hub, reconciler.clone()));
     tokio::spawn(reconciler.run());
 }
