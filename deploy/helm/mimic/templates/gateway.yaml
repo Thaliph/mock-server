@@ -1,0 +1,326 @@
+{{- if .Values.gateway.enabled }}
+{{- if not .Values.mesh.enabled }}
+{{- fail "gateway.enabled needs mesh.enabled: the gateway data plane is the mesh client (spec §7.10)" }}
+{{- end }}
+{{- if not .Values.image.digest }}
+{{- fail "gateway.enabled needs image.digest: the gateway policy pins the mimic image by digest (spec §7.10)" }}
+{{- end }}
+{{- if empty .Values.gateway.namespaces }}
+{{- fail "gateway.enabled needs at least one namespace in gateway.namespaces (spec §7.10)" }}
+{{- end }}
+{{- if not (and (.Capabilities.APIVersions.Has "gateway.networking.k8s.io/v1/Gateway") (.Capabilities.APIVersions.Has "gateway.networking.k8s.io/v1/GatewayClass")) }}
+{{- fail "gateway.enabled needs the Gateway API CRDs (gateway.networking.k8s.io/v1 Gateway and GatewayClass) at install (spec §2)" }}
+{{- end }}
+{{- if not (has .Values.gateway.serviceType (list "ClusterIP" "NodePort" "LoadBalancer")) }}
+{{- fail "gateway.serviceType must be ClusterIP, NodePort or LoadBalancer" }}
+{{- end }}
+{{- $ns := .Values.gateway.namespaces | sortAlpha }}
+{{- $nsList := printf "['%s']" (join "', '" $ns) }}
+{{- $sysctls := "[{'name': 'net.ipv4.ip_unprivileged_port_start', 'value': '0'}]" }}
+{{- $dp := "!variables.isDeployment || (" }}
+{{- $dc := "!variables.isDeployment || (size(variables.pod.containers) == 1 && " }}
+# The mimic Gateway (spec §7.10, M6): the class, the namespaced write RBAC and the admission policy
+# that restricts what the controller may write with it. Messages name the field that refused the object.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: mimic
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  controllerName: mimic.platform.io/gateway-controller
+---
+# Namespaced writes only: this ClusterRole is bound by one RoleBinding per listed namespace, never by a
+# ClusterRoleBinding. No list or watch: the controller reads the objects through its own ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, create, patch, delete]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, create, patch, delete]
+{{- range $ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $.Release.Name }}-gateway
+  namespace: {{ . }}
+  labels:
+    {{- include "mimic.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $.Release.Name }}-gateway
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Release.Name }}-controller
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+---
+# Only the controller's account is matched, so the objects of any other user are not this policy's business.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [deployments]
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [services]
+      - apiGroups: [policy]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [poddisruptionbudgets]
+  matchConditions:
+    - name: controller-service-account
+      expression: 'request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-controller"'
+  variables:
+    # DELETE: only the labels of the deleted object (oldObject) are checked. object is null on DELETE and
+    # oldObject on CREATE, so every read below goes through target or is guarded by the operation.
+    - name: isDelete
+      expression: 'request.operation == "DELETE"'
+    - name: target
+      expression: 'variables.isDelete ? oldObject : object'
+    - name: labels
+      expression: 'has(variables.target.metadata.labels) ? variables.target.metadata.labels : dyn({})'
+    - name: v
+      expression: '''mimic.platform.io/gateway'' in variables.labels ? string(variables.labels[''mimic.platform.io/gateway'']) : '''''
+    - name: isDeployment
+      expression: 'request.resource.resource == "deployments" && !variables.isDelete'
+    - name: isService
+      expression: 'request.resource.resource == "services" && !variables.isDelete'
+    - name: isPdb
+      expression: 'request.resource.resource == "poddisruptionbudgets" && !variables.isDelete'
+    # Deployments only: the lazy variables below are evaluated only behind `!variables.isDeployment ||`.
+    - name: pod
+      expression: 'object.spec.template.spec'
+    - name: container
+      expression: 'variables.pod.containers[0]'
+    - name: psc
+      expression: 'has(variables.pod.securityContext) ? variables.pod.securityContext : dyn({})'
+    - name: sc
+      expression: 'has(variables.container.securityContext) ? variables.container.securityContext : dyn({})'
+  validations:
+    # All three kinds.
+    - expression: >-
+        'app.kubernetes.io/managed-by' in variables.labels
+        && variables.labels['app.kubernetes.io/managed-by'] == 'mimic'
+        && 'mimic.platform.io/gateway' in variables.labels
+      message: "gateway objects: metadata.labels must hold app.kubernetes.io/managed-by mimic and mimic.platform.io/gateway (spec 7.10)"
+    - expression: >-
+        variables.isDelete || request.namespace in {{ $nsList }}
+      message: "gateway objects: the namespace must be one of gateway.namespaces (spec 7.10)"
+    - expression: >-
+        variables.isDelete || request.operation != 'UPDATE' || (
+        has(oldObject.metadata.labels)
+        && 'app.kubernetes.io/managed-by' in oldObject.metadata.labels
+        && oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'mimic'
+        && 'mimic.platform.io/gateway' in oldObject.metadata.labels)
+      message: "gateway objects: the object being updated must already carry the labels app.kubernetes.io/managed-by mimic and mimic.platform.io/gateway"
+    - expression: >-
+        variables.isDelete || (
+        'gateway.networking.k8s.io/gateway-name' in variables.labels
+        && variables.labels['gateway.networking.k8s.io/gateway-name'] == variables.v)
+      message: "gateway objects: metadata.labels gateway.networking.k8s.io/gateway-name must equal mimic.platform.io/gateway"
+    - expression: >-
+        variables.isDelete || (
+        has(object.metadata.ownerReferences)
+        && size(object.metadata.ownerReferences) == 1
+        && object.metadata.ownerReferences[0].apiVersion == 'gateway.networking.k8s.io/v1'
+        && object.metadata.ownerReferences[0].kind == 'Gateway'
+        && object.metadata.ownerReferences[0].name == variables.v
+        && has(object.metadata.ownerReferences[0].controller)
+        && object.metadata.ownerReferences[0].controller == true
+        && (!has(object.metadata.ownerReferences[0].blockOwnerDeletion) || object.metadata.ownerReferences[0].blockOwnerDeletion == false))
+      message: "gateway objects: metadata.ownerReferences must be the one Gateway named by mimic.platform.io/gateway, controller true, blockOwnerDeletion absent or false"
+    # Deployments.
+    - expression: >-
+        {{ $dp }}object.spec.selector == {'matchLabels': {'mimic.platform.io/gateway': variables.v}})
+      message: "gateway deployment: spec.selector must be matchLabels mimic.platform.io/gateway only"
+    - expression: >-
+        {{ $dp }}has(object.spec.template.metadata.labels)
+        && 'mimic.platform.io/gateway' in object.spec.template.metadata.labels
+        && object.spec.template.metadata.labels['mimic.platform.io/gateway'] == variables.v
+        && 'mimic.platform.io/inject' in object.spec.template.metadata.labels
+        && object.spec.template.metadata.labels['mimic.platform.io/inject'] == 'disabled')
+      message: "gateway deployment: spec.template.metadata.labels must hold mimic.platform.io/gateway and mimic.platform.io/inject disabled"
+    - expression: '{{ $dp }}has(object.spec.replicas) && object.spec.replicas >= 1 && object.spec.replicas <= {{ .Values.gateway.maxReplicas }})'
+      message: "gateway deployment: spec.replicas must be from 1 to gateway.maxReplicas"
+    - expression: '{{ $dp }}size(variables.pod.containers) == 1)'
+      message: "gateway deployment: exactly one container"
+    - expression: >-
+        {{ $dp }}(!has(variables.pod.initContainers) || size(variables.pod.initContainers) == 0)
+        && (!has(variables.pod.ephemeralContainers) || size(variables.pod.ephemeralContainers) == 0))
+      message: "gateway deployment: no init or ephemeral container"
+    - expression: '{{ $dc }}variables.container.image == "{{ include "mimic.image" . }}")'
+      message: "gateway deployment: image must be the mimic image of the chart, by digest"
+    - expression: '{{ $dc }}has(variables.container.command) && variables.container.command == ["/usr/local/bin/mimic-sidecar"])'
+      message: "gateway deployment: command must be [/usr/local/bin/mimic-sidecar]"
+    - expression: '{{ $dc }}!has(variables.container.args))'
+      message: "gateway deployment: args must be absent"
+    - expression: >-
+        {{ $dc }}has(variables.container.env)
+        && variables.container.env.all(e, e.name in ['MIMIC_ROLE', 'MIMIC_GATEWAY_PORTS', 'MIMIC_LOG']))
+      message: "gateway deployment: env names must be MIMIC_ROLE, MIMIC_GATEWAY_PORTS and MIMIC_LOG only"
+    - expression: '{{ $dc }}has(variables.container.env) && variables.container.env.all(e, !has(e.valueFrom)))'
+      message: "gateway deployment: env must hold literal values, no valueFrom"
+    - expression: >-
+        {{ $dc }}has(variables.container.env)
+        && variables.container.env.exists(e, e.name == 'MIMIC_ROLE' && has(e.value) && e.value == 'gateway'))
+      message: "gateway deployment: env MIMIC_ROLE must be gateway"
+    - expression: '{{ $dc }}!has(variables.container.envFrom) || size(variables.container.envFrom) == 0)'
+      message: "gateway deployment: envFrom must be absent"
+    - expression: >-
+        {{ $dc }}(!has(variables.pod.volumes) || size(variables.pod.volumes) == 0)
+        && (!has(variables.container.volumeMounts) || size(variables.container.volumeMounts) == 0)
+        && (!has(variables.container.volumeDevices) || size(variables.container.volumeDevices) == 0))
+      message: "gateway deployment: volumes, volumeMounts and volumeDevices must be absent"
+{{- range $probe := list "readinessProbe" "livenessProbe" "startupProbe" }}
+    - expression: >-
+        {{ $dc }}!has(variables.container.{{ $probe }}) || (
+        has(variables.container.{{ $probe }}.httpGet)
+        && variables.container.{{ $probe }}.httpGet.port == 15100
+        && !has(variables.container.{{ $probe }}.httpGet.host)
+        && !has(variables.container.{{ $probe }}.exec)
+        && !has(variables.container.{{ $probe }}.tcpSocket)
+        && !has(variables.container.{{ $probe }}.grpc)))
+      message: "gateway deployment: {{ $probe }} must be an httpGet on port 15100 without host, no exec, tcpSocket or grpc"
+{{- end }}
+    - expression: '{{ $dc }}!has(variables.container.lifecycle))'
+      message: "gateway deployment: lifecycle must be absent"
+    - expression: >-
+        {{ $dc }}!has(variables.container.ports)
+        || variables.container.ports.all(p, (!has(p.hostPort) || p.hostPort == 0) && (!has(p.hostIP) || p.hostIP == '')))
+      message: "gateway deployment: container ports must have no hostPort and no hostIP"
+    - expression: '{{ $dp }}has(variables.pod.automountServiceAccountToken) && variables.pod.automountServiceAccountToken == false)'
+      message: "gateway deployment: automountServiceAccountToken must be false"
+    - expression: >-
+        {{ $dp }}(!has(variables.pod.serviceAccountName) || variables.pod.serviceAccountName in ['', 'default'])
+        && (!has(variables.pod.serviceAccount) || variables.pod.serviceAccount in ['', 'default']))
+      message: "gateway deployment: serviceAccountName must be default"
+    - expression: '{{ $dp }}has(variables.pod.enableServiceLinks) && variables.pod.enableServiceLinks == false)'
+      message: "gateway deployment: enableServiceLinks must be false"
+    - expression: '{{ $dp }}!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false)'
+      message: "gateway deployment: hostNetwork must be absent or false"
+    - expression: '{{ $dp }}!has(variables.pod.hostPID) || variables.pod.hostPID == false)'
+      message: "gateway deployment: hostPID must be absent or false"
+    - expression: '{{ $dp }}!has(variables.pod.hostIPC) || variables.pod.hostIPC == false)'
+      message: "gateway deployment: hostIPC must be absent or false"
+    - expression: '{{ $dp }}!has(variables.pod.shareProcessNamespace) || variables.pod.shareProcessNamespace == false)'
+      message: "gateway deployment: shareProcessNamespace must be absent or false"
+    - expression: '{{ $dp }}!has(variables.pod.hostUsers) || variables.pod.hostUsers != true)'
+      message: "gateway deployment: hostUsers must not be true"
+    - expression: '{{ $dp }}!has(variables.pod.nodeName) || variables.pod.nodeName == "")'
+      message: "gateway deployment: nodeName must be absent"
+    - expression: '{{ $dp }}!has(variables.pod.tolerations) || size(variables.pod.tolerations) == 0)'
+      message: "gateway deployment: tolerations must be absent"
+    - expression: '{{ $dp }}!has(variables.pod.hostAliases) || size(variables.pod.hostAliases) == 0)'
+      message: "gateway deployment: hostAliases must be absent"
+    - expression: '{{ $dp }}!has(variables.pod.priorityClassName) || variables.pod.priorityClassName == "")'
+      message: "gateway deployment: priorityClassName must be absent"
+    - expression: '{{ $dp }}!has(variables.pod.runtimeClassName) || variables.pod.runtimeClassName == "")'
+      message: "gateway deployment: runtimeClassName must be absent"
+    - expression: '{{ $dp }}!has(variables.pod.affinity))'
+      message: "gateway deployment: affinity must be absent"
+    - expression: '{{ $dp }}!has(variables.pod.schedulerName) || variables.pod.schedulerName in ["", "default-scheduler"])'
+      message: "gateway deployment: schedulerName must be default-scheduler"
+    - expression: '{{ $dc }}!has(variables.psc.seLinuxOptions) && !has(variables.sc.seLinuxOptions))'
+      message: "gateway deployment: seLinuxOptions must be absent"
+    - expression: '{{ $dc }}!has(variables.psc.appArmorProfile) && !has(variables.sc.appArmorProfile))'
+      message: "gateway deployment: appArmorProfile must be absent"
+    # One rule per field before the two exact maps, so that a refusal names the field.
+    - expression: '{{ $dc }}has(variables.psc.runAsUser) && variables.psc.runAsUser == 65532 && !has(variables.sc.runAsUser))'
+      message: "gateway deployment: the pod securityContext runAsUser must be 65532 and the container's absent"
+    - expression: '{{ $dc }}has(variables.psc.runAsGroup) && variables.psc.runAsGroup == 65532 && !has(variables.sc.runAsGroup))'
+      message: "gateway deployment: the pod securityContext runAsGroup must be 65532 and the container's absent"
+    - expression: '{{ $dc }}!has(variables.sc.privileged) || variables.sc.privileged == false)'
+      message: "gateway deployment: privileged must be absent or false"
+    - expression: '{{ $dc }}has(variables.sc.capabilities) && !has(variables.sc.capabilities.add))'
+      message: "gateway deployment: capabilities.add must be absent"
+    - expression: >-
+        {{ $dc }}has(variables.psc.sysctls) && variables.psc.sysctls == {{ $sysctls }})
+      message: "gateway deployment: the pod securityContext sysctls must be net.ipv4.ip_unprivileged_port_start 0 only"
+    - expression: >-
+        {{ $dc }}variables.psc == {'runAsNonRoot': true, 'runAsUser': 65532, 'runAsGroup': 65532,
+        'seccompProfile': {'type': 'RuntimeDefault'}, 'sysctls': {{ $sysctls }}})
+      message: "gateway deployment: the pod securityContext must be exactly runAsNonRoot, runAsUser 65532, runAsGroup 65532, seccompProfile RuntimeDefault and the one sysctl (spec 7.10)"
+    - expression: >-
+        {{ $dc }}has(variables.sc.capabilities) && variables.sc.capabilities == {'drop': ['ALL']})
+      message: "gateway deployment: capabilities must be exactly drop ALL"
+    - expression: >-
+        {{ $dc }}variables.sc == {'allowPrivilegeEscalation': false, 'readOnlyRootFilesystem': true,
+        'capabilities': {'drop': ['ALL']}})
+      message: "gateway deployment: the container securityContext must be exactly allowPrivilegeEscalation false, readOnlyRootFilesystem true and capabilities drop ALL (spec 7.10)"
+    - expression: >-
+        {{ $dc }}has(variables.container.resources) && variables.container.resources == {{ toJson .Values.gateway.resources }})
+      message: "gateway deployment: resources must be those of gateway.resources"
+    # Services.
+    - expression: "!variables.isService || (has(object.spec.type) ? object.spec.type : 'ClusterIP') == '{{ .Values.gateway.serviceType }}'"
+      message: "gateway service: spec.type must be gateway.serviceType"
+    - expression: >-
+        !variables.isService || (has(object.spec.selector)
+        && object.spec.selector == {'mimic.platform.io/gateway': variables.v})
+      message: "gateway service: spec.selector must be mimic.platform.io/gateway only"
+    - expression: >-
+        !variables.isService || !has(object.spec.ports) || object.spec.ports.all(p,
+        (!has(p.protocol) || p.protocol == 'TCP') && p.port != 15100
+        && has(p.targetPort) && type(p.targetPort) == int && p.targetPort == p.port)
+      message: "gateway service: spec.ports must be TCP, not 15100, with targetPort equal to port"
+    - expression: >-
+        !variables.isService || (
+        (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0)
+        && (!has(object.spec.externalName) || object.spec.externalName == '')
+        && (!has(object.spec.loadBalancerIP) || object.spec.loadBalancerIP == '')
+        && (!has(object.spec.loadBalancerSourceRanges) || size(object.spec.loadBalancerSourceRanges) == 0)
+        && (!has(object.spec.loadBalancerClass) || object.spec.loadBalancerClass == ''))
+      message: "gateway service: externalIPs, externalName, loadBalancerIP, loadBalancerSourceRanges and loadBalancerClass must be absent"
+    - expression: >-
+        !variables.isService || (
+        (!has(object.spec.externalTrafficPolicy) || object.spec.externalTrafficPolicy == 'Cluster')
+        && (!has(object.spec.internalTrafficPolicy) || object.spec.internalTrafficPolicy == 'Cluster'))
+      message: "gateway service: externalTrafficPolicy and internalTrafficPolicy must be absent or Cluster"
+    - expression: '!variables.isService || !has(object.spec.sessionAffinity) || object.spec.sessionAffinity == ''None'''
+      message: "gateway service: sessionAffinity must be absent or None"
+    - expression: '!variables.isService || !has(object.spec.publishNotReadyAddresses) || object.spec.publishNotReadyAddresses == false'
+      message: "gateway service: publishNotReadyAddresses must be absent or false"
+    # PodDisruptionBudgets.
+    - expression: >-
+        !variables.isPdb || (has(object.spec.selector)
+        && object.spec.selector == {'matchLabels': {'mimic.platform.io/gateway': variables.v}})
+      message: "gateway poddisruptionbudget: spec.selector must be matchLabels mimic.platform.io/gateway only"
+    - expression: >-
+        !variables.isPdb || (has(object.spec.maxUnavailable)
+        && type(object.spec.maxUnavailable) == int && object.spec.maxUnavailable == 1)
+      message: "gateway poddisruptionbudget: spec.maxUnavailable must be the number 1"
+    - expression: '!variables.isPdb || !has(object.spec.minAvailable)'
+      message: "gateway poddisruptionbudget: spec.minAvailable must be absent"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  policyName: {{ .Release.Name }}-gateway
+  validationActions: [Deny]
+{{- end }}

@@ -127,6 +127,17 @@ spec:
               value: {{ toJson .Values.inject.sidecarResources | quote }}
             - name: MIMIC_INJECT_SIDECAR_LOG
               value: {{ .Values.inject.sidecarLogLevel | quote }}
+            {{- if .Values.gateway.enabled }}
+            # The mimic Gateway (spec §7.10); the admission policy of gateway.yaml reads the same values.
+            - name: MIMIC_GATEWAY_NAMESPACES
+              value: {{ .Values.gateway.namespaces | sortAlpha | join "," | quote }}
+            - name: MIMIC_GATEWAY_SERVICE_TYPE
+              value: {{ .Values.gateway.serviceType | quote }}
+            - name: MIMIC_GATEWAY_MAX_REPLICAS
+              value: {{ .Values.gateway.maxReplicas | quote }}
+            - name: MIMIC_GATEWAY_RESOURCES
+              value: {{ toJson .Values.gateway.resources | quote }}
+            {{- end }}
           ports:
             - name: admin
               containerPort: 8081

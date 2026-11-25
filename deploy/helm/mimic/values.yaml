@@ -162,6 +162,22 @@ loadTest:
     namespace: kube-system
     podLabels: {k8s-app: kube-dns}
 
+# The mimic Gateway (spec §7.10, M6). Off by default. Needs mesh.enabled, image.digest, one namespace or
+# more and the Gateway API CRDs at install.
+gateway:
+  enabled: false
+  # Namespaces whose Gateways get objects. Each must exist at install: a RoleBinding is rendered in it.
+  namespaces: []
+  # type of every gateway Service: ClusterIP, NodePort or LoadBalancer.
+  serviceType: ClusterIP
+  # Highest mimic.platform.io/replicas a Gateway can ask for (1 to 100).
+  maxReplicas: 10
+  # resources of the gateway container. Write the quantities in canonical form (100m, 64Mi, 1Gi): the API
+  # server stores them so, and the admission policy compares them as written here.
+  resources:
+    requests: {cpu: 100m, memory: 64Mi}
+    limits: {memory: 128Mi}
+
 metrics:
   # Prometheus Operator ServiceMonitor for the controller.
   serviceMonitor:
