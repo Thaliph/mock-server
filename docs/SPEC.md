@@ -3704,6 +3704,9 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   the mesh client), `image.digest` (the admission policy pins the image by digest), a non-empty
   `gateway.namespaces`, and the Gateway API CRDs at install (§2; checked with
   `.Capabilities.APIVersions`): the chart fails with a message naming the missing one otherwise.
+  The chart also fails when `gateway.resources` has no `limits.memory`, or when
+  `gateway.maxConnections` × 96 KiB + 32 MiB is more than `limits.memory` (the memory budget of
+  the gateway role, "Gateway role" below).
   It renders the `GatewayClass` `mimic`, the RBAC of §11, the admission policy below and the
   controller variables `MIMIC_GATEWAY_*` (§10.2). With `gateway.enabled: false` none of them is
   rendered and the controller watches no Gateway API object but those of §7.9.
@@ -3714,7 +3717,9 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   | `gateway.namespaces` | `[]` | Namespaces whose Gateways get objects (`MIMIC_GATEWAY_NAMESPACES`). Each must exist at install (a RoleBinding is rendered in it). |
   | `gateway.serviceType` | `ClusterIP` | `type` of every gateway Service: `ClusterIP`, `NodePort` or `LoadBalancer` (`MIMIC_GATEWAY_SERVICE_TYPE`). |
   | `gateway.maxReplicas` | `10` | Highest replica count a Gateway may ask for (`MIMIC_GATEWAY_MAX_REPLICAS`). |
-  | `gateway.resources` | `{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | `resources` of the gateway container (`MIMIC_GATEWAY_RESOURCES`). |
+  | `gateway.maxConnections` | `1024` | Connections that one gateway pod serves at once (`MIMIC_GATEWAY_MAX_CONNECTIONS`, given to the pod as `MIMIC_MAX_CONNECTIONS`). It must fit `gateway.resources.limits.memory` (above). |
+  | `gateway.admittedAnnotations` | `[]` | Annotation keys that a mutating webhook of the platform adds to the gateway objects (for example `cloud.google.com/neg`). The admission policy admits these keys. The controller never writes them. |
+  | `gateway.resources` | `{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"memory":"192Mi"}}` | `resources` of the gateway container (`MIMIC_GATEWAY_RESOURCES`). |
 
 - **GatewayClass.** The chart creates `mimic` (`controllerName:
   mimic.platform.io/gateway-controller`, no `parametersRef`). The controller writes the status of
@@ -3736,28 +3741,32 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   `spec`, and the conditions and listener statuses already in the cluster), a field the
   converter does not know at any level of `spec` kept as its path only (as §7.9 "Routes"); a
   `spec` over 64 KiB of JSON converts to its key, generation and class only. Gateway labels and
-  `metadata.annotations` are not read.
+  `metadata.annotations` are not read. The controller converts a Gateway in full only when its
+  class is a mimic class and its namespace is in `MIMIC_GATEWAY_NAMESPACES`. For every other
+  Gateway it keeps a stub: the namespace, the name and the class name, without listeners or
+  status. A change of a stub that keeps its class starts no pass. When a GatewayClass becomes a
+  mimic class, the controller lists the `gateways` again. A pass copies no table when no full
+  Gateway, mimic class or labelled object changed.
 - **Acceptance** (pure, `gateway::accept`). The Gateway's `Accepted` condition is the first that
-  applies of:
-  1. namespace not in `MIMIC_GATEWAY_NAMESPACES`: `False`, `NamespaceNotAllowed`, message
-     `namespace <ns> is not in gateway.namespaces`;
-  2. the class's own `Accepted` is `False`: `False`, `InvalidParameters`, message `GatewayClass
+  applies of (a Gateway of a mimic class outside `MIMIC_GATEWAY_NAMESPACES` gets no condition,
+  no status and no object, §11.1):
+  1. the class's own `Accepted` is `False`: `False`, `InvalidParameters`, message `GatewayClass
      <name> is not accepted`;
-  3. name longer than 63 characters, `spec` over 64 KiB, an unknown field, `spec.tls`,
+  2. name longer than 63 characters, `spec` over 64 KiB, an unknown field, `spec.tls`,
      `spec.allowedListeners` with `namespaces.from` other than `None`,
      `spec.infrastructure.labels`, or a key of `spec.infrastructure.annotations` other than
      `mimic.platform.io/replicas`: `False`, `UnsupportedValue`, message `unsupported: <field
      path>` naming the first in document order (`name longer than 63 characters`, `gateway
      larger than 64 KiB`; annotation keys are named, their values never);
-  4. `spec.addresses` not empty: `False`, `UnsupportedAddress`, message `spec.addresses is not
+  3. `spec.addresses` not empty: `False`, `UnsupportedAddress`, message `spec.addresses is not
      supported`;
-  5. `spec.infrastructure.parametersRef`, or a `mimic.platform.io/replicas` value that is not a
+  4. `spec.infrastructure.parametersRef`, or a `mimic.platform.io/replicas` value that is not a
      decimal integer from 1 to `MIMIC_GATEWAY_MAX_REPLICAS` without sign or leading zero:
      `False`, `InvalidParameters`, the message naming the field (`must be 1 to <max>`);
-  6. no listener accepted (below): `False`, `ListenersNotValid`, message `no valid listener`;
-  7. some listeners not accepted: `True`, `ListenersNotValid`, message naming them (at most
+  5. no listener accepted (below): `False`, `ListenersNotValid`, message `no valid listener`;
+  6. some listeners not accepted: `True`, `ListenersNotValid`, message naming them (at most
      1024 bytes);
-  8. else `True`, `Accepted`.
+  7. else `True`, `Accepted`.
 
   **Listeners**, each in `spec.listeners` order, with conditions `Accepted`, `ResolvedRefs`,
   `Conflicted` and `Programmed`:
@@ -3799,7 +3808,8 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
     binds ports below 1024 without a capability); one container `gateway`: image
     `MIMIC_INJECT_SIDECAR_IMAGE`, `command: [/usr/local/bin/mimic-sidecar]`, env `MIMIC_ROLE=gateway`,
     `MIMIC_GATEWAY_PORTS` (the distinct ports of the accepted listeners, ascending,
-    comma-separated) and `MIMIC_LOG` (`MIMIC_INJECT_SIDECAR_LOG`), literal values only; ports:
+    comma-separated), `MIMIC_LOG` (`MIMIC_INJECT_SIDECAR_LOG`) and `MIMIC_MAX_CONNECTIONS`
+    (`MIMIC_GATEWAY_MAX_CONNECTIONS`), literal values only; ports:
     each listener port (`TCP`, no `hostPort`) and `15100` named `mimic-admin`; readiness
     `/readyz` and liveness `/healthz` (`httpGet`, port `15100`, no `host`); `resources`
     `MIMIC_GATEWAY_RESOURCES`; security context `allowPrivilegeEscalation: false`,
@@ -3855,8 +3865,8 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   server-side apply on the `status` subresource (field manager `mimic-gateway`, `force: true`;
   the class's controller is the only writer of a Gateway's status) only when it differs from the
   cluster's, ignoring `lastTransitionTime` of unchanged conditions. A change of a Gateway's
-  `status` alone triggers no apply. Gateways of a mimic class in any namespace get a status
-  (`NamespaceNotAllowed` included).
+  `status` alone triggers no apply. Only a Gateway of a mimic class in a namespace of
+  `MIMIC_GATEWAY_NAMESPACES` gets a status.
 - **Admission policy.** A `ValidatingAdmissionPolicy` `<release>-gateway` and its binding
   (`failurePolicy: Fail`, `validationActions: [Deny]`, `matchConditions` on the controller's
   service account user name), on `CREATE`, `UPDATE` and `DELETE` of `deployments` (`apps`),
@@ -3869,27 +3879,57 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
     `gateway.networking.k8s.io/gateway-name` equal to `mimic.platform.io/gateway` (`v` below),
     and exactly one owner reference, `gateway.networking.k8s.io/v1` `Gateway` named `v`,
     `controller: true`, `blockOwnerDeletion` absent or false;
-  - a Deployment whose selector is exactly `matchLabels: {mimic.platform.io/gateway: v}`, whose
-    pod labels hold it and `mimic.platform.io/inject: disabled`, with `replicas` 1 to
-    `gateway.maxReplicas`, and a pod of the shape above: one container and no
-    `initContainers` or `ephemeralContainers`; the chart's image by digest; that `command` and
-    no `args`; `env` names among `MIMIC_ROLE` (equal to `gateway`), `MIMIC_GATEWAY_PORTS` and
-    `MIMIC_LOG`, literal values, no `envFrom`; no volume and no volume mount; probes `httpGet` on
-    port 15100 without `host`, no `exec`, `tcpSocket`, `grpc` or `lifecycle`; container ports
-    without `hostPort` or `hostIP`; `automountServiceAccountToken: false`, service account
-    absent or `default`, `enableServiceLinks: false`; `hostNetwork`, `hostPID`, `hostIPC`,
-    `shareProcessNamespace` false or absent, `hostUsers` not `true`; no `nodeName`,
-    `tolerations`, `hostAliases`, `priorityClassName`, `runtimeClassName`, `affinity`,
-    `seLinuxOptions` or `appArmorProfile`, `schedulerName` absent or `default-scheduler`; the
-    pod and container security contexts above exactly (UID and GID 65532, no added capability,
-    no `privileged`, only the one sysctl); `resources` equal to `gateway.resources`;
-  - a Service whose `type` is `gateway.serviceType`, selector exactly `{mimic.platform.io/gateway:
-    v}`, `TCP` ports other than 15100 with `targetPort` equal to `port`, without `externalIPs`,
-    `externalName`, `loadBalancerIP`, `loadBalancerSourceRanges` or `loadBalancerClass`, and
-    `externalTrafficPolicy`, `internalTrafficPolicy`, `sessionAffinity` and
-    `publishNotReadyAddresses` absent or at the API server's default;
-  - a PodDisruptionBudget whose selector is exactly that label and `maxUnavailable: 1`, without
-    `minAvailable`.
+  - the shapes below, by **key allowlists**: the policy refuses a key that is not listed, so it
+    also refuses a field that a later Kubernetes version adds. A key that the API server sets
+    by default is listed with its default value only.
+  - `metadata` of each object: the labels are exactly the five of "Generated objects"; there
+    is no `finalizers`. The policy admits no annotation on `CREATE`. On `UPDATE` the controller
+    adds or changes no annotation key of `oldObject`: other writers can add keys (the Deployment
+    controller, `kubectl rollout restart`), so the policy compares with `oldObject`. A key of
+    `gateway.admittedAnnotations` is admitted at all times.
+  - a Deployment: `spec` keys `replicas` (1 to `gateway.maxReplicas`), `selector` (exactly
+    `matchLabels: {mimic.platform.io/gateway: v}`), `strategy`, `template`, and the defaults
+    `revisionHistoryLimit` (10) and `progressDeadlineSeconds` (600). The pod template
+    `metadata` has the keys `labels` and `annotations` only. Its labels are exactly
+    `app.kubernetes.io/name: mimic-gateway`, `mimic.platform.io/gateway: v` and
+    `mimic.platform.io/inject: disabled`. Its annotations follow the `metadata` rule above.
+  - the pod `spec`: keys `containers` (exactly one), `automountServiceAccountToken` (`false`),
+    `enableServiceLinks` (`false`), `securityContext` and `topologySpreadConstraints` (each
+    exactly as "Generated objects" gives it), and the defaults `dnsPolicy` (`ClusterFirst`),
+    `restartPolicy` (`Always`), `terminationGracePeriodSeconds` (30) and `schedulerName`
+    (`default-scheduler`). The policy thus refuses `nodeSelector`, `nodeName`, `affinity`,
+    `tolerations`, `dnsConfig`, `hostAliases`, `hostNetwork`, `hostPID`, `hostIPC`,
+    `hostUsers`, `shareProcessNamespace`, `serviceAccountName`, `imagePullSecrets`,
+    `priorityClassName`, `runtimeClassName`, `resourceClaims`, `readinessGates`,
+    `schedulingGates`, `activeDeadlineSeconds`, `volumes`, `initContainers` and
+    `ephemeralContainers`.
+  - the container: keys `name` (`gateway`), `image` (the chart's image by digest), `command`
+    (`[/usr/local/bin/mimic-sidecar]`), `env`, `ports`, `readinessProbe`, `livenessProbe`,
+    `resources` (equal to `gateway.resources`), `securityContext` (exactly as "Generated
+    objects" gives it: UID and GID 65532, no capability added, no `privileged`), and the
+    defaults `imagePullPolicy`, `terminationMessagePath` and `terminationMessagePolicy`. The
+    policy thus refuses `args`, `envFrom`, `volumeMounts`, `lifecycle`, `startupProbe`, `stdin`,
+    `tty`, `workingDir` and `resizePolicy`. The `env` names are exactly `MIMIC_GATEWAY_PORTS`,
+    `MIMIC_LOG`, `MIMIC_MAX_CONNECTIONS` (equal to `gateway.maxConnections`) and `MIMIC_ROLE`
+    (equal to `gateway`), each with a literal `value` and no `valueFrom`. A port has the keys
+    `containerPort`, `name` and `protocol` (`TCP`), so it has no `hostPort` or `hostIP`. A probe
+    has `httpGet` with the keys `path`, `port` (15100) and `scheme` (`HTTP`), and the timing
+    keys; it has no `host`, `httpHeaders`, `exec`, `tcpSocket` or `grpc`.
+  - a Service: `spec` keys `type` (`gateway.serviceType`), `selector` (exactly
+    `{mimic.platform.io/gateway: v}`), `ports`, the defaults `sessionAffinity` (`None`) and
+    `internalTrafficPolicy` (`Cluster`), for `NodePort` and `LoadBalancer` the default
+    `externalTrafficPolicy` (`Cluster`), for `LoadBalancer` the default
+    `allocateLoadBalancerNodePorts` (`true`), and `clusterIP`, `clusterIPs`, `ipFamilies` and
+    `ipFamilyPolicy`. The API server allocates `clusterIP` and `clusterIPs` before the policy
+    runs, so the policy admits any value on `CREATE` and only the `oldObject` value on `UPDATE`
+    (§11.1). A port has the keys `name`, `port` (not 15100), `targetPort` (equal to `port`),
+    `protocol` (`TCP`) and `nodePort`, which follows the same `CREATE` and `UPDATE` rule as
+    `clusterIP` (compared with the `oldObject` port of the same `port`). The policy thus refuses
+    `externalIPs`, `externalName`, `loadBalancerIP`, `loadBalancerSourceRanges`,
+    `loadBalancerClass`, `healthCheckNodePort`, `publishNotReadyAddresses`,
+    `sessionAffinityConfig` and `trafficDistribution`.
+  - a PodDisruptionBudget: `spec` keys `selector` (exactly `matchLabels:
+    {mimic.platform.io/gateway: v}`) and `maxUnavailable` (1) only.
 
   It cannot check that the objects match a real Gateway (it reads no other object): a stolen
   controller token can still create, scale to `gateway.maxReplicas` or delete gateway objects
@@ -3901,17 +3941,28 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   naming the port) and serves HTTP/1.1 and HTTP/2 with prior knowledge on them (`hyper`):
   until #457 every request is answered `404`, `x-mimic-error: no-route`, `content-length: 0`
   (the mesh's no-match answer, §7.9 "Routing"), its body not read. Bounds, since the listeners
-  face untrusted clients: at most `MIMIC_MAX_CONNECTIONS` connections over all listeners (more
-  are closed at accept); a request head must arrive within `MIMIC_GATEWAY_HEADER_TIMEOUT` and
-  fit 64 KiB (else `431` or the connection closed); an idle keep-alive connection is closed after
-  `MIMIC_GATEWAY_IDLE_TIMEOUT`; HTTP/2 allows 100 concurrent streams and a 64 KiB header list per
-  connection, with `hyper`'s reset-flood limits. `/readyz` answers `200` once every listener is
+  face untrusted clients:
+  - at most `MIMIC_MAX_CONNECTIONS` connections over all listeners (the process closes more at
+    accept). The generated pod sets it from `gateway.maxConnections`.
+  - a request head must arrive within `MIMIC_GATEWAY_HEADER_TIMEOUT` and fit 64 KiB (else `431`
+    or the connection is closed). The time starts when the connection is accepted, and again
+    after each answer. This applies to HTTP/1 and to HTTP/2: an HTTP/2 connection that sends
+    only the preface and `SETTINGS`, and no `HEADERS`, is closed at the header timeout.
+  - `MIMIC_GATEWAY_IDLE_TIMEOUT` applies only to a connection with no request in progress after
+    its first answer. When it expires, the process closes the connection.
+  - HTTP/2 allows 100 concurrent streams per connection, a 64 KiB header list, connection and
+    stream windows of 64 KiB, and `hyper`'s reset-flood limits.
+  - **Memory budget.** One held connection uses at most 96 KiB of the process memory, in the
+    worst case (a 63 KiB head without its end, or an HTTP/2 stream with 64 KiB of unread data).
+    The process itself uses at most 32 MiB. The chart and the controller check that
+    `MIMIC_GATEWAY_MAX_CONNECTIONS` × 96 KiB + 32 MiB fits the memory limit (GW-19 measures the
+    two numbers). `/readyz` answers `200` once every listener is
   bound; on `SIGTERM` it answers `503`, the listeners stop accepting and open connections are
   drained within `MIMIC_SHUTDOWN_GRACE`.
 - **Metrics and logs** (controller). `mimic_gateway_reconciles_total{result}` counts Gateway
   reconciles: `ok` (objects and status in line, after writes or none), `invalid` (not accepted:
   no object), `conflict` (an object not managed), `error` (a failed request);
-  `mimic_gateway_gateways{state}` counts the Gateways of mimic classes at the last pass
+  `mimic_gateway_gateways{state}` counts the Gateways of mimic classes in the listed namespaces at the last pass
   (`programmed`, `pending`, `not_accepted`). No label holds a Gateway name, a hostname or any
   `spec` value. Log lines: the two WARNs above and one INFO `gateway programmed` (`gateway`,
   `generation`) when a Gateway's `Programmed` turns `True`; no listener hostname, annotation
@@ -4257,7 +4308,7 @@ random numbers it hands to the draw.
 | `mimic_mesh_view_truncated_total` | counter (M1, controller), Services left out of built views because of a bound of §7.9 | — |
 | `mimic_mesh_view_cache_bytes` | gauge (M1, controller), bytes held by the view cache, at most `MIMIC_MESH_VIEW_CACHE_BYTES` | — |
 | `mimic_gateway_reconciles_total` | counter (M6, controller), reconciles of Gateways of a mimic class (§7.10) | `result` (`ok`, `invalid`, `conflict`, `error`) |
-| `mimic_gateway_gateways` | gauge (M6, controller), Gateways of a mimic class at the last pass (§7.10) | `state` (`programmed`, `pending`, `not_accepted`) |
+| `mimic_gateway_gateways` | gauge (M6, controller), Gateways of a mimic class in the listed namespaces at the last pass (§7.10) | `state` (`programmed`, `pending`, `not_accepted`) |
 | `mimic_load_runs_total` | counter (F11, controller), load test runs ended (§7.8); a run that fails before its admission is counted by every replica that writes its status, so two replicas can count it twice in a rare race (an admitted run is counted once, by the replica whose end script wins) | `phase` (`Succeeded`, `Failed`, `Aborted`), `reason` |
 | `mimic_load_active_runs` | gauge (F11, controller), members of `mimic:v1:loads:active` at the last status pass | — |
 
@@ -4629,7 +4680,8 @@ The restarts come from `process_start_time_seconds`, so no kube-state-metrics se
 | `MIMIC_GATEWAY_NAMESPACES` | empty | (M6) Namespaces whose Gateways of a mimic class get objects (§7.10), comma-separated DNS-1123 labels, at most 256, distinct; empty: no Gateway, GatewayClass, labelled Deployment or Service is watched. Set with `MIMIC_MESH=off`: exit 2. The chart sets it, sorted, from `gateway.namespaces` when `gateway.enabled`. |
 | `MIMIC_GATEWAY_SERVICE_TYPE` | `ClusterIP` | (M6) `type` of the gateway Services: `ClusterIP`, `NodePort` or `LoadBalancer`. |
 | `MIMIC_GATEWAY_MAX_REPLICAS` | `10` | (M6) Highest `mimic.platform.io/replicas` accepted (§7.10), 1–100. |
-| `MIMIC_GATEWAY_RESOURCES` | `{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | (M6) Gateway container `resources`, JSON. The gateway's image is `MIMIC_INJECT_SIDECAR_IMAGE` and its `MIMIC_LOG` is `MIMIC_INJECT_SIDECAR_LOG`. |
+| `MIMIC_GATEWAY_MAX_CONNECTIONS` | `1024` | (M6) `MIMIC_MAX_CONNECTIONS` of the generated gateway pods (§7.10), 1–1000000. The controller exits 2 when `MIMIC_GATEWAY_RESOURCES` has no memory limit, or when this value × 96 KiB + 32 MiB is more than that limit. |
+| `MIMIC_GATEWAY_RESOURCES` | `{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"memory":"192Mi"}}` | (M6) Gateway container `resources`, JSON. The gateway's image is `MIMIC_INJECT_SIDECAR_IMAGE` and its `MIMIC_LOG` is `MIMIC_INJECT_SIDECAR_LOG`. |
 | `MIMIC_LOAD_MAX_RUNS` | `0` | (F11) Load test runs active at once in the cluster (§7.8), 0–100; `0` disables load tests. The chart sets `4` when `loadTest.enabled`. |
 | `MIMIC_LOAD_MAX_NAMESPACE_RUNS` | `2` | (F11) Active runs per namespace, 1–100, at most `MIMIC_LOAD_MAX_RUNS` when that is not 0. |
 | `MIMIC_LOAD_MAX_PENDING` | `16` | (F11) `Pending` runs per namespace; newer ones fail `TooManyPending`, 1–1000. |
@@ -5651,13 +5703,35 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   admin opts namespaces in (`gateway.namespaces`) and picks the type; the namespace's
   `ResourceQuota` counts the pods and `gateway.maxReplicas` bounds one Gateway. Many Gateways
   are bounded only by a quota on `count/gateways.gateway.networking.k8s.io`.
-- (M6, #456) **The admission policy checks the shape, not the intent.** It reads no Gateway, so a
-  stolen controller token can create, scale to `gateway.maxReplicas`, change the ports of or
-  delete gateway objects of the §7.10 shape in the listed namespaces (a denial of service of
-  the gateways), and write any Gateway or GatewayClass status. It cannot run another image or
-  command, mount a volume, use the host, add a capability, take over or delete an object
-  without mimic's labels, or select other pods than those labelled `mimic.platform.io/gateway`.
-  RBAC cannot narrow `create`, `patch` and `delete` to labelled objects; the policy does.
+- (M6, #456, #576) **Any namespace can send Gateway events to the controller.** The controller
+  watches `gateways` in all namespaces. It receives and decodes each change of each Gateway,
+  also of other classes and of namespaces that are not listed. It keeps only a stub of these
+  Gateways (namespace, name, class) and does no work for them (§7.10 "What is read"). A Gateway
+  of class `mimic` in a namespace that is not listed gets no status, so its author sees no
+  condition from mimic. `docs/wiki/Troubleshooting.md` gives this cause.
+- (M6, #456, #575) **The admission policy checks the shape, not the intent.** It reads no
+  Gateway. A stolen controller token can thus create, scale to `gateway.maxReplicas`, change the
+  ports of, or delete the gateway objects of the §7.10 shape in the listed namespaces (a denial
+  of service of the gateways). It can also write any Gateway or GatewayClass status. The policy
+  fixes the rest by key allowlists and exact label sets (§7.10 "Admission policy"). So the
+  token cannot run another image or command, mount a volume, use the host, add a capability,
+  add a pod label or an annotation, pin pods to nodes, or change their DNS. It cannot take over
+  or delete an object without mimic's labels. It cannot select pods other than those labelled
+  `mimic.platform.io/gateway`. RBAC cannot narrow `create`, `patch` and `delete` to labelled
+  objects; the policy does.
+- (M6, #575) **A `CREATE` can choose the Service addresses.** The API server allocates
+  `clusterIP`, `clusterIPs` and `nodePort` before the policy runs, so the policy cannot tell an
+  allocated value from a value that the client sends. A stolen controller token can thus take
+  a free cluster IP or node port when it creates a gateway Service. An `UPDATE` cannot change
+  them.
+- (M6, #575) **A platform webhook that annotates the gateway objects needs
+  `gateway.admittedAnnotations`.** The policy runs after the mutating webhooks. When a platform
+  webhook adds an annotation key that is not in the list, the policy refuses the controller's
+  `CREATE`, and the Gateway stays `Programmed: False` (`error`).
+- (M6, #574) **One client with many addresses can hold the connection cap.** The cap
+  (`gateway.maxConnections`) keeps each gateway pod inside its memory limit. It counts all
+  clients together, so a client that opens connections from many source addresses can fill it
+  and delay other clients. Per-source limits belong to an upstream load balancer or WAF.
 - (M6, #456) **The namespace is the trust domain of a Gateway.** A namespace user can label pods
   `mimic.platform.io/gateway: <gateway>` so that the gateway Service sends them traffic, edit
   the generated objects with their own RBAC (the next apply restores mimic's fields; an added
@@ -7068,19 +7142,19 @@ records every request and answers server-side apply as the API server does), as 
 **Decisions recorded on #456** (taken with the recommended option while the maintainer is away):
 generated names follow GEP-1762 (`<gateway>-mimic`); `spec.infrastructure` labels and other
 annotations are refused, not propagated; `allowedRoutes.namespaces.from: Selector` is refused (no
-Namespace read); a Gateway outside `gateway.namespaces` gets `NamespaceNotAllowed`; a Gateway
+Namespace read); a Gateway outside `gateway.namespaces` gets no status (changed by #576, it was `NamespaceNotAllowed`); a Gateway
 that is not accepted has no objects; ports below 1024 through the safe sysctl, not a port remap;
-the gateway needs the mesh; replicas come from the annotation only (no HPA in M6).
+the gateway needs the mesh; replicas come from the annotation only (no HPA in M6). The security audit of #456 adds: a connection cap that fits the memory limit (#574), key allowlists in the admission policy (#575), and stubs for the Gateways that mimic does not serve (#576).
 
 | ID | Criterion |
 |---|---|
 | GW-01 | **U** (`mimic-core` `gateway::objects`, names). `web` gives `web-mimic`; a 57-character name gives itself plus `-mimic` (63 characters); a 58-character name, `a.b`, `1web` and `web.prod.example` give the hashed form of §7.10 (`g` prefix for `1web`, `.` turned into `-`, the 10 hex digits of the SHA-256 of the original name); property (`proptest`): for any DNS-1123 subdomain of at most 63 characters the name is a DNS-1035 label of at most 63 characters and the same input gives the same name. |
 | GW-02 | **U** (next to the adapters, as RTE-13). A `Gateway` object converts to `gateway::input::Gateway` (namespace, name, UID, generation, class, `spec`, existing conditions and listener statuses); a field the converter does not know at any level of `spec` is kept as its path only, with the experimental `defaultScope`, a listener `filters` entry and a made-up field as examples; a `spec` over 64 KiB of JSON converts to the key, generation and class only; labels, `metadata.annotations` and `managedFields` are in no input struct, so two objects differing only there convert equal. |
-| GW-03 | **U** (`gateway::accept`, the Gateway). Each case of §7.10 "Acceptance" gives its exact `Accepted` status, reason and message, and the first one applies when several do: namespace not listed (`NamespaceNotAllowed`); class not accepted (`InvalidParameters`); a 64-character name, a 65 KiB `spec`, an unknown field, `spec.tls`, `allowedListeners` with `from: All`, `Same` and `Selector` (but not `None`), `infrastructure.labels` and an annotation `example.com/x` (`UnsupportedValue`, the key named, the value in no message); `spec.addresses` (`UnsupportedAddress`); `parametersRef` and a replicas value of `0`, `11` (max 10), `+3`, `03`, `2.0` and `two` (`InvalidParameters`); `1` and `10` accepted. No message holds a listener hostname or an annotation value. |
+| GW-03 | **U** (`gateway::accept`, the Gateway). Each case of §7.10 "Acceptance" gives its exact `Accepted` status, reason and message, and the first one applies when several do: class not accepted (`InvalidParameters`); a 64-character name, a 65 KiB `spec`, an unknown field, `spec.tls`, `allowedListeners` with `from: All`, `Same` and `Selector` (but not `None`), `infrastructure.labels` and an annotation `example.com/x` (`UnsupportedValue`, the key named, the value in no message); `spec.addresses` (`UnsupportedAddress`); `parametersRef` and a replicas value of `0`, `11` (max 10), `+3`, `03`, `2.0` and `two` (`InvalidParameters`); `1` and `10` accepted. No message holds a listener hostname or an annotation value. |
 | GW-04 | **U** (`gateway::accept`, listeners). `HTTP` is accepted; `HTTPS`, `TLS`, `TCP`, `UDP` and `example.com/proto` give `Accepted: False`, `UnsupportedProtocol`; port 15100 gives `PortUnavailable`; `allowedRoutes.namespaces.from: Selector` and an unknown listener field give `UnsupportedValue` naming the path; `allowedRoutes.kinds` absent gives `supportedKinds` `[HTTPRoute]` and `ResolvedRefs: True`, `[HTTPRoute, TCPRoute]` gives `[HTTPRoute]` and `ResolvedRefs: False`, `InvalidRouteKinds`, `[GRPCRoute]` gives `[]` and the same; `Conflicted` is `False`, `NoConflicts` and `attachedRoutes` 0 everywhere. One valid and one `TCP` listener give the Gateway `Accepted: True`, `ListenersNotValid`, a message naming the `TCP` one; only invalid listeners give `Accepted: False`, `ListenersNotValid`. |
-| GW-05 | **U** (`gateway::objects`, Deployment). For a Gateway `shop/web` with HTTP listeners on 80 and 8080 and the replicas annotation `3`, the Deployment is the golden JSON byte for byte: name, namespace, the five labels, the owner reference (`controller: true`, no `blockOwnerDeletion`), `replicas` 3 (without the annotation 2, and 1 with `MIMIC_GATEWAY_MAX_REPLICAS=1`), selector, strategy, pod labels with `mimic.platform.io/inject: disabled`, the spread constraint, `automountServiceAccountToken: false`, `enableServiceLinks: false`, no volume, the pod security context with the one sysctl, one container `gateway` with the image, the command, exactly the env `MIMIC_GATEWAY_PORTS=80,8080`, `MIMIC_LOG`, `MIMIC_ROLE=gateway`, the ports 80, 8080 and `mimic-admin` 15100, the two probes, the resources and the container security context of §7.10. A listener that is not accepted adds no port. |
+| GW-05 | **U** (`gateway::objects`, Deployment). For a Gateway `shop/web` with HTTP listeners on 80 and 8080 and the replicas annotation `3`, the Deployment is the golden JSON byte for byte: name, namespace, the five labels, the owner reference (`controller: true`, no `blockOwnerDeletion`), `replicas` 3 (without the annotation 2, and 1 with `MIMIC_GATEWAY_MAX_REPLICAS=1`), selector, strategy, pod labels with `mimic.platform.io/inject: disabled`, the spread constraint, `automountServiceAccountToken: false`, `enableServiceLinks: false`, no volume, the pod security context with the one sysctl, one container `gateway` with the image, the command, exactly the env `MIMIC_GATEWAY_PORTS=80,8080`, `MIMIC_LOG`, `MIMIC_MAX_CONNECTIONS=1024`, `MIMIC_ROLE=gateway`, the ports 80, 8080 and `mimic-admin` 15100, the two probes, the resources and the container security context of §7.10. A listener that is not accepted adds no port. |
 | GW-06 | **U** (`gateway::objects`, Service and PodDisruptionBudget). The same Gateway gives the golden Service (`type` from the configuration for each of the three types, the selector, ports `http-80` and `http-8080` with `targetPort` equal, nothing else in `spec`) and the golden PodDisruptionBudget (`maxUnavailable: 1`). Two listeners on port 80 with different hostnames give one Service port and one container port. |
-| GW-07 | **U** (`proptest`). For any converted Gateway: an accepted one gives three objects with the same valid name, label values of at most 63 characters, distinct ports from 1 to 65535 other than 15100 and env names among the three of §7.10 only; a permutation of its listeners gives byte-identical objects; a Gateway that is not accepted gives no object; the same input twice gives the same bytes. |
+| GW-07 | **U** (`proptest`). For any converted Gateway: an accepted one gives three objects with the same valid name, label values of at most 63 characters, distinct ports from 1 to 65535 other than 15100 and env names among the four of §7.10 only; a permutation of its listeners gives byte-identical objects; a Gateway that is not accepted gives no object; the same input twice gives the same bytes. |
 | GW-08 | **U** (`gateway::status`, `Programmed`). Each case of §7.10 "Status" gives its reason and message: not accepted (`Invalid`), an object not managed (`Invalid`, naming kind and name), no Deployment, `observedGeneration` behind and 0 of 2 available (`Pending`), `ReplicaFailure` (`NoResources`), no Service, a `ClusterIP` and a `NodePort` Service without `clusterIPs` and a `LoadBalancer` Service without ingress (each `AddressNotAssigned`, `no address assigned`), 1 of 2 available (`True`, `1 of 2 replicas available`). `addresses`: both `clusterIPs` of a dual-stack `ClusterIP` Service, the same for `NodePort`, ingress `ip`s then `hostname`s for `LoadBalancer`, at most 16, none while not programmed. Listener `Programmed` is `True`, `Invalid` or `Pending` as specified. |
 | GW-09 | **U** (`gateway::status`, writing). As RTE-14: `lastTransitionTime` kept from the cluster's condition while its `status` is unchanged (a new reason or message keeps it), the time passed in when it changes; `observedGeneration` on every condition; messages cut to 1024 bytes on a character boundary; "write needed" false when only `lastTransitionTime` of unchanged conditions differ. GatewayClass: `Accepted: True`; `False`, `Unsupported`, `name longer than 63 characters` for a 64-character name (checked before `parametersRef`, and its Gateways then get case 2 of §7.10); `False`, `InvalidParameters` with a `parametersRef`. |
 | GW-10 | **I** (apply). A Gateway of class `mimic` in a listed namespace makes the controller send three server-side applies (field manager `mimic-gateway`, `force: true`) whose bodies equal the GW-05 and GW-06 objects, and one status apply; with the fake API reporting the Deployment available and the Service with a ClusterIP, the next status apply has `Programmed: True` and the address. 10 more publications of the same objects change nothing in the store (no resource version moves) and send no status apply. A listener port change gives new Deployment and Service applies with the new port; a status change of the Gateway alone sends no object apply. |
@@ -7088,22 +7162,22 @@ the gateway needs the mesh; replicas come from the annotation only (no HPA in M6
 | GW-12 | **I** (ownership). A Deployment `web-mimic` without the two managed labels in the namespace: no apply and no delete of any of the three objects, `Programmed: False`, `Invalid`, message `Deployment web-mimic exists and is not managed by mimic`, `mimic_gateway_reconciles_total{result="conflict"}` grows, one WARN `gateway object not managed` (`gateway`, `kind`, `name`) per streak; once it is deleted the next reconcile creates the three objects. Managed objects owned by a Gateway of the same name with another UID are adopted: the apply carries the new UID as the only owner reference. |
 | GW-13 | **I** (deletion). The three managed objects are deleted when the Gateway becomes not accepted (its only listener changed to `TCP`) and when its class changes to one of another controller; a managed Deployment and Service naming a Gateway that does not exist are deleted with their PodDisruptionBudget; an unmanaged object of a generated name, and objects of a Gateway in a namespace no longer listed, are never deleted. Before the first full list of `gateways`, `deployments` and `services`, and while `gateways` answers `404`, no delete is sent. Deleting a Gateway sends no delete (garbage collector). |
 | GW-14 | **I** (failures). An apply answered `500`, then `422` `Invalid` (the policy's denial: a policy without a `reason` gives `422`, not `403`). The controller handles every error code in the same way: `mimic_gateway_reconciles_total{result="error"}` grows, one WARN `gateway reconcile failed` (`gateway`, `kind`, `error`) per Gateway and streak whose `error` is the status reason and code only, retries after about 1 s, 2 s, 4 s up to 30 s, and success once the API answers; the WARN and every log line of the run hold no listener hostname, annotation value or object body. |
-| GW-15 | **I** (CRD presence and switch). With `gateways` answering `404`: nothing is applied or deleted, `mimic_mesh_gateway_api_present` 0 and one WARN `gateway api crds missing`; once served, reconciles start. With `MIMIC_GATEWAY_NAMESPACES` empty no request reaches `gateways`, `gatewayclasses`, labelled `deployments` or `services`, or any write path of §7.10. A Gateway in a namespace not listed gets the `NamespaceNotAllowed` status and no object request. A GatewayClass of another `controllerName` and its Gateways get no request. |
-| GW-16 | **I** (controller configuration, the binary as a child process). Each exits 2 naming the variable: `MIMIC_GATEWAY_NAMESPACES` with an invalid name, a duplicate or 257 entries, or set with `MIMIC_MESH=off`; `MIMIC_GATEWAY_SERVICE_TYPE=ExternalName`; `MIMIC_GATEWAY_MAX_REPLICAS` `0` and `101`; `MIMIC_GATEWAY_RESOURCES` that is not a JSON `resources` object. The defaults of §10.2 start. |
+| GW-15 | **I** (CRD presence, switch and stubs). <ul><li>With `gateways` answering `404`, the controller applies and deletes nothing. `mimic_mesh_gateway_api_present` is 0, and there is one WARN `gateway api crds missing`. When `gateways` is served again, reconciles start.</li><li>With `MIMIC_GATEWAY_NAMESPACES` empty, no request goes to `gateways`, `gatewayclasses`, labelled `deployments` or `services`, or to a write path of §7.10.</li><li>A Gateway of class `mimic` in a namespace that is not listed gets no status write and no object request. A GatewayClass of another `controllerName` and its Gateways get no request.</li><li>The converted value of a Gateway of another class, and of a Gateway in a namespace that is not listed, holds the namespace, the name and the class only: no listener, hostname or status.</li><li>Load (#576): 1000 Gateways of another class and 1000 Gateways of class `mimic` in a namespace that is not listed change their `spec` in a loop. A new Gateway in a listed namespace then gets its first apply within 2 s of its creation, and no request names one of the 2000 Gateways.</li><li>When a new GatewayClass with mimic's `controllerName` appears, the controller lists `gateways` again, and its Gateways in listed namespaces get their objects.</li></ul> |
+| GW-16 | **I** (controller configuration, the binary as a child process). Each exits 2 naming the variable: `MIMIC_GATEWAY_NAMESPACES` with an invalid name, a duplicate or 257 entries, or set with `MIMIC_MESH=off`; `MIMIC_GATEWAY_SERVICE_TYPE=ExternalName`; `MIMIC_GATEWAY_MAX_REPLICAS` `0` and `101`; `MIMIC_GATEWAY_MAX_CONNECTIONS` `0`, and `2000` with the default resources (2000 × 96 KiB + 32 MiB is more than 192 MiB); `MIMIC_GATEWAY_RESOURCES` that is not a JSON `resources` object, or that has no `limits.memory`. The defaults of §10.2 start. |
 | GW-17 | **I** (metrics). `mimic_gateway_reconciles_total` has the `result` label only, with values among `ok`, `invalid`, `conflict`, `error`; `mimic_gateway_gateways{state}` counts one programmed, one pending and one not accepted Gateway; no series carries a Gateway name, namespace or hostname; one INFO `gateway programmed` (`gateway`, `generation`) per transition to `True`. |
 | GW-18 | **I** (gateway role configuration, `mimic-sidecar` as a child process). Without `MIMIC_ROLE`, or `sidecar`, the sidecar behaves as before (an existing sidecar test passes unchanged); `MIMIC_ROLE=gateway` with `MIMIC_GATEWAY_PORTS=18080,18081` starts without `MIMIC_WORKLOAD`, `MIMIC_POD_*` or any other sidecar variable, writes no file and opens no outbound connection; each exits 2 naming the variable: `MIMIC_ROLE=proxy`, `MIMIC_GATEWAY_PORTS` absent, empty, `0`, `65536`, `15100`, `80,80`, 65 ports, `http`; `MIMIC_GATEWAY_HEADER_TIMEOUT` `0s` and `6m`; `MIMIC_GATEWAY_IDLE_TIMEOUT` `0s` and `2h`. A port already bound exits 1 with one ERROR `gateway listener failed` naming the port. |
-| GW-19 | **I** (gateway role, answers and bounds). On each port, HTTP/1.1 (`GET`, and `POST` with a 1 MiB body not read) and HTTP/2 with prior knowledge get `404`, `x-mimic-error: no-route`, `content-length: 0`; keep-alive carries a second request. A head sent byte by byte past `MIMIC_GATEWAY_HEADER_TIMEOUT=1s` and an idle connection past `MIMIC_GATEWAY_IDLE_TIMEOUT=2s` are closed within 1 s of the bound; a 65 KiB head gets `431` or a close; with `MIMIC_MAX_CONNECTIONS=4` the fifth connection is closed at accept while four are open; an HTTP/2 client opening 101 streams has the 101st refused and a rapid-reset flood ends with `GOAWAY`; the process RSS stays under 64 MiB through the test. |
+| GW-19 | **I** (gateway role, answers and bounds; release build). <ul><li>On each port, HTTP/1.1 (`GET`, and `POST` with a 1 MiB body that the process does not read) and HTTP/2 with prior knowledge get `404`, `x-mimic-error: no-route`, `content-length: 0`. Keep-alive carries a second request.</li><li>With `MIMIC_GATEWAY_HEADER_TIMEOUT=1s`, the process closes each of these within 1 s after the bound: a head sent byte by byte; an HTTP/1 connection that sends nothing; an HTTP/2 connection that sends the preface and `SETTINGS` and no `HEADERS`. With `MIMIC_GATEWAY_IDLE_TIMEOUT=2s`, it closes a connection that is idle after its first answer within 1 s after the bound.</li><li>A 65 KiB head gets `431` or a close. An HTTP/2 client that opens 101 streams has the 101st refused. A rapid-reset flood ends with `GOAWAY`.</li><li>With `MIMIC_MAX_CONNECTIONS=4`, the process closes the fifth connection at accept while four are open.</li><li>**Memory budget** (#574), with the configuration of the generated pod (`MIMIC_MAX_CONNECTIONS=1024`, the cgroup memory limit of `gateway.resources`, 192 MiB): a client holds 1024 connections, each with a 63 KiB head without its end. In a second run, it holds 1024 HTTP/2 connections, each with the preface only. In a third run, each connection has one HTTP/2 stream with 64 KiB of unread data. In each run, the process RSS stays below 75% of the limit (144 MiB), and the 1025th connection is closed at accept. The test writes the RSS per held connection and the RSS of the process with no connection: they must be at most 96 KiB and 32 MiB (§7.10, the memory budget).</li></ul> |
 | GW-20 | **I** (gateway role, readiness and shutdown). `/readyz` answers `503` until every listener is bound, then `200`; `/metrics` and `/healthz` answer on 15100 only; after `SIGTERM` `/readyz` answers `503`, a new connection is refused, an in-flight HTTP/1 request completes and the process exits 0 within `MIMIC_SHUTDOWN_GRACE`. |
-| GW-21 | **E** (chart, `scripts/check-chart.sh`, as RTE-26). The default render is the golden file (no GatewayClass, no policy `<release>-gateway`, no `gateways` rule, no `MIMIC_GATEWAY_*`). With `gateway.enabled`, `image.digest`, `gateway.namespaces: [shop, edge]` and the Gateway API version passed (`--api-versions`): the GatewayClass `mimic` with the `controllerName` of §7.10; the controller ClusterRole adds exactly `get`, `list`, `watch` on `gateways` and `gatewayclasses` and `patch` on `gateways/status` and `gatewayclasses/status`; a ClusterRole `<release>-gateway` with exactly `get`, `create`, `patch`, `delete` on `deployments`, `services` and `poddisruptionbudgets` and no other rule, bound by one RoleBinding in `shop` and one in `edge` and nowhere else (no ClusterRoleBinding of it); no rule on `secrets`, `pods`, `namespaces` or `customresourcedefinitions` is added; the policy and its binding (`failurePolicy: Fail`, `validationActions: [Deny]`, the service account `matchConditions`, the three resources and three operations, the image digest, namespaces, service type, max replicas and resources of the values); the controller env `MIMIC_GATEWAY_NAMESPACES=edge,shop` and the three others. |
-| GW-22 | **E** (chart, same script). `helm template` fails with a message naming the cause for `gateway.enabled` with `mesh.enabled: false`, without `image.digest`, with `gateway.namespaces: []`, without the Gateway API version, and with `gateway.serviceType: ExternalName` (a `fail` in the template; the chart has no values schema). |
+| GW-21 | **E** (chart, `scripts/check-chart.sh`, as RTE-26). The default render is the golden file (no GatewayClass, no policy `<release>-gateway`, no `gateways` rule, no `MIMIC_GATEWAY_*`). With `gateway.enabled`, `image.digest`, `gateway.namespaces: [shop, edge]` and the Gateway API version passed (`--api-versions`): the GatewayClass `mimic` with the `controllerName` of §7.10; the controller ClusterRole adds exactly `get`, `list`, `watch` on `gateways` and `gatewayclasses` and `patch` on `gateways/status` and `gatewayclasses/status`; a ClusterRole `<release>-gateway` with exactly `get`, `create`, `patch`, `delete` on `deployments`, `services` and `poddisruptionbudgets` and no other rule, bound by one RoleBinding in `shop` and one in `edge` and nowhere else (no ClusterRoleBinding of it); no rule on `secrets`, `pods`, `namespaces` or `customresourcedefinitions` is added; the policy and its binding (`failurePolicy: Fail`, `validationActions: [Deny]`, the service account `matchConditions`, the three resources and three operations, the image digest, namespaces, service type, max replicas and resources of the values); the controller env `MIMIC_GATEWAY_NAMESPACES=edge,shop` and the four others, `MIMIC_GATEWAY_MAX_CONNECTIONS=1024` included. The policy holds: the rule that admits `MIMIC_MAX_CONNECTIONS` with the value of `gateway.maxConnections` only; the exact label sets of the objects and of the pod template; the annotation rule with the keys of `gateway.admittedAnnotations`; and the key allowlists of the Deployment `spec`, the pod `spec`, the container, the Service `spec`, a Service port and the PodDisruptionBudget `spec` (#575). |
+| GW-22 | **E** (chart, same script). `helm template` fails with a message naming the cause for `gateway.enabled` with `mesh.enabled: false`, without `image.digest`, with `gateway.namespaces: []`, without the Gateway API version, with `gateway.serviceType: ExternalName`, with `gateway.resources` without `limits.memory`, and with `gateway.maxConnections: 2000` and the default resources (a `fail` in the template; the chart has no values schema). |
 | GW-23 | **E** (kind, `scripts/e2e-gateway.sh`, own kind cluster and namespaces, cleaned by a trap, the pinned CRDs of RTE-25). The gated CI job `e2e-gateway` runs this script on Kubernetes 1.33 and on the latest Kubernetes that kind supports. The checks are not in `scripts/e2e.sh`: that job has no time left, and its `msh_28` and `rte_*` sections delete the CRDs. With `gateway.enabled` and namespace `gw-e2e` listed (labels `mimic.platform.io/inject: enabled` and `pod-security.kubernetes.io/enforce: restricted`): the GatewayClass `mimic` gets `Accepted: True` within 10 s; a Gateway `web` with one HTTP listener on port 80 gets, within 60 s, `Accepted: True`, `Programmed: True`, `status.addresses` the Service's ClusterIP and its listener `Accepted`, `ResolvedRefs`, `Programmed` `True`, `Conflicted` `False`; the Deployment `web-mimic` has 2 available replicas whose pods have one container and no init container (not injected) and are admitted by Pod Security `restricted`; `curl` from a client pod to `http://web-mimic.gw-e2e/` gets `404` with `x-mimic-error: no-route`; once converged, with both controller replicas, the resource versions of the Gateway, the Deployment and the Service do not change over 10 s. |
 | GW-24 | **E** (same script, lifecycle). The listener port changed to 8080: within 60 s the Service has port 8080 only, the Deployment has rolled, the Gateway is `Programmed: True` again and `curl` on 8080 gets the `404`; the replicas annotation `3` gives 3 available replicas; the Gateway deleted: the Deployment, Service and PodDisruptionBudget are gone within 60 s. |
-| GW-25 | **E** (same script, refusals). A Gateway with only a `TCP` listener gets `Accepted: False`, `ListenersNotValid` and no Deployment; a Gateway of class `mimic` in a namespace not listed gets `Accepted: False`, `NamespaceNotAllowed` and no Deployment; a Deployment `taken-mimic` created beforehand without the labels keeps its spec and resource version, and the Gateway `taken` gets `Programmed: False`, `Invalid`. |
+| GW-25 | **E** (same script, refusals). A Gateway with only a `TCP` listener gets `Accepted: False`, `ListenersNotValid` and no Deployment; a Gateway of class `mimic` in a namespace that is not listed gets no `status.conditions` and no Deployment within 30 s; a Deployment `taken-mimic` created beforehand without the labels keeps its spec and resource version, and the Gateway `taken` gets `Programmed: False`, `Invalid`. |
 | GW-26 | **E** (same script, RBAC). `kubectl auth can-i` as the controller is `yes` for `create`, `patch` and `delete` on `deployments`, `services` and `poddisruptionbudgets` in `gw-e2e` and for `patch gateways/status`; `no` for the same verbs in a namespace not listed, for `update gateways`, `create gateways`, `get secrets` in `gw-e2e`, `get pods`, `list namespaces` and `create pods` in `gw-e2e`. |
-| GW-27 | **E** (same script, the policy). As the controller (impersonation, `--dry-run=server`), the policy refuses in `gw-e2e`, each with a message naming the field: a Deployment of the generated shape with another image (another digest, and the tag instead of the digest), `args`, a second container, an init container, an `env` with `valueFrom` or another name, `envFrom`, a volume (`hostPath`, `secret`, `emptyDir`), `automountServiceAccountToken` absent or `true`, another service account, `hostNetwork`, `hostPID`, a `hostPort`, `privileged`, `runAsUser: 0`, an added capability, another sysctl, `nodeName`, a toleration, an `exec` probe, an `httpGet` probe with `host`, a `lifecycle` hook, replicas 11, other resources, a selector or pod label other than the label's value, `mimic.platform.io/inject` absent from the pod labels, the labels or the owner reference missing; a Service with `externalIPs`, `type: LoadBalancer` (the chart says `ClusterIP`), `loadBalancerSourceRanges`, port 15100, a `targetPort` other than its port or another selector; a PodDisruptionBudget with `minAvailable` or another selector; an `UPDATE` and a `DELETE` of an unlabelled Deployment, Service and PodDisruptionBudget; the same objects in a namespace not listed. The objects of GW-05 and GW-06 are admitted. The same refused Deployment created by the cluster admin is not matched. |
-| GW-28 | **E** (same script, the data path skeleton). From a client pod, 200 concurrent connections each sending one request to the gateway Service get `404` `no-route`; a connection that sends half a head and waits is closed by the gateway within 15 s; the gateway pods restart 0 times during the script. |
-| GW-29 | **D** (documentation review). `docs/wiki/Gateway.md` (new): enabling (`gateway.*`, the CRDs, the mesh, the digest), creating a Gateway, the generated objects and their names, replicas, the Service type, how to read the status, what is refused and why (§7.10, §11.1), and that routing comes with #457 and HTTPS with #458; `Security.md`: the gateway RBAC (namespaced, the ClusterRole bound only in the listed namespaces), the admission policy and what it does not check, the gateway pod (no token, no capability, restricted); `Monitoring.md`: the two metrics; `Troubleshooting.md`: `NamespaceNotAllowed`, `UnsupportedValue`, `gateway object not managed`, `gateway reconcile failed`, a gateway stuck `Pending`; `CHANGELOG.md` *Unreleased*: the feature, the RBAC, the policy and the chart values. |
-| GW-30 | **D** (security review). Privileges reviewed by the reviewer agent: no Secret, pod or Namespace read is added (GW-21, GW-26); writes only in the listed namespaces (GW-21, GW-26) and only of the policy's shape (GW-27), never of an object the controller does not manage (GW-12, GW-25, GW-27); the gateway pod has no token, capability, volume or host access and runs under Pod Security `restricted` (GW-05, GW-23); the listeners are bounded (GW-19, GW-28); no hostname, annotation value or other `spec` value reaches a log, a metric label or a status message: only field paths, annotation keys and the validated, bounded identifiers of §7.10 "Status" (namespace, class, listener and object names, kinds, protocols, ports, counts) (GW-03, GW-14, GW-17); status and objects are idempotent across replicas (GW-10, GW-11); nothing is deleted on a partial picture (GW-13); the §11.1 limits of M6 are written. |
+| GW-27 | **E** (same script, the policy). As the controller (impersonation, `--dry-run=server`), the policy refuses in `gw-e2e`, each with a message naming the field: a Deployment of the generated shape with another image (another digest, and the tag instead of the digest), `args`, a second container, an init container, an `env` with `valueFrom` or another name, `envFrom`, a volume (`hostPath`, `secret`, `emptyDir`), `automountServiceAccountToken` absent or `true`, another service account, `hostNetwork`, `hostPID`, a `hostPort`, `privileged`, `runAsUser: 0`, an added capability, another sysctl, `nodeName`, a toleration, an `exec` probe, an `httpGet` probe with `host`, a `lifecycle` hook, replicas 11, other resources, a selector or pod label other than the label's value, `mimic.platform.io/inject` absent from the pod labels, the labels or the owner reference missing; a Service with `externalIPs`, `type: LoadBalancer` (the chart says `ClusterIP`), `loadBalancerSourceRanges`, port 15100, a `targetPort` other than its port or another selector; a PodDisruptionBudget with `minAvailable` or another selector; an `UPDATE` and a `DELETE` of an unlabelled Deployment, Service and PodDisruptionBudget; the same objects in a namespace not listed. Key allowlists (#575): the policy also refuses a Deployment with an extra label on the object or on the pod template, a pod template annotation on `CREATE`, an annotation key that the `UPDATE` adds or changes, `nodeSelector`, `dnsConfig`, `dnsPolicy: None`, `imagePullSecrets`, `resourceClaims`, `readinessGates`, `schedulingGates`, `activeDeadlineSeconds`, `minReadySeconds`, a container `workingDir` or `startupProbe`, a probe with `httpHeaders`, and `MIMIC_MAX_CONNECTIONS` with another value or absent. It refuses a Service with an annotation, `healthCheckNodePort`, `publishNotReadyAddresses: true`, `sessionAffinity: ClientIP`, an `UPDATE` that changes a `nodePort` or the `clusterIP`, and a PodDisruptionBudget with `unhealthyPodEvictionPolicy`. The objects of GW-05 and GW-06 are admitted. An `UPDATE` by the controller after `kubectl rollout restart` of the Deployment is admitted, and so is an annotation key of `gateway.admittedAnnotations` on `CREATE`. The same refused Deployment created by the cluster admin is not matched. |
+| GW-28 | **E** (same script, the data path skeleton). <ul><li>From a client pod, 200 concurrent connections each send one request to the gateway Service, and each gets `404` `no-route`.</li><li>A connection that sends half a head and waits is closed by the gateway within 15 s.</li><li>Memory budget (#574): a client pod holds 1024 connections to one gateway pod for 30 s, each with a 63 KiB head without its end (the pod's cap). The 1025th is closed at accept, and the pod stays `Ready`.</li><li>The gateway pods restart 0 times during the script.</li></ul> |
+| GW-29 | **D** (documentation review). `docs/wiki/Gateway.md` (new): enabling (`gateway.*`, the CRDs, the mesh, the digest), creating a Gateway, the generated objects and their names, replicas, the Service type, how to read the status, what is refused and why (§7.10, §11.1), and that routing comes with #457 and HTTPS with #458; `Security.md`: the gateway RBAC (namespaced, the ClusterRole bound only in the listed namespaces), the admission policy and what it does not check, the gateway pod (no token, no capability, restricted); `Monitoring.md`: the two metrics; `Troubleshooting.md`: a Gateway with no status (its namespace is not listed), `UnsupportedValue`, `gateway object not managed`, `gateway reconcile failed`, a gateway stuck `Pending`; `CHANGELOG.md` *Unreleased*: the feature, the RBAC, the policy and the chart values. `Gateway.md` also gives `gateway.maxConnections` and its memory rule, and `gateway.admittedAnnotations`. |
+| GW-30 | **D** (security review). Privileges reviewed by the reviewer agent: no Secret, pod or Namespace read is added (GW-21, GW-26); writes only in the listed namespaces (GW-21, GW-26) and only of the policy's shape (GW-27), never of an object the controller does not manage (GW-12, GW-25, GW-27); the gateway pod has no token, capability, volume or host access and runs under Pod Security `restricted` (GW-05, GW-23); the listeners are bounded, and the default connection cap fits the memory limit (GW-19, GW-28, #574); the policy uses key allowlists and exact label sets (GW-27, #575); the controller keeps only a stub of the Gateways it does not serve (GW-15, #576); no hostname, annotation value or other `spec` value reaches a log, a metric label or a status message: only field paths, annotation keys and the validated, bounded identifiers of §7.10 "Status" (namespace, class, listener and object names, kinds, protocols, ports, counts) (GW-03, GW-14, GW-17); status and objects are idempotent across replicas (GW-10, GW-11); nothing is deleted on a partial picture (GW-13); the §11.1 limits of M6 are written. |
 
 ## 13. Test strategy
 
