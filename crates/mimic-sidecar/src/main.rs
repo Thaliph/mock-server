@@ -12,6 +12,7 @@ use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
 use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
+use mimic_sidecar::gateway::{self, config::Role};
 use mimic_sidecar::limits;
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::load::{LoadConfig, Marker};
@@ -34,6 +35,12 @@ fn main() -> ExitCode {
         return code;
     }
     let env = Env::from_os();
+    // Before any sidecar variable: the gateway role reads none of them.
+    match Role::from_env(&env) {
+        Ok(Role::Sidecar) => {}
+        Ok(Role::Gateway) => return gateway::main(&env),
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    }
     let config = match CommonConfig::from_env(&env, DEFAULT_ADMIN) {
         Ok(config) => config,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),

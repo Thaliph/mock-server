@@ -424,21 +424,26 @@ impl TunnelConfig {
                 "expected a number from 1 to 10000",
             ));
         }
-        let max_connections = env.parse_or(MAX_CONNECTIONS_VAR, DEFAULT_MAX_CONNECTIONS)?;
-        if !MAX_CONNECTIONS_RANGE.contains(&max_connections) {
-            return Err(ConfigError::invalid(
-                MAX_CONNECTIONS_VAR,
-                &max_connections.to_string(),
-                "expected a number from 1 to 1000000",
-            ));
-        }
         Ok(TunnelConfig {
             inbound,
             outbound,
             max_authorities,
-            max_connections,
+            max_connections: max_connections(env)?,
         })
     }
+}
+
+/// `MIMIC_MAX_CONNECTIONS`: connections served at once, 1 to 1000000 (spec §10.3).
+pub fn max_connections(env: &Env) -> Result<usize, ConfigError> {
+    let max_connections = env.parse_or(MAX_CONNECTIONS_VAR, DEFAULT_MAX_CONNECTIONS)?;
+    if !MAX_CONNECTIONS_RANGE.contains(&max_connections) {
+        return Err(ConfigError::invalid(
+            MAX_CONNECTIONS_VAR,
+            &max_connections.to_string(),
+            "expected a number from 1 to 1000000",
+        ));
+    }
+    Ok(max_connections)
 }
 
 fn addrs(env: &Env, var: &str, default: &str) -> Result<Vec<SocketAddr>, ConfigError> {

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::capture_logs;
+use common::{capture_logs, peak_rss};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
@@ -836,17 +836,6 @@ async fn pul_15_sigterm_with_a_silent_api_exits_within_the_bound() {
         begun.elapsed()
     );
     assert_eq!(api.count(), 1);
-}
-
-/// Peak resident set size of the process `pid`, in bytes.
-fn peak_rss(pid: u32) -> u64 {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-    let kb: u64 = status
-        .lines()
-        .find_map(|l| l.strip_prefix("VmHWM:"))
-        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
-        .expect("VmHWM");
-    kb * 1024
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
