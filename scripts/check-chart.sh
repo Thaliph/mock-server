@@ -397,7 +397,7 @@ ctr=$(yq '.spec.template.spec.containers[0]' <<<"$prom_dep")
 pod_sc=$(yq '.spec.template.spec.securityContext' <<<"$prom_dep")
 [[ $(yq -r '.spec.replicas' <<<"$prom_dep") == 1 ]] || fail "mon_16: the Deployment has not 1 replica"
 [[ $(yq -r '.spec.strategy.type' <<<"$prom_dep") == Recreate ]] || fail "mon_16: the strategy is not Recreate"
-[[ $(yq -r '.image' <<<"$ctr") == quay.io/prometheus/prometheus:v3.15.1@sha256:* ]] || fail "mon_16: the image is not the pinned Prometheus"
+[[ $(yq -r '.image' <<<"$ctr") == quay.io/prometheus/prometheus:v3.16.0@sha256:* ]] || fail "mon_16: the image is not the pinned Prometheus"
 [[ $(yq -r '.args | join(" ")' <<<"$ctr") == "--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=24h --storage.tsdb.retention.size=800MB --web.listen-address=:9090 --log.format=json" ]] \
   || fail "mon_16: the Prometheus arguments are not those of §10.7: $(yq -r '.args | join(" ")' <<<"$ctr")"
 grep -qE 'enable-admin-api|enable-lifecycle|remote-write|otlp' <<<"$ctr" && fail "mon_16: an admin, lifecycle, remote-write or OTLP flag is set"
@@ -528,7 +528,7 @@ gdep=$(yq 'select(.kind == "Deployment" and .metadata.name == "mimic-grafana")' 
 [[ $(yq -r '.spec.template.spec.automountServiceAccountToken' <<<"$gdep") == false ]] || fail "mon_19: the token is automounted"
 gctr=$(yq '.spec.template.spec.containers[] | select(.name == "grafana")' <<<"$gdep")
 dctr=$(yq '.spec.template.spec.containers[] | select(.name == "dashboards")' <<<"$gdep")
-[[ $(yq -r '.image' <<<"$gctr") == docker.io/grafana/grafana:13.2.4-distroless@sha256:* ]] || fail "mon_19: the grafana image is not the pinned one"
+[[ $(yq -r '.image' <<<"$gctr") == docker.io/grafana/grafana:13.3.1-distroless@sha256:* ]] || fail "mon_19: the grafana image is not the pinned one"
 [[ $(yq -r '.image' <<<"$dctr") == quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:* ]] || fail "mon_19: the sidecar image is not the pinned one"
 tmpvol=$(yq -r '.volumeMounts[] | select(.mountPath == "/tmp") | .name' <<<"$gctr")
 [[ -n $tmpvol && $(yq -r ".spec.template.spec.volumes[] | select(.name == \"$tmpvol\") | .emptyDir.medium" <<<"$gdep") == Memory ]] \

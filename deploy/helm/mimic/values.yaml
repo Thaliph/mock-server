@@ -89,8 +89,8 @@ inject:
 valkey:
   image:
     repository: docker.io/valkey/valkey
-    tag: 9.0-alpine
-    digest: sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+    tag: 9.1-alpine
+    digest: sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
   # Secret holding the key `password`. Empty: the chart creates one with a random password,
   # kept across upgrades and on uninstall.
   existingSecret: ""
@@ -119,9 +119,9 @@ valkey:
     enabled: false
     image:
       repository: docker.io/oliver006/redis_exporter
-      tag: v1.95.0
+      tag: v1.97.0
       # Pinned in images/Dockerfile (stage redis-exporter); scripts/check-pins.sh keeps the two equal.
-      digest: sha256:afb21407aba3df1b4010899f155fc6b1ba2026c97b725d72aca4019d772e7b6b
+      digest: sha256:f5f903fbe77571d455ede0453b084d6840bc62fc105efac001034421cab83b99
     resources:
       requests: {cpu: 10m, memory: 16Mi}
       limits: {memory: 32Mi}
@@ -194,9 +194,9 @@ monitoring:
     namespaces: []
     image:
       repository: quay.io/prometheus/prometheus
-      tag: v3.15.1
+      tag: v3.16.0
       # Pinned in images/Dockerfile (stage prometheus); scripts/check-pins.sh keeps the two equal.
-      digest: sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+      digest: sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd
     # --storage.tsdb.retention.time, and --storage.tsdb.retention.size below the emptyDir limit, so that the kubelet
     # never evicts the pod for its data.
     retention: 24h
@@ -212,9 +212,9 @@ monitoring:
     enabled: false
     image:
       repository: docker.io/grafana/grafana
-      tag: 13.2.4-distroless
+      tag: 13.3.1-distroless
       # Pinned in images/Dockerfile (stage grafana); scripts/check-pins.sh keeps the two equal.
-      digest: sha256:ae3d3add290adbe6a88412229f5d76fd7bb82743050881698642d3d62f277e35
+      digest: sha256:54e297ac67e2b72572f926892f4e06074dc4f79f2a56ed9a9ca9a88a46f28733
     # The dashboard sidecar: it writes the dashboard files and never calls Grafana (no credential).
     sidecarImage:
       repository: quay.io/kiwigrid/k8s-sidecar
