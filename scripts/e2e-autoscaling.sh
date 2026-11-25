@@ -340,12 +340,18 @@ admitted() { # <description> <file>
   (( dry_rc == 0 )) || fail "adm_74: $1 was refused: $dry_out"
   echo "  admitted: $1"
 }
+# no_secret_name <description> <output>: a refusal holds neither the token nor the Secret's name. The policy and its binding are
+# named mimic-prometheus-address, so the name of the Secret, mimic-prometheus-auth, appears in no message.
+no_secret_name() {
+  [[ $2 != *mimic-prometheus-auth* ]] || fail "adm_74: the refusal of $1 holds the Secret's name: $2"
+  ! grep -qiE 'token|ca\.crt|secretTargetRef' <<<"$2" || fail "adm_74: the refusal of $1 mentions the token or the Secret: $2"
+}
 refused() { # <description> <file>
   dry "$2"
   (( dry_rc == 1 )) || fail "adm_74: $1 was admitted"
-  [[ $dry_out == *mimic-prometheus* ]] || fail "adm_74: the refusal of $1 does not name mimic-prometheus: $dry_out"
-  [[ $dry_out == *ValidatingAdmissionPolicy* ]] || fail "adm_74: $1 was refused, but not by the policy: $dry_out"
-  ! grep -qiE 'token|ca\.crt|secretTargetRef' <<<"$dry_out" || fail "adm_74: the refusal of $1 mentions the token or the Secret: $dry_out"
+  [[ $dry_out == *"ValidatingAdmissionPolicy 'mimic-prometheus-address'"* ]] || fail "adm_74: $1 was refused, but not by the policy: $dry_out"
+  [[ $dry_out == *"ClusterTriggerAuthentication mimic-prometheus "* ]] || fail "adm_74: the refusal of $1 does not name the ClusterTriggerAuthentication mimic-prometheus: $dry_out"
+  no_secret_name "$1" "$dry_out"
   echo "  refused:  $1"
 }
 other_addr=https://collector.other.svc:443
@@ -373,8 +379,9 @@ refused "type loki with the credential" "$WORK/r-type.yaml"
 # cannot be reached on this CRD): the refusal is by the schema, not by the policy.
 dry "$WORK/r-kind.yaml"
 (( dry_rc == 1 )) || fail "adm_74: kind clustertriggerauthentication in lower case was admitted"
-[[ $dry_out == *"authenticationRef.kind: Unsupported value"* || $dry_out == *mimic-prometheus* ]] \
+[[ $dry_out == *"authenticationRef.kind: Unsupported value"* ]] \
   || fail "adm_74: the lower-case kind was refused for another reason: $dry_out"
+no_secret_name "the lower-case kind" "$dry_out"
 echo "  refused:  kind clustertriggerauthentication in lower case with another serverAddress (by the CRD schema enum, not the policy)"
 refused "a ScaledJob using the credential with another serverAddress" "$WORK/r-scaledjob.yaml"
 # An update of the live shop/cart (ADM-70) that adds the credential and another serverAddress is refused, and the object is unchanged.
@@ -384,10 +391,12 @@ patch=$(jq -nc --arg a "$other_addr" --argjson t "$(jq -c '.triggers' <<<"$befor
 if patch_out=$(kubectl -n "$APP_NS" patch scaledobject cart --type merge -p "$patch" 2>&1); then
   fail "adm_74: the update of the live ScaledObject was admitted"
 fi
-[[ $patch_out == *mimic-prometheus* && $patch_out == *ValidatingAdmissionPolicy* ]] || fail "adm_74: the update was refused, but not by the policy: $patch_out"
+[[ $patch_out == *"ValidatingAdmissionPolicy 'mimic-prometheus-address'"* && $patch_out == *"ClusterTriggerAuthentication mimic-prometheus "* ]] \
+  || fail "adm_74: the update was refused, but not by the policy: $patch_out"
+no_secret_name "the update of the live shop/cart" "$patch_out"
 [[ $(kubectl -n "$APP_NS" get scaledobject cart -o json | jq -c '.spec') == "$before" ]] || fail "adm_74: the refused update changed the live ScaledObject"
 echo "  refused:  the update of the live shop/cart, which is unchanged"
 kubectl delete namespace "$OTHER_NS" --wait=false >/dev/null
-echo "adm_74: 2 cases admitted, 6 refused by the policy with mimic-prometheus in the message, the update refused"
+echo "adm_74: 2 cases admitted, 6 refused by the policy naming the ClusterTriggerAuthentication, none holding the Secret's name, the update refused"
 
 echo "e2e-autoscaling: ADM-70 passed"

@@ -134,7 +134,7 @@ jq -e '[.[] | select(.apiVersion == "admissionregistration.k8s.io/v1" and .kind 
 ext_address=$(yq -r 'select(.kind == "ScaledObject") | .spec.triggers[0].metadata.serverAddress' $dir/scaledobject-external.yaml)
 jq -e --arg addr "$ext_address" '
   (.[] | select(.kind == "ValidatingAdmissionPolicy")) as $p | (.[] | select(.kind == "ValidatingAdmissionPolicyBinding")) as $b
-  | $p.metadata.name == "mimic-prometheus-auth" and $b.metadata.name == "mimic-prometheus-auth"
+  | $p.metadata.name == "mimic-prometheus-address" and $b.metadata.name == "mimic-prometheus-address"
   and $p.spec.failurePolicy == "Fail"
   and ($p.spec.matchConstraints.resourceRules | length) == 1
   and ($p.spec.matchConstraints.resourceRules[0] | .apiGroups == ["keda.sh"] and (.operations | sort) == ["CREATE", "UPDATE"]
@@ -145,7 +145,7 @@ jq -e --arg addr "$ext_address" '
   and ([$p.spec.variables[] | select(.name == "uses")][0].expression | contains("mimic-prometheus") and contains("clustertriggerauthentication") and contains("lowerAscii"))
   and ([$p.spec.validations[].expression] | join(" ") | contains("type") and contains("serverAddress") and contains("unsafeSsl") and contains("FromEnv"))
   and ($p.spec.validations | all(.messageExpression | contains("mimic-prometheus")))
-  and $b.spec.policyName == "mimic-prometheus-auth" and $b.spec.validationActions == ["Deny"] and ($b.spec | has("paramRef") | not)' <<<"$pdocs" >/dev/null \
+  and $b.spec.policyName == "mimic-prometheus-address" and $b.spec.validationActions == ["Deny"] and ($b.spec | has("paramRef") | not)' <<<"$pdocs" >/dev/null \
   || fail "adm_73: $pol: the policy or its binding is not the one of §10.7"
 echo "adm_73: keda-auth-policy.yaml is one policy and one binding bound to the address of scaledobject-external.yaml"
 

@@ -115,8 +115,9 @@ AUTOSCALING_DIRS = ("deploy/autoscaling", "scripts/e2e", "crates/mimic-core/src/
 AUTOSCALING_FILES = frozenset(
     {
         "scripts/e2e-autoscaling.sh",
-        "scripts/check-autoscaling.sh",
         "scripts/keda-chart.sh",
+        # Set the app and node images of the job.
+        "scripts/pinned-image.sh",
         "images/Dockerfile",
         "deploy/helm/mimic/Chart.yaml",
         "deploy/helm/mimic/values.yaml",

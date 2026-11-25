@@ -255,7 +255,7 @@ class Adm70Gate(unittest.TestCase):
         "deploy/autoscaling/scaledobject.yaml",
         "deploy/autoscaling/keda-values.yaml",
         "scripts/e2e-autoscaling.sh",
-        "scripts/check-autoscaling.sh",
+        "scripts/pinned-image.sh",
         "scripts/e2e/apps/service.py",
         "images/Dockerfile",
         "deploy/helm/mimic/values.yaml",
@@ -274,14 +274,19 @@ class Adm70Gate(unittest.TestCase):
             self.assertTrue(run([path])["gate_e2e_autoscaling"], path)
 
     def test_adm_70_the_script_runs_the_image_and_chart_stages_it_needs(self):
-        for path in ("scripts/e2e-autoscaling.sh", "scripts/check-autoscaling.sh"):
-            r = run([path])
-            self.assertTrue(r["gate_chart"] and r["gate_image"], path)
+        r = run(["scripts/e2e-autoscaling.sh"])
+        self.assertTrue(r["gate_chart"] and r["gate_image"])
         # It starts no Rust job.
         r = run(["scripts/e2e-autoscaling.sh"])
         self.assertFalse(r["gate_lint"] or r["gate_test"] or r["gate_security"])
         # Its edit alone does not start the other kind jobs.
         self.assertFalse(r["gate_e2e"] or r["gate_e2e_load"])
+
+    def test_adm_70_the_chart_check_alone_does_not_start_the_kind_job(self):
+        # check-autoscaling.sh runs in the chart job only (ADM-68, ADM-69).
+        r = run(["scripts/check-autoscaling.sh"])
+        self.assertTrue(r["gate_chart"])
+        self.assertFalse(r["gate_e2e_autoscaling"])
 
     def test_adm_70_unrelated_changes_leave_the_gate_off(self):
         for path in (

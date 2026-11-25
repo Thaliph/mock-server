@@ -5,7 +5,7 @@
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: mimic-prometheus-auth
+  name: mimic-prometheus-address
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -40,7 +40,7 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: mimic-prometheus-auth
+  name: mimic-prometheus-address
 spec:
-  policyName: mimic-prometheus-auth
+  policyName: mimic-prometheus-address
   validationActions: [Deny]

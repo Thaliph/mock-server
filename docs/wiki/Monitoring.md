@@ -242,7 +242,7 @@ repository, outside the chart, so the published chart is unchanged:
 | `keda-values.yaml` | Values for the chart `keda` **2.21.1**, pinned by version and by the SHA-256 of its archive, with its three images pinned by tag and digest. Secrets are read in KEDA's own namespace only (`permissions.operator.restrict.secret` and `permissions.metricServer.restrict.secret`), there is no `get` on `*/*` and no `*/scale` (`rbac.enabledCustomScaledRefKinds: false`; Deployments and StatefulSets stay scalable), `rbac.aggregateToDefaultRoles` stays `false`, and KEDA's own `kubernetes` NetworkPolicies are on. |
 | `scaledobject.yaml` | The `ScaledObject` `cart` of the Deployment `cart` in namespace `shop`, on the bundled Prometheus of release `mimic`. |
 | `scaledobject-external.yaml` | The same `ScaledObject` for an external Prometheus, with a `ClusterTriggerAuthentication`. |
-| `keda-auth-policy.yaml` | A `ValidatingAdmissionPolicy` and its binding, both `mimic-prometheus-auth`, that bind the `ClusterTriggerAuthentication` of the external variant to its address. Always applied with `scaledobject-external.yaml`. |
+| `keda-auth-policy.yaml` | A `ValidatingAdmissionPolicy` and its binding, both `mimic-prometheus-address`, that bind the `ClusterTriggerAuthentication` of the external variant to its address. Always applied with `scaledobject-external.yaml`. |
 | `keda-scaledobject-editor.yaml` | A ClusterRole `keda-scaledobject-editor` that grants `scaledobjects` only, to bind per namespace. |
 
 The set-up below (bundled Prometheus, KEDA from the checked archive, `scaledobject.yaml`) is the one the project's kind
@@ -351,7 +351,7 @@ prom-label-proxy or by the hosted Prometheus, and set its own query limits: the 
 any namespace use a `ClusterTriggerAuthentication`, and the Prometheus scaler sends `Authorization: Bearer <token>`
 to whatever `serverAddress` the trigger names. Without the policy, whoever can write a `ScaledObject` anywhere
 obtains the token. The file holds a `ValidatingAdmissionPolicy` and a `ValidatingAdmissionPolicyBinding`, both named
-`mimic-prometheus-auth` (`admissionregistration.k8s.io/v1`, GA since Kubernetes 1.30). Its variable `address` is the
+`mimic-prometheus-address` (`admissionregistration.k8s.io/v1`, GA since Kubernetes 1.30). Its variable `address` is the
 literal address of your Prometheus, the same placeholder as the `serverAddress` of `scaledobject-external.yaml`
 (`https://prometheus.example.com:9090`): **edit the two together**, to the same value.
 
@@ -370,7 +370,7 @@ case-insensitively). Such a trigger is refused unless it:
 - has no `metadata.unsafeSsl` other than `"false"`, so the token goes over verified TLS;
 - has no metadata key ending in `FromEnv` (KEDA's indirection through the target's environment).
 
-The refusal names `mimic-prometheus` and the configured address, never the token or the Secret. A trigger that does
+The refusal names the `ClusterTriggerAuthentication` `mimic-prometheus` and the configured address, never the token or the Secret `mimic-prometheus-auth`. A trigger that does
 not use the credential is not checked. An update is refused the same way, and the object stays unchanged. A new
 policy can take some seconds to be enforced (the kind test waits up to 30 s), and KEDA's operator has no right on
 `ValidatingAdmissionPolicy` objects, so it cannot remove it. With the policy, the token goes only to the configured
@@ -500,9 +500,9 @@ kubectl -n shop create rolebinding keda-scaledobject-editor --clusterrole=keda-s
 
 Grant this Role only. The other `keda.sh` rights escalate through the operator:
 
-- **`scaledjobs`**: a `ScaledJob` holds a whole Job template, and the operator, which may create Jobs in every
-  namespace, creates it. A subject that may write `scaledjobs` runs pods with any ServiceAccount of its namespace,
-  within its Pod Security level, without `pods` or `jobs` rights. Grant it only to subjects that may already create
+- **`scaledjobs`**: a `ScaledJob` holds a whole Job template, and the operator, which can create Jobs in every
+  namespace, creates it. A subject that can write `scaledjobs` runs pods with any ServiceAccount of its namespace,
+  within its Pod Security level, without `pods` or `jobs` rights. Grant it only to subjects that can already create
   pods and use every ServiceAccount of the namespace.
 - **`triggerauthentications`**: a `TriggerAuthentication` can ask for a `podIdentity` owned by the operator (for
   example `aws` with `identityOwner: keda`), so its scalers use KEDA's cloud identity where one is configured. Grant
@@ -545,11 +545,11 @@ Autoscaling is also only as available as the least trusted `ScaledObject` author
   (mimic's injection webhook included), or re-point an aggregated API, by patching any `APIService` (Trivy
   KSV-0114). It has no right on `ValidatingAdmissionPolicy` objects, so `keda-auth-policy.yaml` stays in force. KEDA
   is a cluster component you install, not mimic.
-- **KEDA's operator may reach any pod.** Its chart's `kubernetes` NetworkPolicy admits the operator's egress to every
+- **The KEDA operator pod can reach any pod.** Its chart's `kubernetes` NetworkPolicy admits the operator's egress to every
   pod on every port, since its scalers can query any source; the example keeps it, as a narrower policy would break
   other teams' scalers on a shared KEDA. The Prometheus side is the narrow one: `queryFrom` admits the operator pods
   only.
-- **The three KEDA pods may reach any address on TCP 443 and 6443.** `keda-values.yaml` adds one egress rule of TCP
+- **The three KEDA pods can reach any address on TCP 443 and 6443.** `keda-values.yaml` adds one egress rule of TCP
   443 and 6443 with no peer to the operator, the metrics server and the admission webhooks, because the API server is
   not a pod. As with mimic's empty `networkPolicy.apiServerCIDR`, this also admits the internet and every
   host-network address on those ports, until you narrow it with an `ipBlock` of the API server
