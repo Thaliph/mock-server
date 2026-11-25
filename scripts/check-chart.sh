@@ -1009,4 +1009,79 @@ render --set mesh.enabled=false > "$tmp/mesh-off.yaml"
 [[ -z $(gw_rules "$tmp/mesh-off.yaml") ]] || fail "rte_26: mesh.enabled=false renders a Gateway API rule"
 echo "rte_26: the controller reads HTTPRoutes and ReferenceGrants, patches only the HTTPRoute status; none with the mesh off"
 
+# GW-21, GW-22 (#456): the mimic Gateway. Off, the render is the golden file and holds no gateway object; on, the
+# class, the namespaced write RBAC, the admission policy and the controller variables of spec §7.10.
+gw_on() { render --set gateway.enabled=true --set image.digest="$digest" --set 'gateway.namespaces={shop,edge}' \
+  --api-versions gateway.networking.k8s.io/v1/Gateway --api-versions gateway.networking.k8s.io/v1/GatewayClass "$@"; }
+gw_env() { # gw_env <name> <render file>
+  yq -r 'select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[0].env[] | select(.name == "'"$1"'") | .value' "$2"
+}
+gw_policy() { # gw_policy <render file>: every expression of the policy mimic-gateway, one per line
+  yq -r 'select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-gateway") | .spec.validations[].expression' "$1"
+}
+all_rules() { # all_rules <render file>: "kind group resource verbs" of each rule of each ClusterRole and Role, sorted
+  yq -r 'select(.kind == "ClusterRole" or .kind == "Role") | .kind + "/" + .metadata.name as $k | .rules[] | .apiGroups[] as $g | .resources[] as $r | $k + " " + $g + " " + $r + " " + (.verbs | join(","))' "$1" | grep -vx -- '---' | sort
+}
+gw_on > "$tmp/gw-on.yaml"
+gw_on --set 'gateway.namespaces={edge,shop}' > "$tmp/gw-on-sorted.yaml"
+cmp -s "$tmp/gw-on.yaml" "$tmp/gw-on-sorted.yaml" || fail "gw_21: the order of gateway.namespaces changes the render"
+[[ -z $(yq -r 'select(.kind == "GatewayClass" or (.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-gateway")) | .kind' "$tmp/default.yaml") ]] \
+  || fail "gw_21: the default render holds a GatewayClass or the gateway policy"
+[[ -z $(gw_rules "$tmp/default.yaml" | grep -E '^gateway' || true) ]] || fail "gw_21: the default render has a rule on gateways"
+[[ -z $(yq -r 'select(.kind == "Deployment") | .spec.template.spec.containers[].env[]? | select(.name | test("^MIMIC_GATEWAY_")) | .name' "$tmp/default.yaml") ]] \
+  || fail "gw_21: the default render has a MIMIC_GATEWAY_ variable"
+[[ $(yq -r 'select(.kind == "GatewayClass") | .metadata.name + " " + (.spec | keys | join(",")) + " " + .spec.controllerName' "$tmp/gw-on.yaml") \
+  == "mimic controllerName mimic.platform.io/gateway-controller" ]] || fail "gw_21: the GatewayClass is not mimic with only the controllerName"
+[[ $(gw_rules "$tmp/gw-on.yaml") == $'gatewayclasses get,list,watch\ngatewayclasses/status patch\ngateways get,list,watch\ngateways/status patch\nhttproutes get,list,watch\nhttproutes/status patch\nreferencegrants get,list,watch' ]] \
+  || fail "gw_21: the controller's Gateway API rules are not those of rte_26 plus gateways and gatewayclasses read and status patch"
+[[ $(yq -r 'select(.kind == "ClusterRole" and .metadata.name == "mimic-gateway") | .rules[] | .apiGroups[0] + "|" + .resources[0] + "|" + (.resources | length | tostring) + "|" + (.verbs | sort | join(","))' "$tmp/gw-on.yaml" | LC_ALL=C sort) \
+  == $'apps|deployments|1|create,delete,get,patch\npolicy|poddisruptionbudgets|1|create,delete,get,patch\n|services|1|create,delete,get,patch' ]] \
+  || fail "gw_21: the ClusterRole mimic-gateway is not get, create, patch, delete on deployments, services and poddisruptionbudgets"
+[[ $(yq -r 'select(.kind == "RoleBinding" and .metadata.name == "mimic-gateway") | .metadata.namespace + " " + .roleRef.kind + "/" + .roleRef.name + " " + (.subjects | length | tostring) + " " + .subjects[0].kind + "/" + .subjects[0].namespace + "/" + .subjects[0].name' "$tmp/gw-on.yaml" | grep -vx -- '---') \
+  == $'edge ClusterRole/mimic-gateway 1 ServiceAccount/mimic-system/mimic-controller\nshop ClusterRole/mimic-gateway 1 ServiceAccount/mimic-system/mimic-controller' ]] \
+  || fail "gw_21: the RoleBindings of mimic-gateway are not one in edge and one in shop"
+[[ -z $(yq -r 'select(.kind == "ClusterRoleBinding" and .roleRef.name == "mimic-gateway") | .metadata.name' "$tmp/gw-on.yaml") ]] \
+  || fail "gw_21: a ClusterRoleBinding binds mimic-gateway"
+render > "$tmp/gw-off.yaml"
+[[ $(diff <(all_rules "$tmp/gw-off.yaml") <(all_rules "$tmp/gw-on.yaml") | grep -c '^<' || true) == 0 ]] || fail "gw_21: enabling the gateway removes a rule"
+added=$(diff <(all_rules "$tmp/gw-off.yaml") <(all_rules "$tmp/gw-on.yaml") | grep '^>' | sed 's/^> //' || true)
+[[ $(grep -c . <<<"$added") == 7 ]] || fail "gw_21: enabling the gateway adds other rules than the four of the controller and the three of mimic-gateway: $added"
+! grep -Eq ' (secrets|pods|namespaces|customresourcedefinitions) ' <<<"$added" || fail "gw_21: a rule on secrets, pods, namespaces or customresourcedefinitions is added"
+[[ $(yq -r 'select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-gateway") | .spec.failurePolicy + " " + (.spec.matchConditions | length | tostring) + " " + .spec.matchConditions[0].expression + " " + (.spec.matchConstraints.resourceRules | length | tostring) + " " + ([.spec.matchConstraints.resourceRules[].operations | join(",")] | unique | join(";"))' "$tmp/gw-on.yaml") \
+  == 'Fail 1 request.userInfo.username == "system:serviceaccount:mimic-system:mimic-controller" 3 CREATE,UPDATE,DELETE' ]] \
+  || fail "gw_21: the policy is not failurePolicy Fail with the controller's account and three resources on three operations"
+[[ $(yq -r 'select(.kind == "ValidatingAdmissionPolicyBinding" and .metadata.name == "mimic-gateway") | .spec.policyName + " " + (.spec.validationActions | join(","))' "$tmp/gw-on.yaml") == "mimic-gateway Deny" ]] \
+  || fail "gw_21: the policy binding is not mimic-gateway with [Deny]"
+for want in "ghcr.io/thaliph/mimic@$digest" "['edge', 'shop']" "'ClusterIP'" "<= 10" '{"limits":{"memory":"128Mi"},"requests":{"cpu":"100m","memory":"64Mi"}}'; do
+  grep -qF -- "$want" <<<"$(gw_policy "$tmp/gw-on.yaml")" || fail "gw_21: the policy does not hold $want"
+done
+[[ $(gw_env MIMIC_GATEWAY_NAMESPACES "$tmp/gw-on.yaml") == edge,shop ]] || fail "gw_21: MIMIC_GATEWAY_NAMESPACES is not edge,shop"
+[[ $(gw_env MIMIC_GATEWAY_SERVICE_TYPE "$tmp/gw-on.yaml") == ClusterIP ]] || fail "gw_21: MIMIC_GATEWAY_SERVICE_TYPE is not ClusterIP"
+[[ $(gw_env MIMIC_GATEWAY_MAX_REPLICAS "$tmp/gw-on.yaml") == 10 ]] || fail "gw_21: MIMIC_GATEWAY_MAX_REPLICAS is not 10"
+[[ $(gw_env MIMIC_GATEWAY_RESOURCES "$tmp/gw-on.yaml") == '{"limits":{"memory":"128Mi"},"requests":{"cpu":"100m","memory":"64Mi"}}' ]] \
+  || fail "gw_21: MIMIC_GATEWAY_RESOURCES is not the resources as JSON"
+gw_on --set gateway.serviceType=LoadBalancer --set gateway.maxReplicas=3 --set gateway.resources.limits.memory=256Mi > "$tmp/gw-vals.yaml"
+[[ $(gw_env MIMIC_GATEWAY_SERVICE_TYPE "$tmp/gw-vals.yaml") == LoadBalancer && $(gw_env MIMIC_GATEWAY_MAX_REPLICAS "$tmp/gw-vals.yaml") == 3 \
+  && $(gw_env MIMIC_GATEWAY_RESOURCES "$tmp/gw-vals.yaml") == *'"memory":"256Mi"'* ]] || fail "gw_21: the controller variables do not follow the gateway values"
+for want in "'LoadBalancer'" "<= 3" "256Mi"; do
+  grep -qF -- "$want" <<<"$(gw_policy "$tmp/gw-vals.yaml")" || fail "gw_21: the policy does not follow the gateway values ($want)"
+done
+echo "gw_21: default render without gateway objects; GatewayClass, namespaced RBAC, policy and variables with gateway.enabled"
+
+# refuse <message part> <helm flags...>: helm template of the gateway render with one fault fails with the message.
+gw_refuse() {
+  local want=$1; shift
+  if "$@" > /dev/null 2> "$tmp/gw-err"; then fail "gw_22: no failure for $want"; fi
+  grep -qF -- "$want" "$tmp/gw-err" || fail "gw_22: the failure does not name $want: $(cat "$tmp/gw-err")"
+}
+gw_refuse "needs mesh.enabled" gw_on --set mesh.enabled=false
+gw_refuse "needs image.digest" gw_on --set image.digest=""
+gw_refuse "gateway.namespaces" gw_on --set gateway.namespaces=null
+gw_refuse "Gateway API CRDs" render --set gateway.enabled=true --set image.digest="$digest" --set 'gateway.namespaces={shop}' --api-versions gateway.networking.k8s.io/v1/GatewayClass
+gw_refuse "Gateway API CRDs" render --set gateway.enabled=true --set image.digest="$digest" --set 'gateway.namespaces={shop}' --api-versions gateway.networking.k8s.io/v1/Gateway
+gw_refuse "gateway.serviceType" gw_on --set gateway.serviceType=ExternalName
+gw_refuse "gateway.serviceType" gw_on --set gateway.serviceType=clusterip
+gw_refuse "needs mesh.enabled" gw_on --set mesh.enabled=false --set image.digest="" --set gateway.namespaces=null
+echo "gw_22: each missing prerequisite and a bad serviceType fail helm template, the first check in order"
+
 echo "chart checks passed"

@@ -58,6 +58,16 @@ rules:
     resources: [httproutes/status]
     verbs: [patch]
   {{- end }}
+  {{- if .Values.gateway.enabled }}
+  # The mimic Gateway (spec §7.10, M6): Gateways and GatewayClasses are read, and only their status is written.
+  # The objects of a Gateway are written through the namespaced ClusterRole of gateway.yaml, never from here.
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways, gatewayclasses]
+    verbs: [get, list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways/status, gatewayclasses/status]
+    verbs: [patch]
+  {{- end }}
   {{- if .Values.loadTest.enabled }}
   # Load tests (spec §11, F11): the MimicLoadTest objects, the status of each, and the generator's
   # Job and NetworkPolicy, which the ValidatingAdmissionPolicy of loadtest-policy.yaml restricts to
