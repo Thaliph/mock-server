@@ -222,7 +222,7 @@ pub fn decide(
 }
 
 /// A literal `env` value as the kubelet will expand it: `$$` stands for a literal `$`.
-fn literal(value: &str) -> String {
+pub(crate) fn literal(value: &str) -> String {
     value.replace('$', "$$")
 }
 

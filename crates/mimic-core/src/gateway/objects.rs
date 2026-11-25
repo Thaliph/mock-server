@@ -52,3 +52,21 @@ fn hex(bytes: &[u8], digits: usize) -> String {
         .map(char::from)
         .collect()
 }
+
+/// The three objects of an accepted Gateway, as server-side apply bodies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Objects {
+    pub deployment: serde_json::Value,
+    pub service: serde_json::Value,
+    pub pod_disruption_budget: serde_json::Value,
+}
+
+/// The objects of `gw` (GW-05, GW-06); `None` exactly when it is not accepted (GW-07).
+pub fn objects(
+    gw: &super::input::Gateway,
+    acceptance: &super::accept::Acceptance,
+    settings: &super::Settings,
+) -> Option<Objects> {
+    let _ = (gw, acceptance, settings);
+    None
+}

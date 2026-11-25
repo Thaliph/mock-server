@@ -85,3 +85,59 @@ pub struct ObservedStatus {
     pub listeners: Vec<Value>,
     pub addresses: Vec<Value>,
 }
+
+/// The gateway Deployment's status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentState {
+    pub generation: i64,
+    /// `status.observedGeneration`.
+    pub observed_generation: i64,
+    /// `status.availableReplicas`.
+    pub available_replicas: u32,
+    /// A `ReplicaFailure` condition is `True`.
+    pub replica_failure: bool,
+}
+
+/// A `status.loadBalancer.ingress[]` entry of the gateway Service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ingress {
+    pub ip: Option<String>,
+    pub hostname: Option<String>,
+}
+
+/// The gateway Service's addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceState {
+    /// `spec.type`, as written.
+    pub service_type: String,
+    /// `spec.clusterIPs`.
+    pub cluster_ips: Vec<String>,
+    pub ingress: Vec<Ingress>,
+}
+
+/// The kind of a generated object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ObjectKind {
+    Deployment,
+    Service,
+    PodDisruptionBudget,
+}
+
+impl ObjectKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObjectKind::Deployment => "Deployment",
+            ObjectKind::Service => "Service",
+            ObjectKind::PodDisruptionBudget => "PodDisruptionBudget",
+        }
+    }
+}
+
+/// The generated objects as the cluster holds them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Observed {
+    pub deployment: Option<DeploymentState>,
+    pub service: Option<ServiceState>,
+    /// The first object of a generated name that is not managed by mimic.
+    pub unmanaged: Option<(ObjectKind, String)>,
+}

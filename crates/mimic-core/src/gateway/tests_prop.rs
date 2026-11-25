@@ -1,10 +1,10 @@
-//! GW-01 and GW-07 properties: generated names are valid and stable; the acceptance of any
-//! converted Gateway keeps its bounds.
+//! GW-01 and GW-07 properties: generated names are valid and stable; the acceptance and the
+//! objects of any converted Gateway keep their bounds and do not depend on the listener order.
 
 use proptest::prelude::*;
 
 use super::accept::gateway;
-use super::objects::name;
+use super::objects::{name, objects};
 use super::testkit::any_gateway;
 use super::{ADMIN_PORT, MAX_LISTENERS};
 
@@ -18,6 +18,19 @@ fn dns_1035(s: &str) -> bool {
         && (b[b.len() - 1].is_ascii_lowercase() || b[b.len() - 1].is_ascii_digit())
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// Deterministic shuffle: sorts by a mixed key, so every seed is one permutation.
+fn shuffle<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
+    let mix = |i: usize| {
+        let mut x = seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 31;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^ (x >> 29)
+    };
+    let mut keyed: Vec<(u64, usize)> = (0..items.len()).map(|i| (mix(i), i)).collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, i)| items[i].clone()).collect()
 }
 
 fn label() -> impl Strategy<Value = String> {
@@ -62,5 +75,56 @@ proptest! {
             prop_assert!(got.ports().is_empty());
         }
         prop_assert_eq!(&got, &gateway(&gw, &class, &settings));
+    }
+
+    #[test]
+    fn gw_07_objects_for_any_gateway((gw, class, settings) in any_gateway(), seed in any::<u64>()) {
+        let acceptance = gateway(&gw, &class, &settings);
+        let got = objects(&gw, &acceptance, &settings);
+        prop_assert_eq!(got.is_some(), acceptance.is_accepted());
+        prop_assert_eq!(&got, &objects(&gw, &acceptance, &settings));
+        if let Some(o) = got {
+            let all = [&o.deployment, &o.service, &o.pod_disruption_budget];
+            let name = &o.deployment["metadata"]["name"];
+            prop_assert!(name.as_str().is_some_and(dns_1035), "name {name}");
+            for object in all {
+                prop_assert_eq!(&object["metadata"]["name"], name);
+                let labels = object["metadata"]["labels"].as_object().cloned().unwrap_or_default();
+                prop_assert_eq!(labels.len(), 5);
+                for (key, value) in &labels {
+                    prop_assert!(value.as_str().is_some_and(|v| v.len() <= 63), "label {key}");
+                }
+            }
+            let container = &o.deployment["spec"]["template"]["spec"]["containers"][0];
+            let ports: Vec<u64> = container["ports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p.get("name").is_none())
+                .filter_map(|p| p["containerPort"].as_u64())
+                .collect();
+            prop_assert!(ports.windows(2).all(|w| w[0] < w[1]), "ports {ports:?}");
+            prop_assert!(ports.iter().all(|p| (1..=65535).contains(p) && *p != 15100));
+            let service_ports: Vec<u64> = o.service["spec"]["ports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["port"].as_u64())
+                .collect();
+            prop_assert_eq!(&service_ports, &ports);
+            for e in container["env"].as_array().into_iter().flatten() {
+                let n = e["name"].as_str().unwrap_or_default();
+                prop_assert!(["MIMIC_GATEWAY_PORTS", "MIMIC_LOG", "MIMIC_ROLE"].contains(&n), "env {n}");
+            }
+            let mut shuffled = gw.clone();
+            shuffled.listeners = shuffle(&gw.listeners, seed);
+            let again = objects(&shuffled, &gateway(&shuffled, &class, &settings), &settings);
+            prop_assert!(again.is_some());
+            if let Some(again) = again {
+                prop_assert_eq!(o.deployment.to_string(), again.deployment.to_string());
+                prop_assert_eq!(o.service.to_string(), again.service.to_string());
+                prop_assert_eq!(o.pod_disruption_budget.to_string(), again.pod_disruption_budget.to_string());
+            }
+        }
     }
 }

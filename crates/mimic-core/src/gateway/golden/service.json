@@ -1,0 +1,44 @@
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "labels": {
+      "app.kubernetes.io/managed-by": "mimic",
+      "app.kubernetes.io/name": "mimic-gateway",
+      "gateway.networking.k8s.io/gateway-class-name": "mimic",
+      "gateway.networking.k8s.io/gateway-name": "web",
+      "mimic.platform.io/gateway": "web"
+    },
+    "name": "web-mimic",
+    "namespace": "shop",
+    "ownerReferences": [
+      {
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "controller": true,
+        "kind": "Gateway",
+        "name": "web",
+        "uid": "uid-web"
+      }
+    ]
+  },
+  "spec": {
+    "ports": [
+      {
+        "name": "http-80",
+        "port": 80,
+        "protocol": "TCP",
+        "targetPort": 80
+      },
+      {
+        "name": "http-8080",
+        "port": 8080,
+        "protocol": "TCP",
+        "targetPort": 8080
+      }
+    ],
+    "selector": {
+      "mimic.platform.io/gateway": "web"
+    },
+    "type": "ClusterIP"
+  }
+}

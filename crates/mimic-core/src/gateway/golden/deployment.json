@@ -1,0 +1,146 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "labels": {
+      "app.kubernetes.io/managed-by": "mimic",
+      "app.kubernetes.io/name": "mimic-gateway",
+      "gateway.networking.k8s.io/gateway-class-name": "mimic",
+      "gateway.networking.k8s.io/gateway-name": "web",
+      "mimic.platform.io/gateway": "web"
+    },
+    "name": "web-mimic",
+    "namespace": "shop",
+    "ownerReferences": [
+      {
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "controller": true,
+        "kind": "Gateway",
+        "name": "web",
+        "uid": "uid-web"
+      }
+    ]
+  },
+  "spec": {
+    "replicas": 3,
+    "selector": {
+      "matchLabels": {
+        "mimic.platform.io/gateway": "web"
+      }
+    },
+    "strategy": {
+      "rollingUpdate": {
+        "maxSurge": 1,
+        "maxUnavailable": 0
+      },
+      "type": "RollingUpdate"
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "mimic-gateway",
+          "mimic.platform.io/gateway": "web",
+          "mimic.platform.io/inject": "disabled"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "containers": [
+          {
+            "command": [
+              "/usr/local/bin/mimic-sidecar"
+            ],
+            "env": [
+              {
+                "name": "MIMIC_GATEWAY_PORTS",
+                "value": "80,8080"
+              },
+              {
+                "name": "MIMIC_LOG",
+                "value": "info"
+              },
+              {
+                "name": "MIMIC_ROLE",
+                "value": "gateway"
+              }
+            ],
+            "image": "registry.example/mimic-sidecar@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/healthz",
+                "port": 15100
+              }
+            },
+            "name": "gateway",
+            "ports": [
+              {
+                "containerPort": 80,
+                "protocol": "TCP"
+              },
+              {
+                "containerPort": 8080,
+                "protocol": "TCP"
+              },
+              {
+                "containerPort": 15100,
+                "name": "mimic-admin",
+                "protocol": "TCP"
+              }
+            ],
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/readyz",
+                "port": 15100
+              }
+            },
+            "resources": {
+              "limits": {
+                "memory": "128Mi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "64Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              },
+              "readOnlyRootFilesystem": true
+            }
+          }
+        ],
+        "enableServiceLinks": false,
+        "securityContext": {
+          "runAsGroup": 65532,
+          "runAsNonRoot": true,
+          "runAsUser": 65532,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          },
+          "sysctls": [
+            {
+              "name": "net.ipv4.ip_unprivileged_port_start",
+              "value": "0"
+            }
+          ]
+        },
+        "topologySpreadConstraints": [
+          {
+            "labelSelector": {
+              "matchLabels": {
+                "mimic.platform.io/gateway": "web"
+              }
+            },
+            "maxSkew": 1,
+            "topologyKey": "kubernetes.io/hostname",
+            "whenUnsatisfiable": "ScheduleAnyway"
+          }
+        ]
+      }
+    }
+  }
+}

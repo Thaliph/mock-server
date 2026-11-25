@@ -1,0 +1,32 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "PodDisruptionBudget",
+  "metadata": {
+    "labels": {
+      "app.kubernetes.io/managed-by": "mimic",
+      "app.kubernetes.io/name": "mimic-gateway",
+      "gateway.networking.k8s.io/gateway-class-name": "mimic",
+      "gateway.networking.k8s.io/gateway-name": "web",
+      "mimic.platform.io/gateway": "web"
+    },
+    "name": "web-mimic",
+    "namespace": "shop",
+    "ownerReferences": [
+      {
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "controller": true,
+        "kind": "Gateway",
+        "name": "web",
+        "uid": "uid-web"
+      }
+    ]
+  },
+  "spec": {
+    "maxUnavailable": 1,
+    "selector": {
+      "matchLabels": {
+        "mimic.platform.io/gateway": "web"
+      }
+    }
+  }
+}

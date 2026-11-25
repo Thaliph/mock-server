@@ -549,6 +549,18 @@ impl Condition {
             message,
         }
     }
+
+    /// The condition as a `metav1.Condition` of type `kind`.
+    pub fn to_json(
+        &self,
+        kind: &str,
+        generation: i64,
+        previous: Option<&serde_json::Value>,
+        now: &str,
+    ) -> serde_json::Value {
+        let _ = (kind, generation, previous, now);
+        serde_json::Value::Null
+    }
 }
 
 /// `status.conditions` of a `MimicConfig`.

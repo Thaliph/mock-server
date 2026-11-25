@@ -2,9 +2,10 @@
 //! listener `http` HTTP 80; `namespaces = {shop}`, `max_replicas = 10`.
 
 use proptest::prelude::*;
+use serde_json::json;
 
-use super::Settings;
 use super::input::*;
+use super::{ServiceType, Settings};
 use crate::mesh::input::GATEWAY_GROUP;
 
 pub fn listener(name: &str, protocol: &str, port: u16) -> Listener {
@@ -65,6 +66,10 @@ pub fn settings() -> Settings {
     Settings {
         namespaces: ["shop".to_string()].into(),
         max_replicas: 10,
+        service_type: ServiceType::ClusterIP,
+        image: format!("registry.example/mimic-sidecar@sha256:{}", "0".repeat(64)),
+        log: "info".into(),
+        resources: json!({"requests": {"cpu": "100m", "memory": "64Mi"}, "limits": {"memory": "128Mi"}}),
     }
 }
 
@@ -219,8 +224,8 @@ pub fn any_gateway() -> impl Strategy<Value = (Gateway, GatewayClass, Settings)>
             observed: vec![],
         };
         let settings = Settings {
-            namespaces: ["shop".to_string()].into(),
             max_replicas: max,
+            ..settings()
         };
         (gw, class, settings)
     })
