@@ -5509,7 +5509,19 @@ rte_21_until 30 "the view of client kept the backend ext after the ReferenceGran
 # RTE-23: the CRDs deleted while the mesh runs; calls still work, balanced over the pods; installed again.
 rte_21_logs() { kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --tail=-1 2>/dev/null | grep -c "$1" || true; }
 rte_21_missing_before=$(rte_21_logs 'gateway api crds missing')
-kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --timeout=120s >/dev/null || fail "rte_21: cannot delete the Gateway API CRDs"
+# The instances go first (a CRD with instances waits for its customresourcecleanup finalizer), then the CRDs, with a bound
+# that has margin. On a timeout the stuck CRDs and what is left of their instances are printed, so the failure says why.
+rte_21_crds=$(kubectl get crd -o name | grep -E '\.gateway\.networking\.k8s\.io$' || true)
+for crd in $rte_21_crds; do
+  kubectl delete "${crd#*/}" --all --all-namespaces --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
+done
+if ! kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --timeout=240s >/dev/null; then
+  for crd in $rte_21_crds; do
+    kubectl get "$crd" -o jsonpath='{.metadata.name}{" deletionTimestamp="}{.metadata.deletionTimestamp}{" finalizers="}{.metadata.finalizers}{"\n"}{.status.conditions}{"\n"}' >&2 2>&1 || true
+    kubectl get "${crd#*/}" --all-namespaces -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,FINALIZERS:.metadata.finalizers >&2 2>&1 || true
+  done
+  fail "rte_21: cannot delete the Gateway API CRDs"
+fi
 gateway_absent() { [[ $(rte_21_gauge) == 0 ]]; }
 rte_21_until 40 "the controller did not report mimic_mesh_gateway_api_present 0 within 40 s" gateway_absent
 (( $(rte_21_logs 'gateway api crds missing') > rte_21_missing_before )) || fail "rte_21: the controller did not log gateway api crds missing"
