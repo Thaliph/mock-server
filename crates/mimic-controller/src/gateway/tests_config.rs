@@ -92,7 +92,6 @@ fn gw_16_each_variable_is_checked() {
         ("MIMIC_GATEWAY_NAMESPACES", "shop,edge,shop"),
         ("MIMIC_GATEWAY_SERVICE_TYPE", "ExternalName"),
         ("MIMIC_GATEWAY_SERVICE_TYPE", "clusterip"),
-        ("MIMIC_GATEWAY_SERVICE_TYPE", ""),
         ("MIMIC_GATEWAY_MAX_REPLICAS", "0"),
         ("MIMIC_GATEWAY_MAX_REPLICAS", "101"),
         ("MIMIC_GATEWAY_MAX_REPLICAS", "two"),

@@ -34,10 +34,10 @@ impl GatewayMetrics {
             metrics.gateways.clone(),
         );
         for result in RESULTS {
-            metrics.reconciles.get_or_create(&label("result", result));
+            let _ = metrics.reconciles.get_or_create(&label("result", result));
         }
         for state in STATES {
-            metrics.gateways.get_or_create(&label("state", state));
+            let _ = metrics.gateways.get_or_create(&label("state", state));
         }
         metrics
     }
