@@ -419,7 +419,7 @@ pub async fn route_pass(
 }
 
 /// RFC 3339, in seconds, of now.
-fn clock() -> String {
+pub(crate) fn clock() -> String {
     let now = time::OffsetDateTime::now_utc();
     now.replace_nanosecond(0)
         .unwrap_or(now)

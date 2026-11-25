@@ -170,7 +170,7 @@ impl MeshConfig {
     }
 }
 
-fn cluster_name(name: &str) -> bool {
+pub(crate) fn cluster_name(name: &str) -> bool {
     let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
     name.len() <= 63
         && edge(name.chars().next())

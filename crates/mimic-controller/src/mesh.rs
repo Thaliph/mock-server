@@ -3,17 +3,16 @@
 //! serves the views, and the status of the `MimicConfig`s. What a view holds is decided by
 //! `mimic_core::mesh`, a pure function; this module is the process plumbing around it.
 
-mod config;
-mod convert;
+pub(crate) mod config;
+pub(crate) mod convert;
 mod hub;
-mod metrics;
+pub(crate) mod metrics;
 pub mod status;
-mod watch;
+pub(crate) mod table;
+pub(crate) mod watch;
 
 pub use config::MeshConfig;
-#[cfg(test)]
-pub use hub::Event;
-pub use hub::{Answer, Entry, Hub};
+pub use hub::{Answer, Entry, Event, Hub};
 pub use metrics::MeshMetrics;
 pub use watch::spawn;
 

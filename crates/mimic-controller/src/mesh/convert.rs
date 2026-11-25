@@ -25,7 +25,7 @@ pub type Key = (String, String);
 /// Label of an EndpointSlice naming its Service.
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
-fn key(meta: &ObjectMeta) -> Option<Key> {
+pub(crate) fn key(meta: &ObjectMeta) -> Option<Key> {
     let (namespace, name) = (meta.namespace.as_deref()?, meta.name.as_deref()?);
     (!namespace.is_empty() && !name.is_empty()).then(|| (namespace.to_string(), name.to_string()))
 }
@@ -126,7 +126,7 @@ pub fn slice(object: &KubeSlice) -> Option<(Key, EndpointSlice)> {
     Some((key, slice))
 }
 
-fn text(value: &Value, field: &str) -> Option<String> {
+pub(crate) fn text(value: &Value, field: &str) -> Option<String> {
     value.get(field)?.as_str().map(str::to_string)
 }
 
@@ -289,7 +289,7 @@ pub fn grant(object: &DynamicObject) -> Option<(Key, ReferenceGrant)> {
 
 /// The longest `spec` of an `HTTPRoute` that is read (RTE-13); a larger one is kept as its key,
 /// generation and parents.
-const MAX_SPEC_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SPEC_BYTES: usize = 64 * 1024;
 
 /// The fields of each level of an `HTTPRoute` the converter reads (or, for the filter types of
 /// the standard channel, that `mesh::route` refuses by `type`). Any other is an unknown field.
@@ -324,7 +324,7 @@ const FILTER_FIELDS: [&str; 7] = [
 ];
 
 /// The paths of the fields an object has besides `known`, under `at`.
-fn unknown(value: &Value, at: &str, known: &[&str], out: &mut Vec<String>) {
+pub(crate) fn unknown(value: &Value, at: &str, known: &[&str], out: &mut Vec<String>) {
     let Some(object) = value.as_object() else {
         return;
     };
@@ -337,14 +337,14 @@ fn unknown(value: &Value, at: &str, known: &[&str], out: &mut Vec<String>) {
     }
 }
 
-fn list<'a>(value: &'a Value, field: &str) -> &'a [Value] {
+pub(crate) fn list<'a>(value: &'a Value, field: &str) -> &'a [Value] {
     value
         .get(field)
         .and_then(Value::as_array)
         .map_or(&[], Vec::as_slice)
 }
 
-fn port(value: &Value) -> Option<u16> {
+pub(crate) fn port(value: &Value) -> Option<u16> {
     u16::try_from(value.get("port")?.as_u64()?).ok()
 }
 

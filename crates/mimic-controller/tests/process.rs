@@ -789,6 +789,65 @@ fn msh_18_an_invalid_mesh_setting_exits_2_before_listening() {
 }
 
 #[test]
+fn gw_16_invalid_gateway_variables_exit_2_naming_the_variable() {
+    let many = (0..257)
+        .map(|i| format!("ns-{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let shop = ("MIMIC_GATEWAY_NAMESPACES", "shop");
+    let cases: Vec<Vec<(&str, &str)>> = vec![
+        vec![("MIMIC_GATEWAY_NAMESPACES", "Shop")],
+        vec![("MIMIC_GATEWAY_NAMESPACES", "shop,shop")],
+        vec![("MIMIC_GATEWAY_NAMESPACES", &many)],
+        vec![shop, ("MIMIC_MESH", "off")],
+        vec![shop, ("MIMIC_GATEWAY_SERVICE_TYPE", "ExternalName")],
+        vec![shop, ("MIMIC_GATEWAY_MAX_REPLICAS", "0")],
+        vec![shop, ("MIMIC_GATEWAY_MAX_REPLICAS", "101")],
+        vec![shop, ("MIMIC_GATEWAY_RESOURCES", "[]")],
+        vec![
+            shop,
+            ("MIMIC_GATEWAY_RESOURCES", r#"{"limits":{"cpu":"x"}}"#),
+        ],
+    ];
+    for extra in cases {
+        let (var, value) = *extra.last().unwrap();
+        let var = if var == "MIMIC_MESH" {
+            "MIMIC_GATEWAY_NAMESPACES"
+        } else {
+            var
+        };
+        let mut pairs = vec![("MIMIC_VALKEY_URL", "redis://127.0.0.1:1")];
+        pairs.extend(extra.iter().copied());
+        let (status, stdout, stderr) = run(BIN, &[], &env(&pairs));
+        assert_eq!(status.code(), Some(2), "{var}={value:.40}");
+        assert!(stderr.contains(var), "{var}={value:.40}: {stderr}");
+        assert!(
+            !stdout.contains("admin listening"),
+            "{var}: checked before the start"
+        );
+    }
+}
+
+#[test]
+fn gw_16_the_defaults_start() {
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[
+            ("MIMIC_VALKEY_URL", &url),
+            ("MIMIC_GATEWAY_NAMESPACES", "shop"),
+        ]),
+    );
+    controller.wait_log(Duration::from_secs(10), |v| {
+        v["message"] == "controller starting"
+    });
+    let addr = controller.admin_addr();
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(http_get(addr, "/healthz").0, 200, "still running");
+}
+
+#[test]
 fn inj_19_invalid_listener_limits_exit_2() {
     for (var, value) in [
         ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "0"),

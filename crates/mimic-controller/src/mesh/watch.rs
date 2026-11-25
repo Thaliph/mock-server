@@ -20,7 +20,7 @@ use super::hub::{Event, Hub};
 
 /// How long to wait before a watch that ended is started again, and between two looks for the
 /// `ReferenceGrant` CRD.
-const RETRY: Duration = Duration::from_secs(10);
+pub(crate) const RETRY: Duration = Duration::from_secs(10);
 
 fn key_of<K: kube::Resource>(object: &K) -> Option<Key> {
     Some((object.namespace()?, object.name_any()))
@@ -31,7 +31,7 @@ fn key_of<K: kube::Resource>(object: &K) -> Option<Key> {
 /// kind served by a CRD: a watch on a deleted CRD fails with an error that is not a 404 (the
 /// API server's 404 body is plain text, read as a broken event stream), so after any watch
 /// error the resource is looked up and a 404 ends the watch.
-async fn forward<K, T, S>(
+pub(crate) async fn forward<K, T, S>(
     events: S,
     convert: impl Fn(&K) -> Option<(Key, T)>,
     feed: impl Fn(Event<T>),
@@ -79,7 +79,7 @@ async fn forward<K, T, S>(
 }
 
 /// The API server says the resource does not exist (a CRD that is not installed).
-fn gone(error: &watcher::Error) -> bool {
+pub(crate) fn gone(error: &watcher::Error) -> bool {
     matches!(
         error,
         watcher::Error::InitialListFailed(kube::Error::Api(status))
@@ -90,7 +90,7 @@ fn gone(error: &watcher::Error) -> bool {
 }
 
 /// The CRD of `api` is not installed: a list of it answers 404.
-async fn crd_missing(api: &Api<DynamicObject>) -> bool {
+pub(crate) async fn crd_missing(api: &Api<DynamicObject>) -> bool {
     matches!(
         api.list(&ListParams::default().limit(1)).await,
         Err(kube::Error::Api(status)) if status.code == 404
@@ -171,7 +171,7 @@ async fn grants(client: kube::Client, hub: Arc<Hub>) {
 }
 
 /// How long to wait between two looks for the `HTTPRoute` CRD.
-const CRD_LOOK: Duration = Duration::from_secs(30);
+pub(crate) const CRD_LOOK: Duration = Duration::from_secs(30);
 
 /// `HTTPRoute`s, when the Gateway API CRD exists: it may be installed after the controller
 /// started (and removed), so it is looked for again every [`CRD_LOOK`] (RTE-18). The hub logs

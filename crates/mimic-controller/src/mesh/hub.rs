@@ -24,6 +24,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use super::config::MeshConfig;
 use super::convert::{Key, RouteObserved};
 use super::metrics::{MeshMetrics, label};
+use super::table::Table;
 
 /// The longest wait between two publications while changes keep arriving.
 const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -53,66 +54,6 @@ impl<A, B> Event<(A, B)> {
     }
 }
 
-struct Table<V> {
-    items: BTreeMap<Key, V>,
-    /// The objects of a relist that is not complete: the old content is served meanwhile.
-    staging: Option<BTreeMap<Key, V>>,
-    /// A list was complete once.
-    synced: bool,
-}
-
-impl<V> Default for Table<V> {
-    fn default() -> Table<V> {
-        Table {
-            items: BTreeMap::new(),
-            staging: None,
-            synced: false,
-        }
-    }
-}
-
-impl<V: PartialEq> Table<V> {
-    /// Applies an event; false when it changed nothing a view depends on (a watch event that
-    /// only moved a `resourceVersion`, such as the echo of this controller's own status apply).
-    fn feed(&mut self, event: Event<V>) -> bool {
-        match event {
-            Event::Init => {
-                self.staging = Some(BTreeMap::new());
-                false
-            }
-            Event::InitApply(key, value) => match &mut self.staging {
-                Some(staging) => {
-                    staging.insert(key, value);
-                    false
-                }
-                None => {
-                    self.items.insert(key, value);
-                    true
-                }
-            },
-            Event::InitDone => {
-                let first = !self.synced;
-                self.synced = true;
-                match self.staging.take() {
-                    Some(staging) if staging != self.items => {
-                        self.items = staging;
-                        true
-                    }
-                    _ => first,
-                }
-            }
-            Event::Apply(key, value) => {
-                let same = self.items.get(&key) == Some(&value);
-                if !same {
-                    self.items.insert(key, value);
-                }
-                !same
-            }
-            Event::Delete(key) => self.items.remove(&key).is_some(),
-        }
-    }
-}
-
 #[derive(Default)]
 struct Tables {
     services: Table<Service>,
@@ -128,9 +69,17 @@ struct Tables {
     route_status: Table<RouteObserved>,
     /// The `HTTPRoute` CRD is installed: `None` until the first look.
     gateway_api: Option<bool>,
+    /// The `Gateway` CRD is installed: `None` until the first look, and always with the gateway
+    /// off (§7.10).
+    gateway_crd: Option<bool>,
 }
 
 impl Tables {
+    /// A Gateway API kind looked at is not installed.
+    fn gateway_api_absent(&self) -> bool {
+        self.gateway_api == Some(false) || self.gateway_crd == Some(false)
+    }
+
     fn synced(&self) -> bool {
         self.services.synced
             && self.slices.synced
@@ -417,11 +366,7 @@ impl Hub {
         let changed = {
             let mut tables = lock(&self.tables);
             let was_absent = tables.gateway_api == Some(false);
-            if was_absent {
-                tracing::info!("gateway api crds found");
-            }
-            tables.gateway_api = Some(true);
-            self.metrics.gateway_api_present.set(1);
+            self.presence(&mut tables, |t| t.gateway_api = Some(true));
             tables.routes.feed(event) || was_absent
         };
         if changed {
@@ -460,18 +405,34 @@ impl Hub {
         let changed = {
             let mut tables = lock(&self.tables);
             let changed = tables.gateway_api != Some(false);
-            if changed {
-                tracing::warn!("gateway api crds missing");
-            }
             tables.routes = Table::default();
             tables.route_status = Table::default();
-            tables.gateway_api = Some(false);
-            self.metrics.gateway_api_present.set(0);
+            self.presence(&mut tables, |t| t.gateway_api = Some(false));
             changed
         };
         if changed {
             self.dirty();
         }
+    }
+
+    /// The `Gateway` CRD is installed or not (§7.10). No view depends on it: nothing is built.
+    pub fn gateway_crd(&self, present: bool) {
+        let mut tables = lock(&self.tables);
+        self.presence(&mut tables, |t| t.gateway_crd = Some(present));
+    }
+
+    /// Applies a change of presence of a Gateway API kind: `mimic_mesh_gateway_api_present` is 1
+    /// when no kind looked at is absent. Logged once per change of that, not once per look.
+    fn presence(&self, tables: &mut Tables, change: impl FnOnce(&mut Tables)) {
+        let was_absent = tables.gateway_api_absent();
+        change(tables);
+        let absent = tables.gateway_api_absent();
+        if absent && !was_absent {
+            tracing::warn!("gateway api crds missing");
+        } else if was_absent && !absent {
+            tracing::info!("gateway api crds found");
+        }
+        self.metrics.gateway_api_present.set(i64::from(!absent));
     }
 
     /// Something a view depends on changed (an object, a mode).

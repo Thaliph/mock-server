@@ -3,6 +3,7 @@
 
 mod cert_manager;
 mod certs;
+mod gateway;
 mod loadtest;
 mod mesh;
 mod push_config;
@@ -50,6 +51,8 @@ struct Config {
     load: loadtest::Config,
     /// The `MIMIC_MESH*` and `MIMIC_CLUSTER_NAME` settings (spec §10.2).
     mesh: mesh::MeshConfig,
+    /// The `MIMIC_GATEWAY_*` settings; `None` when no namespace is listed (spec §7.10).
+    gateway: Option<mimic_core::gateway::Settings>,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
@@ -68,6 +71,13 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
             pod_window: push.pod_window,
         },
     )?;
+    let mesh = mesh::MeshConfig::from_env(env)?;
+    let gateway = gateway::from_env(
+        env,
+        mesh.enabled,
+        &webhook.inject.sidecar_image,
+        &webhook.inject.sidecar_log,
+    )?;
     Ok(Config {
         common: CommonConfig::from_env(env, DEFAULT_ADMIN)?,
         valkey: valkey::client_from_env(env)?,
@@ -76,7 +86,8 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
         sidecar_api_addr,
         push,
         load,
-        mesh: mesh::MeshConfig::from_env(env)?,
+        mesh,
+        gateway,
     })
 }
 
@@ -150,6 +161,10 @@ async fn run(config: Config) -> std::io::Result<()> {
     let status_metrics = status::StatusMetrics::register(metrics.registry_mut());
     let load_metrics = loadtest::LoadMetrics::register(metrics.registry_mut());
     let mesh_metrics = mesh::MeshMetrics::register(metrics.registry_mut());
+    let gateway_metrics = config
+        .gateway
+        .as_ref()
+        .map(|_| gateway::GatewayMetrics::register(metrics.registry_mut()));
     // Constant for the process: set once, from the parsed configuration.
     let limit = Family::<Vec<(String, String)>, Gauge>::default();
     metrics
@@ -169,17 +184,25 @@ async fn run(config: Config) -> std::io::Result<()> {
         "webhook configured"
     );
     let cache = Arc::new(workloads::WorkloadCache::new());
+    // The cluster client, for the sidecar API's `TokenReview`s, once it is available.
+    let kube_client = Arc::new(tokio::sync::OnceCell::new());
     // Off: no hub, no watch, and the route answers 404 (design §3.4).
     let mesh = config
         .mesh
         .enabled
         .then(|| mesh::Hub::new(config.mesh, mesh_metrics));
+    // Off: no reflector, metric or request (GW-15).
+    let gateway = config
+        .gateway
+        .zip(gateway_metrics)
+        .map(|(settings, metrics)| {
+            let cluster = Arc::new(gateway::KubeCluster::new(kube_client.clone()));
+            gateway::Reconciler::new(settings, cluster, metrics)
+        });
     // The serving certificate is loaded into this slot by the certificate manager.
     let cert = Arc::new(tls::CertSlot::new());
     // The TLS seed (spec §5) is loaded into this slot by `tls_ca::manage`.
     let seed = Arc::new(tls_ca::SeedSlot::new());
-    // The cluster client, for the sidecar API's `TokenReview`s, once it is available.
-    let kube_client = Arc::new(tokio::sync::OnceCell::new());
     // The load API (spec §7.8) exists only when load tests are enabled.
     let load = (config.load.max_runs > 0).then(|| sidecar_api::load::LoadApi {
         reviewer: Arc::new(sidecar_api::KubeReviewer::with_audience(
@@ -226,6 +249,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             if let Some(mesh) = mesh {
                 let sink = Arc::new(mesh::status::KubeSink::new(kube_client.clone()));
                 let routes = Arc::new(mesh::status::KubeRouteSink::new(kube_client.clone()));
+                gateway::start(client.clone(), mesh.clone(), gateway);
                 mesh::spawn(client.clone(), mesh, cache.changes(), sink, routes);
             }
             tokio::spawn(tls_ca::manage(client.clone(), tls_ca, seed, seed_metrics));
