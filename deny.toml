@@ -5,7 +5,13 @@ all-features = true
 
 [advisories]
 # Any advisory fails the check; an exception is declared here with its reason.
-ignore = []
+ignore = [
+  # kube-client openssl-tls connector trusts OpenSSL's default roots. mimic builds kube with
+  # default-features = false and rustls-tls only (crates/mimic-controller/Cargo.toml), so the
+  # openssl connector is not compiled in. Remove when kube >= 5.2.0 clears the 14-day cooldown
+  # (2026-12-08) and the lockfile moves to it.
+  { id = "RUSTSEC-2026-0600", reason = "openssl-tls not enabled; rustls-tls only. Remove with kube >= 5.2.0 after 2026-12-08" },
+]
 
 [licenses]
 confidence-threshold = 0.9
