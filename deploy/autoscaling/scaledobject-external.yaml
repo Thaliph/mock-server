@@ -1,0 +1,39 @@
+# The variant for an external Prometheus (#455, docs/SPEC.md §10.7). The Secret mimic-prometheus-auth lives in KEDA's
+# namespace (the restricted operator reads Secrets there only) and holds the keys `token` and `ca.crt`; create it
+# out of band, never in a file. The serverAddress is a placeholder.
+apiVersion: keda.sh/v1alpha1
+kind: ClusterTriggerAuthentication
+metadata:
+  name: mimic-prometheus
+spec:
+  secretTargetRef:
+    - parameter: bearerToken
+      name: mimic-prometheus-auth
+      key: token
+    - parameter: ca
+      name: mimic-prometheus-auth
+      key: ca.crt
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cart
+  namespace: shop
+spec:
+  scaleTargetRef:
+    name: cart
+    kind: Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      authenticationRef:
+        name: mimic-prometheus
+        kind: ClusterTriggerAuthentication
+      metadata:
+        serverAddress: https://prometheus.example.com:9090
+        authModes: bearer
+        query: sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})
+        threshold: "0.7"
+        ignoreNullValues: "false"

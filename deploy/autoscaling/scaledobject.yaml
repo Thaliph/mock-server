@@ -1,0 +1,22 @@
+# Scales the Deployment shop/cart on the mimic admission contract (#455, docs/SPEC.md §10.7), with the bundled
+# Prometheus of release `mimic` in namespace mimic-system. Needs monitoring.prometheus.queryFrom to admit the KEDA
+# operator ({namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keda}}, podSelector: {matchLabels: {app: keda-operator}}}).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cart
+  namespace: shop
+spec:
+  scaleTargetRef:
+    name: cart
+    kind: Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://mimic-prometheus.mimic-system.svc:9090
+        query: sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})
+        threshold: "0.7"
+        ignoreNullValues: "false"

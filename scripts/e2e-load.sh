@@ -116,15 +116,6 @@ START_TIMEOUT=0
 START_MARGIN=60
 c_t0=0
 
-# wait_for <seconds> <command...>: the command succeeds within the time. Its errors are no failure while it polls.
-wait_for() {
-  local end=$((SECONDS + $1))
-  shift
-  until "$@" 2>/dev/null; do
-    (( SECONDS < end )) || return 1
-    sleep 2
-  done
-}
 # exists <kubectl get arguments>: the object is there.
 exists() { kubectl get "$@" -o name >/dev/null 2>&1; }
 # absent <kubectl get arguments>: the object is NotFound; any other error is not an absence.
@@ -711,22 +702,8 @@ on=$(helm template "$RELEASE" deploy/helm/mimic -n "$NS" --set loadTest.enabled=
   || fail "ldt_06: loadTest.enabled does not set MIMIC_LOAD_MAX_RUNS to 4"
 
 # --- cluster, images, release -------------------------------------------------------------------
-clusters=$(kind get clusters) || { echo "FAIL kind get clusters failed" >&2; exit 1; }
-if ! found -x "$CLUSTER" <<<"$clusters"; then
-  log "create kind cluster $CLUSTER"
-  node_args=()
-  [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
-  kind create cluster --name "$CLUSTER" --wait 120s "${node_args[@]}"
-fi
-kubectl config use-context "kind-$CLUSTER" >/dev/null
-
-if [[ ${SKIP_BUILD:-0} != 1 ]]; then
-  log "build $IMAGE and $INIT_IMAGE"
-  docker build -q -t "$IMAGE" .
-  docker build -q -t "$INIT_IMAGE" --target init .
-  BUILT=1
-fi
-kind load docker-image --name "$CLUSTER" "$IMAGE" "$INIT_IMAGE"
+e2e_cluster_up
+e2e_load_images
 
 digest=$(image_digest "$IMAGE" || true)
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail "ldt_06: no digest of $IMAGE on the node (got '$digest')"

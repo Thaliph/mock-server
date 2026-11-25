@@ -65,6 +65,10 @@ CHART_FILES = frozenset(
         "scripts/check-release-chart.sh",
         "scripts/check-pins.sh",
         "scripts/check-release.sh",
+        # ADM-68, ADM-69 run in the chart job, with the shared checks and the KEDA chart pin.
+        "scripts/check-autoscaling.sh",
+        "scripts/keda-chart.sh",
+        "scripts/lib/render-checks.sh",
         "scripts/check-dashboards.py",
         "scripts/test_check_dashboards.py",
         "scripts/pin-chart.sh",
@@ -103,6 +107,31 @@ GATES = {
     "e2e": ("image", "chart", "e2e"),
     "e2e_load": ("image", "chart", "e2e"),
 }
+
+# The e2e-autoscaling job (ADM-70, #455): the example, its script and the shared e2e apps, the chart's Prometheus templates and
+# values, the KEDA pins, and the code that decides and exposes the admission signal: the mesh modules of mimic-core (the
+# utilisation) and of the sidecar (the gauges), and the controller's admission view.
+AUTOSCALING_DIRS = ("deploy/autoscaling", "scripts/e2e", "crates/mimic-core/src/mesh", "crates/mimic-sidecar/src/mesh")
+AUTOSCALING_FILES = frozenset(
+    {
+        "scripts/e2e-autoscaling.sh",
+        "scripts/keda-chart.sh",
+        # Set the app and node images of the job.
+        "scripts/pinned-image.sh",
+        "images/Dockerfile",
+        "deploy/helm/mimic/Chart.yaml",
+        "deploy/helm/mimic/values.yaml",
+        "deploy/helm/mimic/templates/_monitoring.tpl",
+        "deploy/helm/mimic/templates/podmonitor.yaml",
+        "deploy/helm/mimic/templates/prometheus.yaml",
+        "deploy/helm/mimic/templates/prometheus-config.yaml",
+        "deploy/helm/mimic/templates/prometheus-networkpolicy.yaml",
+        "deploy/helm/mimic/templates/prometheus-rbac.yaml",
+        "crates/mimic-core/src/mesh/admission.rs",
+        "crates/mimic-sidecar/src/limits.rs",
+        "crates/mimic-controller/src/sidecar_api/admission.rs",
+    }
+)
 
 # The fuzz jobs (PRX-28, DSC-23, PUL-20, MCK-20, LDT-18, GRP-10, MSH-13): a directory entry matches itself and what is under it.
 CODEC_DIRS = ("crates/mimic-core/src/proxy/http1", "fuzz")
@@ -143,7 +172,9 @@ def classify(event, paths):
     other = False
     for path in paths:
         found = categories_of(path)
-        if not found:
+        # A path that only the e2e-autoscaling job reads (its script) is known: it sets that job's gate and, through its
+        # `needs`, the image and chart gates below.
+        if not found and not under(path, AUTOSCALING_DIRS, AUTOSCALING_FILES):
             other = True
         for c in found:
             cats[c] = True
@@ -157,6 +188,10 @@ def classify(event, paths):
     result["full"] = full
     for job, needed in GATES.items():
         result[f"gate_{job}"] = any(cats[c] for c in needed)
+    result["gate_e2e_autoscaling"] = full or any(under(p, AUTOSCALING_DIRS, AUTOSCALING_FILES) for p in paths)
+    # The job needs the image and chart stages (its `needs` in ci.yml).
+    result["gate_image"] |= result["gate_e2e_autoscaling"]
+    result["gate_chart"] |= result["gate_e2e_autoscaling"]
     result["gate_fuzz_http1"] = full or any(under(p, CODEC_DIRS, CODEC_FILES) for p in paths)
     result["gate_fuzz_discovery"] = full or any(under(p, DISCOVERY_DIRS, DISCOVERY_FILES) for p in paths)
     return result

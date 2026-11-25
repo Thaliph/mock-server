@@ -38,6 +38,7 @@ GATES = [
     "gate_image",
     "gate_e2e",
     "gate_e2e_load",
+    "gate_e2e_autoscaling",
     "gate_fuzz_http1",
     "gate_fuzz_discovery",
 ]
@@ -125,7 +126,7 @@ class Fnd10Classification(unittest.TestCase):
         # e2e deploys the chart with the images, so a chart change needs both.
         r = run(["deploy/helm/mimic/values.yaml"])
         self.assertFalse(r["full"])
-        self.assertTrue(on(r, "chart", "vendored_ui", "trivy_config", "image", "e2e", "e2e_load"))
+        self.assertTrue(on(r, "chart", "vendored_ui", "trivy_config", "image", "e2e", "e2e_load", "e2e_autoscaling"))
         self.assertFalse(r["gate_lint"])
         self.assertFalse(r["gate_test"])
         self.assertFalse(r["gate_security"])
@@ -245,6 +246,63 @@ class Fnd10Classification(unittest.TestCase):
         for gate in GATES:
             self.assertIn(gate, r)
             self.assertIsInstance(r[gate], bool)
+
+
+class Adm70Gate(unittest.TestCase):
+    """ADM-70: the gate of the e2e-autoscaling job (#455)."""
+
+    PATHS = [
+        "deploy/autoscaling/scaledobject.yaml",
+        "deploy/autoscaling/keda-values.yaml",
+        "scripts/e2e-autoscaling.sh",
+        "scripts/pinned-image.sh",
+        "scripts/e2e/apps/service.py",
+        "images/Dockerfile",
+        "deploy/helm/mimic/values.yaml",
+        "deploy/helm/mimic/templates/prometheus-networkpolicy.yaml",
+        "deploy/helm/mimic/templates/_monitoring.tpl",
+        "crates/mimic-core/src/mesh/admission.rs",
+        "crates/mimic-core/src/mesh/utilization.rs",
+        "crates/mimic-sidecar/src/mesh/signal.rs",
+        "scripts/keda-chart.sh",
+        "crates/mimic-sidecar/src/limits.rs",
+        "crates/mimic-controller/src/sidecar_api/admission.rs",
+    ]
+
+    def test_adm_70_each_input_sets_the_gate(self):
+        for path in self.PATHS:
+            self.assertTrue(run([path])["gate_e2e_autoscaling"], path)
+
+    def test_adm_70_the_script_runs_the_image_and_chart_stages_it_needs(self):
+        r = run(["scripts/e2e-autoscaling.sh"])
+        self.assertTrue(r["gate_chart"] and r["gate_image"])
+        # It starts no Rust job.
+        r = run(["scripts/e2e-autoscaling.sh"])
+        self.assertFalse(r["gate_lint"] or r["gate_test"] or r["gate_security"])
+        # Its edit alone does not start the other kind jobs.
+        self.assertFalse(r["gate_e2e"] or r["gate_e2e_load"])
+
+    def test_adm_70_the_chart_check_alone_does_not_start_the_kind_job(self):
+        # check-autoscaling.sh runs in the chart job only (ADM-68, ADM-69).
+        r = run(["scripts/check-autoscaling.sh"])
+        self.assertTrue(r["gate_chart"])
+        self.assertFalse(r["gate_e2e_autoscaling"])
+
+    def test_adm_70_unrelated_changes_leave_the_gate_off(self):
+        for path in (
+            "crates/mimic-core/src/proxy.rs",
+            "crates/mimic-sidecar/src/http1.rs",
+            "deploy/helm/mimic/templates/grafana.yaml",
+            "scripts/e2e.sh",
+            "docs/wiki/Monitoring.md",
+            "scripts/check-chart.sh",
+        ):
+            self.assertFalse(run([path])["gate_e2e_autoscaling"], path)
+
+    def test_adm_70_an_unknown_change_or_a_push_runs_it(self):
+        self.assertTrue(run([], event="push")["gate_e2e_autoscaling"])
+        self.assertTrue(run(["something/unknown"])["gate_e2e_autoscaling"])
+        self.assertTrue(run([".github/workflows/ci.yml"])["gate_e2e_autoscaling"])
 
 
 class Fnd10Cli(unittest.TestCase):

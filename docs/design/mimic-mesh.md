@@ -606,22 +606,26 @@ Dashboards (§9.1 of the spec) gain a *Mesh* row (calls, attempts, reasons, ejec
   does not alias 1-second noise, and it counts **refused demand**, so it goes above 1.0 under
   overload and the HPA can grow by more than one step at once. The raw counters
   (`mimic_admission_requests_total` by result, `mimic_admission_in_flight_seconds_total`) are
-  exported too, for an adapter rule that computes `rate()` itself; the chart's rule uses the
+  exported too, for a query that computes `rate()` itself; the example `ScaledObject` uses the
   gauge.
-- The HPA scales a deployment on `mimic_admission_utilization` as a `Pods` metric through the
-  **custom metrics API**, served by **prometheus-adapter** (owner decision), which reads the
-  **chart-installed Prometheus by default** or an external one (`autoscaling.prometheus.url`).
-- Chart: `autoscaling.enabled` installs prometheus-adapter (image pinned by digest, distroless
-  base, non-root, Pod Security `restricted`) with one rule exposing the gauge per pod, its
-  `APIService` `v1beta1.custom.metrics.k8s.io`, RBAC and NetworkPolicy; it turns on the
-  sidecar scrape objects it needs. Mimic does not create HPAs (least privilege): the wiki gives
-  the HPA manifest (`averageValue: 700m` = 70 % of the contract).
-- Risk accepted: prometheus-adapter's last release is v0.12.0 (2024); the repository is not
-  archived and still receives commits. The integration is one rule and a standard API, so
-  replacing it (KEDA, another adapter) later changes the chart only.
-- The cluster can have only one `custom.metrics.k8s.io` APIService: the chart refuses to render
-  it when `autoscaling.adapter.existingAPIService` says one is already there, and documents
-  adding mimic's rule to the existing adapter instead.
+- Amended by #455 (maintainer decision, 2026-11-24; spec §10.7 "Autoscaling on the admission
+  contract", §12.29). Autoscaling uses **KEDA** and its Prometheus scaler, not prometheus-adapter.
+  The adapter has had no release since v0.12.0 (2024-05), and its image has 57 HIGH or CRITICAL
+  Trivy findings.
+  - A `ScaledObject` sums the gauge over the Deployment's pods
+    (`job="mimic-sidecar"`, `namespace`, `deployment`), with `threshold: "0.7"` and
+    `metricType: AverageValue`, which is 70 % of the contract per pod.
+  - KEDA creates the HPA, which reads the value as an `External` metric through KEDA's
+    `v1beta1.external.metrics.k8s.io`. The API server verifies the TLS of that API service.
+  - `ignoreNullValues: "false"` turns the absent gauge (no contract) into a scaler error, so the
+    HPA holds instead of scaling on a false 0.
+- Mimic installs neither KEDA nor `ScaledObject`s (least privilege; "Mimic creating HPAs" is out
+  of scope). `deploy/autoscaling/` ships reviewed KEDA chart values, pinned by version, archive
+  checksum and image digests, with Secrets restricted to KEDA's namespace and no `*` RBAC. It
+  also ships a `ScaledObject`, and a variant for an external Prometheus whose token and CA come
+  from a Secret through a `ClusterTriggerAuthentication`.
+- The chart gains one value, `monitoring.prometheus.queryFrom`, so that the KEDA operator can
+  reach the bundled Prometheus.
 
 ## 12. Interaction with mock mode and load tests
 

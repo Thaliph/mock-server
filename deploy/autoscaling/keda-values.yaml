@@ -1,0 +1,54 @@
+# KEDA for autoscaling on the admission contract (#455, docs/SPEC.md §10.7). Example, not part of the mimic chart.
+# Chart keda 2.21.1 (no OCI artefact), pinned by the SHA-256 of its archive. Check it before installing:
+#   curl -fsSLO https://kedacore.github.io/charts/keda-2.21.1.tgz
+#   echo "76b45621e48e18c9872cdc0c46295e4cbac1236fd379d06bca38ef91d8fb883e  keda-2.21.1.tgz" | sha256sum -c -
+#   helm install keda ./keda-2.21.1.tgz -n keda --create-namespace -f keda-values.yaml
+# The images are the stages keda, keda-metrics-apiserver and keda-admission-webhooks of images/Dockerfile
+# (kept equal by scripts/check-pins.sh). KEDA 2.21 needs Kubernetes 1.34 to 1.36.
+
+image:
+  keda:
+    registry: ghcr.io
+    repository: kedacore/keda
+    tag: "2.21.1@sha256:d09d92c0a310e3057a3c54df387b99abf2bf31352218dbe1adcb00e807886488"
+  metricsApiServer:
+    registry: ghcr.io
+    repository: kedacore/keda-metrics-apiserver
+    tag: "2.21.1@sha256:747e376b3e80dc4f72bf4f7043f47cc4cdb56f34b1aed9531789f474996e1c84"
+  webhooks:
+    registry: ghcr.io
+    repository: kedacore/keda-admission-webhooks
+    tag: "2.21.1@sha256:5f4b0b0f7831b9f53738be85e99449a1747a5effa970305fe602455ab0f4fcd3"
+
+# Secrets are read in KEDA's own namespace only.
+permissions:
+  operator:
+    restrict:
+      secret: true
+  metricServer:
+    restrict:
+      secret: true
+
+rbac:
+  # No get on */* and no */scale; Deployments and StatefulSets stay scalable.
+  enabledCustomScaledRefKinds: false
+  # Keeps keda.sh rights out of the default edit and admin roles.
+  aggregateToDefaultRoles: false
+
+networkPolicy:
+  enabled: true
+  flavor: kubernetes
+  # KEDA's policies admit egress to pods only, but the API server is not a pod on most clusters (on kind it is the node's
+  # address), so every KEDA pod would time out reaching it. These rules admit TCP 443 and 6443 to any destination (what
+  # mimic's own chart does while networkPolicy.apiServerCIDR is empty). Narrow each to the API server with
+  # `to: [{ipBlock: {cidr: <address>/32}}]` (`kubectl get endpoints kubernetes`).
+  kubernetes:
+    operator:
+      extraEgressRules: &apiServerEgress
+        - ports:
+            - {port: 443, protocol: TCP}
+            - {port: 6443, protocol: TCP}
+    metricsServer:
+      extraEgressRules: *apiServerEgress
+    webhooks:
+      extraEgressRules: *apiServerEgress

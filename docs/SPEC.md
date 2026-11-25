@@ -4560,6 +4560,7 @@ storage and ingress are out of scope; the dashboards are those of §9.1, shipped
 | `monitoring.prometheus.storageSizeLimit` | `1Gi` | `sizeLimit` of the `emptyDir` that holds the TSDB. There is no persistent volume: the data are lost when the pod restarts. |
 | `monitoring.prometheus.resources` | requests 100m CPU and 256Mi memory, limit 512Mi memory | Resources of the Prometheus container. |
 | `monitoring.prometheus.namespaces` | `[]` | Namespaces of the sidecar and load jobs. Empty: every namespace, through a ClusterRole. A list: those namespaces and the release namespace, through a Role and a RoleBinding in each (each namespace must exist at install). |
+| `monitoring.prometheus.queryFrom` | `[]` | NetworkPolicy `from` peers admitted to TCP 9090 of the bundled Prometheus besides the Grafana pods, rendered only with `networkPolicy.enabled`: for example the KEDA operator of the autoscaling example (below, #455), `{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keda}}, podSelector: {matchLabels: {app: keda-operator}}}`. Each peer reads every series (§11.1). Empty: no rule is added, and the policy is that of MON-20. |
 | `monitoring.grafana.enabled` | `false` | Renders `<release>-grafana`: a Deployment (1 replica, `Recreate`) with the containers `grafana` and `dashboards` (the k8s-sidecar), a Service `ClusterIP` on 3000 only, the ConfigMaps `<release>-grafana` (`grafana.ini`) and `<release>-grafana-provisioning` (the datasource and the dashboards provider), the Secret `<release>-grafana-admin`, a ServiceAccount, the Role and RoleBinding `<release>-grafana-dashboards` and, with `networkPolicy.enabled`, a NetworkPolicy (§11). Grafana can be enabled without the bundled Prometheus (see `datasourceUrl`). |
 | `monitoring.grafana.image` | `docker.io/grafana/grafana:13.2.4-distroless@sha256:ae3d…` | Pinned by digest in `images/Dockerfile` (stage `grafana`, checked by `scripts/check-pins.sh`). Built 2026-10-12, outside the 14-day cooldown. |
 | `monitoring.grafana.sidecarImage` | `quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:092d…` | The dashboard sidecar. Pinned by digest in `images/Dockerfile` (stage `k8s-sidecar`, checked by `scripts/check-pins.sh`). Built 2026-10-08. |
@@ -4571,7 +4572,9 @@ storage and ingress are out of scope; the dashboards are those of §9.1, shipped
 
 Prometheus runs with exactly the arguments `--config.file=/etc/prometheus/prometheus.yml`,
 `--storage.tsdb.path=/prometheus`, `--storage.tsdb.retention.time=<retention>`,
-`--storage.tsdb.retention.size=<retentionSize>`, `--web.listen-address=:9090` and `--log.format=json`:
+`--storage.tsdb.retention.size=<retentionSize>`, `--web.listen-address=:9090`, `--log.format=json`,
+`--query.timeout=15s`, `--query.max-samples=5000000` and `--query.max-concurrency=4` (fixed, #563: since
+#455 its queries can come from any `ScaledObject` author through KEDA, §11.1):
 no `--web.enable-admin-api`, `--web.enable-lifecycle`, `--web.enable-remote-write-receiver` or
 `--web.enable-otlp-receiver`. A change of `prometheus.yml` rolls the pod through a checksum annotation,
 since there is no reload endpoint. Its security context: `runAsUser` and `runAsGroup` 65534 (the image
@@ -4668,6 +4671,68 @@ no Secret, no hook.
 Default off, because a dashboard is useless without a Grafana that reads the release namespace, the default
 render stays the golden file of MON-01, and a production Grafana that watches every namespace would otherwise
 receive them unasked; on with the bundled Grafana, because that is its only purpose.
+
+#### Autoscaling on the admission contract (#455)
+
+KEDA (maintainer decision on #455) scales a Deployment on `mimic_admission_utilization` (§4.1
+"Signals", §9). A `ScaledObject` holds one Prometheus trigger, and KEDA creates and owns the
+`autoscaling/v2` HPA, which reads the value as an `External` metric through KEDA's
+`v1beta1.external.metrics.k8s.io`. Mimic installs neither KEDA nor a `ScaledObject`:
+- the chart renders no KEDA object and has no `autoscaling.*` value;
+- the controller gains no RBAC;
+- the only chart change is `monitoring.prometheus.queryFrom` (above).
+
+Mimic ships reviewed example files in `deploy/autoscaling/`, outside the chart, so the published
+chart is unchanged. KEDA v2.21 supports Kubernetes 1.34 to 1.36, so the example needs 1.34 or
+later, above mimic's floor of 1.33 (INJ-17).
+
+| File | Content |
+|---|---|
+| `keda-values.yaml` | Values of the chart `keda` 2.21.1 of `https://kedacore.github.io/charts` (no OCI artefact), pinned by version and by the SHA-256 of its archive, `76b45621e48e18c9872cdc0c46295e4cbac1236fd379d06bca38ef91d8fb883e`. The file header and the wiki give the commands that check the archive before installing it. The three images are pinned by tag and digest: `ghcr.io/kedacore/keda:2.21.1@sha256:d09d92c0a310e3057a3c54df387b99abf2bf31352218dbe1adcb00e807886488`, `ghcr.io/kedacore/keda-metrics-apiserver:2.21.1@sha256:747e376b3e80dc4f72bf4f7043f47cc4cdb56f34b1aed9531789f474996e1c84` and `ghcr.io/kedacore/keda-admission-webhooks:2.21.1@sha256:5f4b0b0f7831b9f53738be85e99449a1747a5effa970305fe602455ab0f4fcd3`. Each is a stage of `images/Dockerfile` (`keda`, `keda-metrics-apiserver`, `keda-admission-webhooks`), kept equal by `scripts/check-pins.sh`, so that Dependabot proposes their bumps. It also sets: <ul><li>`permissions.operator.restrict.secret: true` and `permissions.metricServer.restrict.secret: true`: Secrets are read in KEDA's own namespace only.</li><li>`rbac.enabledCustomScaledRefKinds: false`: no `get` on `*/*` and no `*/scale`. Deployments and StatefulSets stay scalable.</li><li>`networkPolicy: {enabled: true, flavor: kubernetes}`: KEDA's own policies, plus `networkPolicy.kubernetes.{operator,metricsServer,webhooks}.extraEgressRules` admitting TCP 443 and 6443 to any destination: the API server is not a pod, so KEDA's pod-only egress would cut the operator from it (it then crash-loops and never creates `kedaorg-certs`). As with mimic's `networkPolicy.apiServerCIDR` empty, a comment shows how to narrow it to the API server's address (§11.1).</li></ul>`rbac.aggregateToDefaultRoles` keeps its default `false`, as do the chart's security contexts (non-root, read-only root, no privilege escalation, `drop: [ALL]`, `RuntimeDefault`) and resources. |
+| `scaledobject.yaml` | One `ScaledObject` `cart` of the Deployment `cart` in namespace `shop`: `minReplicaCount: 1`, `maxReplicaCount: 4`, no `fallback`, no `idleReplicaCount`. One trigger `prometheus` with `serverAddress: http://mimic-prometheus.mimic-system.svc:9090` (the bundled Prometheus of release `mimic`), `query: sum(mimic_admission_utilization{job="mimic-sidecar",namespace="shop",deployment="cart"})`, `threshold: "0.7"` (70 % of the contract), `metricType: AverageValue` and `ignoreNullValues: "false"`. |
+| `scaledobject-external.yaml` | The variant for an external Prometheus. A `ClusterTriggerAuthentication` `mimic-prometheus` takes `bearerToken` and `ca` from the keys `token` and `ca.crt` of a Secret `mimic-prometheus-auth` in KEDA's namespace (`secretTargetRef`). The same `ScaledObject` adds `authModes: bearer`, an `https://` placeholder `serverAddress` and `authenticationRef: {name: mimic-prometheus, kind: ClusterTriggerAuthentication}`. A namespaced `TriggerAuthentication` is not used: its Secret would sit in the app's namespace, which the restricted operator cannot read. The token is never a value of the file, a `customHeaders` entry or an argument. It is applied together with `keda-auth-policy.yaml`, which binds the credential to that address (#562). |
+| `keda-auth-policy.yaml` | A `ValidatingAdmissionPolicy` `mimic-prometheus-address` and its `ValidatingAdmissionPolicyBinding` `mimic-prometheus-address` (`admissionregistration.k8s.io/v1`, GA since Kubernetes 1.30, below KEDA's 1.34 floor), #562. It matches `CREATE` and `UPDATE` of `scaledobjects` and `scaledjobs` in `keda.sh` (every version), with `failurePolicy: Fail`. Its one variable `address` is the literal configured address, the same placeholder as the `serverAddress` of `scaledobject-external.yaml` (`https://prometheus.example.com:9090`), edited together with it. A trigger *uses the credential* when its `authenticationRef.name` is `mimic-prometheus` and its `authenticationRef.kind`, compared case-insensitively, is `ClusterTriggerAuthentication`. Each such trigger must: <ul><li>be `type: prometheus`;</li><li>have `metadata.serverAddress` exactly equal to `address`;</li><li>have no `metadata.unsafeSsl` other than `"false"`;</li><li>have no metadata key ending in `FromEnv` (KEDA's indirection through the target's environment).</li></ul>Otherwise the request is refused with a message that names `mimic-prometheus` and the configured address, never the Secret. A trigger that does not use the credential is not checked. The binding has `validationActions: [Deny]`, no parameters and no namespace selector. |
+| `keda-scaledobject-editor.yaml` | A ClusterRole `keda-scaledobject-editor` with one rule, `keda.sh` `scaledobjects`, verbs `get`, `list`, `watch`, `create`, `update`, `patch` and `delete`, to bind per namespace with a RoleBinding (#565). It grants neither `scaledjobs` nor `triggerauthentications` nor `clustertriggerauthentications` (§11.1). |
+
+- **The query.** It sums the gauge over the Deployment's pods: the `deployment` target label is
+  the one the webhook sets on injected pods, and `job="mimic-sidecar"` is the job of the bundled
+  Prometheus and of the PodMonitor `<release>-sidecar` (§10.7 above). With `AverageValue` the
+  HPA wants `ceil(sum / 0.7)` replicas, which is the same as an average of 0.7 per pod. The
+  `job` matcher keeps out a series of the same name from any other scrape job (an app's own
+  `/metrics`). A Deployment whose name is longer than 63 characters has no label (INJ-03), so
+  it has no series and is never scaled.
+- **No contract.** Without a contract the pods have no series (§4.1), so the query is empty.
+  `ignoreNullValues: "false"` makes that a scaler error, not a 0. KEDA then gives the HPA no
+  metric (its default error behaviour, since there is no `fallback`). The HPA sets
+  `ScalingActive` to `False` with reason `FailedGetExternalMetric` and keeps its replicas:
+  neither up nor down on a false 0. `minReplicaCount` is at least 1, because at 0 replicas
+  there is no sidecar to measure demand. A new pod not yet scraped adds nothing to the sum
+  until its first scrape.
+- **Delay.** The signal reaches the HPA after the 15 s EWMA, one scrape interval
+  (`metrics.podMonitor.interval`, 30 s by default) and the HPA sync period (15 s). KEDA runs the
+  query when the HPA asks for the metric.
+- **Network.** The KEDA operator runs the scalers, so it is the pod that queries Prometheus.
+  With the mimic chart's NetworkPolicy, `monitoring.prometheus.queryFrom` admits it:
+  `{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keda}}, podSelector:
+  {matchLabels: {app: keda-operator}}}`. KEDA's own policies admit its egress (§11.1).
+- **TLS.** The operator generates the metrics server's certificate and patches its CA into the
+  `APIService` (KEDA's default). The API server therefore verifies it: there is no
+  `insecureSkipTLSVerify`.
+- **One provider.** A cluster can have only one `v1beta1.external.metrics.k8s.io`. A cluster
+  that already runs KEDA uses `scaledobject.yaml` alone, with its own KEDA settings.
+- **The `rate()` variant** (wiki only) uses two triggers in one `ScaledObject`, each with
+  `threshold: "0.7"`:
+  - `sum(rate(mimic_admission_requests_total{job="mimic-sidecar",namespace="shop",deployment="cart",result=~"admitted|overloaded|queue-timeout"}[2m])) / max(mimic_admission_limit{job="mimic-sidecar",namespace="shop",deployment="cart",kind="rps"})`
+  - `sum(rate(mimic_admission_in_flight_seconds_total{job="mimic-sidecar",namespace="shop",deployment="cart"}[2m])) / max(mimic_admission_limit{job="mimic-sidecar",namespace="shop",deployment="cart",kind="concurrency"})`
+
+  The HPA follows the larger replica count. The limit gauge is absent without a contract, so
+  both queries are empty then, and the HPA holds as above. The window is at least four scrape
+  intervals. The variant has no 15 s smoothing of its own.
+- **Image scans** (Trivy, 2026-11-24). The three 2.21.1 images show no finding at any
+  severity (Debian 13.7 distroless base). The 2.21.0 images, outside the cooldown, have 7, 7
+  and 6 HIGH (Go standard library, `golang.org/x/net`, `go-jose`), all fixed in 2.21.1.
+  2.21.1 was published on 2026-11-15 (images) and 2026-11-16 (chart), so the PR that pins it
+  merges on or after **2026-11-30**, when the 14-day cooldown ends.
 
 ## 11. Security baseline
 
@@ -4789,7 +4854,7 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
 - The bundled Prometheus and Grafana (#379, §10.7) are off unless the chart enables them, for a
   demo or a dev cluster. Prometheus may `list` and `watch` pods only, has no admin, lifecycle,
   remote-write or OTLP endpoint, and its NetworkPolicy admits 9090 from the Grafana pods of the
-  release only (none when Grafana is off) and lets it out to 15100 in its namespaces, 8081 of the
+  release and the peers of `monitoring.prometheus.queryFrom` only (none when both are absent) and lets it out to 15100 in its namespaces, 8081 of the
   controller pods, 9121 of the Valkey pods (with `valkey.metrics.enabled`) and the API server, and
   nowhere else (no DNS: it scrapes pod IPs). Grafana may read the ConfigMaps of the release
   namespace only, never a Secret; its admin password is in a generated Secret; anonymous access,
@@ -5044,7 +5109,8 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   `monitoring.prometheus.namespaces` narrows it to a list of namespaces.
 - (#379) **The Prometheus HTTP API has no authentication.** Whoever reaches 9090 reads every
   series: authorities of the egress, endpoint templates of load tests, pod and deployment names.
-  The NetworkPolicy (Grafana pods only) needs a CNI that enforces it, and `kubectl port-forward`
+  The NetworkPolicy (Grafana pods and the `monitoring.prometheus.queryFrom` peers only, so a peer
+  given for the KEDA operator of #455 reads every series too) needs a CNI that enforces it, and `kubectl port-forward`
   (RBAC `pods/portforward` in the release namespace) bypasses it by design: it is how the demo is
   reached.
 - (#379) **Grafana has one admin user** and no SSO. Its password is in the Secret
@@ -5384,7 +5450,90 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   meshed or not, and a namespace writer that lowers the contract, raise it. An HPA built on it
   (#455) can then be driven up to its `maxReplicas`. NetworkPolicy bounds who can reach the
   pods, `maxReplicas` bounds the cost, and the contract is the namespace's own configuration.
-  The app can move only its own pod's signal, by answering slowly or by calling itself.
+  The app can move only its own pod's signal, by answering slowly or by calling itself; with the
+  `ScaledObject` of `deploy/autoscaling/scaledobject.yaml` that is enough to hold the Deployment
+  at `maxReplicaCount` (§10.7 "Autoscaling"). The example always sets it (ADM-69).
+- (M5, #455) **Whoever can write a `ScaledObject` reads any series KEDA's Prometheus holds.**
+  The query is the author's own, and KEDA cannot scope it to a namespace. The value shows in
+  the HPA's status, one aggregate at a time, so a `ScaledObject` in one namespace can read
+  another namespace's series in the bundled Prometheus (authorities of the egress, endpoint
+  templates, pod names; the #379 limit). The example keeps `rbac.aggregateToDefaultRoles: false`,
+  so namespace `edit` and `admin` do not grant `keda.sh` objects: granting them is the cluster
+  admin's decision. An external Prometheus can scope the query with KEDA's `namespace`
+  parameter behind prom-label-proxy (the wiki says so).
+- (M5, #455) **KEDA's operator is a cluster-wide scaler.** Its chart grants it, in every namespace:
+  - `get`, `list` and `watch` on pods, services, ConfigMaps, ServiceAccounts, EndpointSlices,
+    Deployments, ReplicaSets and StatefulSets;
+  - `patch` and `update` on `deployments/scale` and `statefulsets/scale`;
+  - create, update and delete of HPAs and Jobs;
+  - patch of `APIService` and `ValidatingWebhookConfiguration` objects, for its certificates.
+
+  The example removes the Secret rules outside KEDA's namespace and the `*/*` and `*/scale`
+  rules (ADM-68). A compromised operator can still scale any Deployment and edit any HPA. It can
+  also disable admission, by patching any `ValidatingWebhookConfiguration` (mimic's injection
+  webhook included), or re-point an aggregated API, by patching any `APIService` (Trivy
+  KSV-0114). It has no right on `ValidatingAdmissionPolicy` objects, so the #562 policy stays
+  in force (ADM-73). KEDA is the operator's cluster component, installed by the operator, not
+  by mimic.
+- (M5, #455) **KEDA's operator may reach any pod.** The chart's `kubernetes` NetworkPolicy admits
+  the operator's egress to every pod on every port, since its scalers can query any source.
+  The example keeps it: a narrower policy would break other teams' scalers on a shared KEDA.
+  The Prometheus side is the narrow one: `queryFrom` admits the operator pods only.
+- (M5, #455, #564) **The three KEDA pods may reach any address on TCP 443 and 6443.**
+  `keda-values.yaml` adds one `extraEgressRules` entry of TCP 443 and 6443 with no peer, to the
+  operator, the metrics server and the admission webhooks, because the API server is not a pod.
+  As with mimic's empty `networkPolicy.apiServerCIDR`, this also admits the internet and every
+  host-network address on those ports, until the operator narrows it with an `ipBlock` of the
+  API server (the comment in the file). On a shared KEDA, 443 also serves other teams' HTTPS
+  scalers, so a `ScaledObject` author can make the operator dial any HTTPS address. With the
+  #562 policy, no mimic credential goes with such a request. ADM-68 checks the exact rules, so
+  a wider edit fails.
+- (M5, #455, #562) **A `ClusterTriggerAuthentication` can be used from every namespace.** KEDA
+  binds `mimic-prometheus` neither to namespaces nor to a destination, and the Prometheus scaler
+  sends `Authorization: Bearer <token>` to whatever `serverAddress` the trigger names.
+  - **Without `keda-auth-policy.yaml`** (not applied, edited out, or its binding deleted), whoever
+    can write a `ScaledObject` or `ScaledJob` anywhere obtains the external Prometheus token,
+    with every scope its issuer gave it.
+  - **With the policy**, the token goes only to the configured address, over verified TLS
+    (`unsafeSsl` refused), and the author's own query still reads, one aggregate at a time,
+    anything the token can read (the first #455 limit above).
+
+  Recommended: a read-only token, scoped by prom-label-proxy or by the hosted Prometheus.
+  To allow the credential in some namespaces only, add that rule to the policy (refuse a
+  reference to `mimic-prometheus` from another namespace). Do not put a namespace selector on
+  the binding: the policy does not check a namespace outside the selector, so a `ScaledObject`
+  there could send the token to any address. The policy covers `ScaledObject` and `ScaledJob`, the KEDA kinds whose triggers
+  take a `serverAddress`. A KEDA bump that adds another kind able to reference a
+  `ClusterTriggerAuthentication` needs the policy extended (ADM-72).
+- (M5, #455, #563) **Autoscaling is as available as the least trusted `ScaledObject` author.** One
+  KEDA operator and one Prometheus serve every namespace. An author can write expensive PromQL,
+  or a `serverAddress` that answers an endless body with a long `timeout` and a short
+  `pollingInterval`. KEDA has no per-namespace quota, and its Prometheus scaler reads the body
+  unbounded. The shared Prometheus or the operator then slows down or is OOM-killed, and other
+  namespaces' HPAs report `FailedGetExternalMetric` and hold: they do not scale up under load,
+  and nothing scales down on a false 0. The bundled Prometheus bounds each query (15 s,
+  5,000,000 samples, 4 at once, ADM-76). An external Prometheus needs its own limits.
+  Recommended: `ScaledObject` rights for trusted teams only.
+- (M5, #455, #565) **`keda.sh` rights beyond `scaledobjects` escalate through the operator.**
+  - `ScaledJob` holds a whole Job template, and the operator, which may create Jobs in every
+    namespace, creates it. A subject that may write `scaledjobs` therefore runs pods with any
+    ServiceAccount of its namespace, within its Pod Security level, without `pods` or `jobs`
+    rights.
+  - A `TriggerAuthentication` can ask for a `podIdentity` owned by the operator (for example
+    `aws` with `identityOwner: keda`), so its scalers use KEDA's cloud identity where one is
+    configured.
+  - `clustertriggerauthentications` is cluster-wide.
+
+  Grant `keda-scaledobject-editor` (ADM-75) only. Grant `scaledjobs` only to subjects that may
+  already create pods and use every ServiceAccount of the namespace. Grant
+  `triggerauthentications` only when KEDA has no operator-owned pod identity. Keep
+  `clustertriggerauthentications` for cluster admins.
+- (M5, #455) **A namespace writer can feed a fake series.** A namespace writer can add a pod
+  that the query reads. That pod needs the label `mimic.platform.io/deployment: <deployment>`
+  and a container port named `mimic-admin`, so that it is scraped as job `mimic-sidecar` and
+  serves any `mimic_admission_utilization`. That writer can already edit the `ScaledObject`
+  and the Deployment. The `job` matcher keeps out the series of other scrape jobs (an app's own
+  `/metrics` scraped by annotation).
 - (M5, #454) **The admission metrics lag by up to 100 ms and miss the last tick at exit.**
   They are taken from the admission counts every 100 ms (§4.1 "Signals"), so a scrape can miss
   the latest 100 ms of requests, and the requests of the last 100 ms before the process exits
@@ -5840,11 +5989,11 @@ Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` 
 | MON-13 | **E** (kind, folded into `scripts/e2e.sh` section `mon_02`). The `/metrics` of every controller pod, read after the application's rollout, together have a `# TYPE` line for every controller metric of the #385 table of §9 and a `mimic_limit` series for each controller name (a labelled family has no `# TYPE` line before its first series, and an admission reaches one replica only); one scrape of an injected sidecar has the same for the sidecar, `process_open_fds` included although the sidecar is non-dumpable (TLS-16); one scrape of the Valkey exporter has every name of the exporter list of §9. |
 | MON-14 | **E** (`helm template`, `scripts/check-chart.sh`). Bundled monitoring off (#379): with the defaults the render is still the golden file of MON-01, and the renders with `metrics.podMonitor.enabled`, `valkey.metrics.enabled` or `loadTest.enabled` hold no object named `<release>-prometheus*` or `<release>-grafana*`. `Chart.yaml` has no `dependencies`, and there is no `Chart.lock` or `charts/` in the chart directory. `helm lint --strict` passes for Prometheus on, Grafana on, both, and both with `valkey.metrics.enabled`, `metrics.podMonitor.enabled` and `loadTest.enabled`. |
 | MON-15 | **E** (`scripts/check-pins.sh`, `scripts/check-release-chart.sh`). The Prometheus, Grafana and k8s-sidecar references of `values.yaml` (`monitoring.prometheus.image`, `monitoring.grafana.image`, `monitoring.grafana.sidecarImage`) equal the stages `prometheus`, `grafana` and `k8s-sidecar` of `images/Dockerfile`, and a mismatch (a copy with one digest changed) fails the check. With both enabled, every `image:` of the render of the chart as published has `@sha256:`. |
-| MON-16 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.prometheus.enabled`: the Deployment `<release>-prometheus` has 1 replica, strategy `Recreate`, the image of the values, exactly the six arguments of §10.7 (none of the four disabled flags), a checksum annotation that changes when `metrics.podMonitor.interval` changes, `runAsUser` and `runAsGroup` 65534, `runAsNonRoot`, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]`, `RuntimeDefault`, the resources of the values, an emptyDir with `sizeLimit` `1Gi` mounted at `/prometheus`, the ConfigMap mounted read-only at `/etc/prometheus`, and probes on `/-/ready` and `/-/healthy`; the Service `<release>-prometheus` is `ClusterIP` with the single port 9090. |
+| MON-16 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.prometheus.enabled`: the Deployment `<release>-prometheus` has 1 replica, strategy `Recreate`, the image of the values, exactly the nine arguments of §10.7 (none of the four disabled flags; the three query limits from #563, ADM-76), a checksum annotation that changes when `metrics.podMonitor.interval` changes, `runAsUser` and `runAsGroup` 65534, `runAsNonRoot`, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]`, `RuntimeDefault`, the resources of the values, an emptyDir with `sizeLimit` `1Gi` mounted at `/prometheus`, the ConfigMap mounted read-only at `/etc/prometheus`, and probes on `/-/ready` and `/-/healthy`; the Service `<release>-prometheus` is `ClusterIP` with the single port 9090. |
 | MON-17 | **E** (`helm template`, `scripts/check-chart.sh`). The jobs of `prometheus.yml` are exactly those of the §10.7 table: names, `role: pod`, label selectors, namespaces (the release namespace; for `mimic-sidecar` and `mimic-load` none, i.e. all, or the set of `monitoring.prometheus.namespaces` plus the release namespace), port names, path `/metrics`, intervals, the drop of `Succeeded` and `Failed` pods, and target labels; `mimic-valkey` is present only with `valkey.metrics.enabled`. Equivalence: with `metrics.serviceMonitor.enabled`, `metrics.podMonitor.enabled` and `valkey.metrics.enabled` also on, for each ServiceMonitor and PodMonitor the job of the same `job` value has the same selector labels, port name, path, interval and the same `(source labels, target label, replacement)` relabel rules as the monitor, except `namespace` and `pod`: those are the Operator's implicit target labels, so the ServiceMonitor and the PodMonitors carry no relabelings for them (the ServiceMonitor has none at all, the PodMonitors name them only where §12.13 MON-01 lists them), and the comparison leaves them out, while `prometheus.yml` sets them for every job; a monitor changed in a copy of the chart without its job fails the check. No job scrapes a node, the kubelet, cAdvisor, the API server or Prometheus, and the file has none of `authorization`, `basic_auth`, `bearer_token`, `bearer_token_file`, `oauth2`, `tls_config`. |
 | MON-18 | **E** (`helm template`, `scripts/check-chart.sh`). RBAC: with `monitoring.prometheus.enabled` and `namespaces: []`, one ClusterRole `<release>-prometheus` with the single rule `apiGroups: [""]`, `resources: [pods]`, `verbs: [list, watch]`, bound by a ClusterRoleBinding to the ServiceAccount `<release>-prometheus`, and no Role; with `namespaces: [a, b]`, a Role and a RoleBinding with that rule in `a`, `b` and the release namespace (each once, also when the release namespace is listed) and no ClusterRole. With `monitoring.grafana.enabled`, the Role `<release>-grafana-dashboards` in the release namespace has the single rule `get`, `list`, `watch` on `configmaps`, its RoleBinding names the ServiceAccount `<release>-grafana`, and no ClusterRole or other Role names that ServiceAccount. Over every render of MON-14, no rule names `secrets`, `nodes`, `nodes/*`, `pods/exec`, `pods/log`, `pods/portforward` or `*`, or a verb other than `get`, `list`, `watch` in a monitoring object. |
 | MON-19 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.grafana.enabled`: the Deployment `<release>-grafana` has 1 replica, strategy `Recreate`, exactly the containers `grafana` and `dashboards` with the pinned images of the values, no init container, a checksum annotation that changes with `grafana.ini` and with the provisioning, `automountServiceAccountToken: false`, and the projected token volume mounted in `dashboards` only. The Secret `<release>-grafana-admin` has a 32-character alphanumeric `admin-password` (its template reads the existing Secret with `lookup` first, as the Valkey one does; kept across upgrades, MON-21); it is mounted read-only in `grafana` only, `grafana.ini` sets `security.admin_password` to `$__file{/etc/grafana-admin/admin-password}` (the `grafana` container has no env), no env of any container holds or references the password, and the password appears in no other rendered object. The rendered `grafana.ini` holds every setting of §10.7, and its `plugins.disable_plugins` lists every bundled datasource plugin but `prometheus`, the legacy `postgres` ID included (#407); the provisioned datasource has `uid` `mimic-prometheus`, `type` `prometheus`, URL `http://<release>-prometheus:9090` (the value of `monitoring.grafana.datasourceUrl` when set) and `editable: false`; the provider reads `/tmp/dashboards`; the `dashboards` container has `LABEL=grafana_dashboard`, `LABEL_VALUE=1`, `RESOURCE=configmap`, `NAMESPACE` the release namespace and no `REQ_URL`, `REQ_USERNAME` or `REQ_PASSWORD`. The Service `<release>-grafana` is `ClusterIP` with the single port 3000; there is no Ingress, HTTPRoute or PersistentVolumeClaim; `grafana` mounts a memory emptyDir on `/tmp`; the pod has `fsGroup` 472 and `supplementalGroups` [472] (§10.7: the sidecar writes the emptyDir of grafana's dashboards); both containers have `runAsNonRoot`, the UIDs of §10.7, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]`, `RuntimeDefault` and the resources of the values (Pod Security `restricted`, FND-08). |
-| MON-20 | **E** (`helm template`, `scripts/check-chart.sh`). With `networkPolicy.enabled`, Grafana on and `datasourceUrl` set, the Grafana NetworkPolicy has the rules of `datasourceEgress` after its DNS and API server rules, and with `datasourceUrl` empty it has none of them; with `datasourceUrl` empty the 9090 rule admits the bundled Prometheus only (MON-20 covers both cases). With `networkPolicy.enabled` and Prometheus on, the NetworkPolicy `<release>-prometheus` selects the Prometheus pods with `policyTypes: [Ingress, Egress]`; its ingress is TCP 9090 from the Grafana pods of the release when Grafana is on, and empty otherwise; its egress is exactly TCP 15100 to every namespace (or to the namespaces of `monitoring.prometheus.namespaces` and the release namespace), TCP 8081 to the controller pods, TCP 9121 to the Valkey pods only with `valkey.metrics.enabled`, and TCP 443 and 6443 to `networkPolicy.apiServerCIDR` (no peer when empty). With Grafana on, `<release>-grafana` selects the Grafana pods with both types; ingress TCP 3000 from the release namespace; egress exactly TCP 9090 to the Prometheus pods, UDP and TCP 53 to `loadTest.dnsSelector`, and TCP 443 and 6443 as above. With `networkPolicy.enabled: false` neither is rendered. With `loadTest.enabled` and Prometheus on, `loadTest.metricsFrom` empty falls back to the namespace peer as with `metrics.podMonitor.enabled` (MON-01), and a set value wins. The controller and Valkey NetworkPolicies are the same as with monitoring off. |
+| MON-20 | **E** (`helm template`, `scripts/check-chart.sh`). With `networkPolicy.enabled`, Grafana on and `datasourceUrl` set, the Grafana NetworkPolicy has the rules of `datasourceEgress` after its DNS and API server rules, and with `datasourceUrl` empty it has none of them; with `datasourceUrl` empty the 9090 rule admits the bundled Prometheus only (MON-20 covers both cases). With `networkPolicy.enabled` and Prometheus on, the NetworkPolicy `<release>-prometheus` selects the Prometheus pods with `policyTypes: [Ingress, Egress]`; its ingress is TCP 9090 from the Grafana pods of the release when Grafana is on, then TCP 9090 from the peers of `monitoring.prometheus.queryFrom` when it is set (ADM-67), and empty when neither applies; its egress is exactly TCP 15100 to every namespace (or to the namespaces of `monitoring.prometheus.namespaces` and the release namespace), TCP 8081 to the controller pods, TCP 9121 to the Valkey pods only with `valkey.metrics.enabled`, and TCP 443 and 6443 to `networkPolicy.apiServerCIDR` (no peer when empty). With Grafana on, `<release>-grafana` selects the Grafana pods with both types; ingress TCP 3000 from the release namespace; egress exactly TCP 9090 to the Prometheus pods, UDP and TCP 53 to `loadTest.dnsSelector`, and TCP 443 and 6443 as above. With `networkPolicy.enabled: false` neither is rendered. With `loadTest.enabled` and Prometheus on, `loadTest.metricsFrom` empty falls back to the namespace peer as with `metrics.podMonitor.enabled` (MON-01), and a set value wins. The controller and Valkey NetworkPolicies are the same as with monitoring off. |
 | MON-21 | **E** (kind, `scripts/e2e.sh` section `mon_21`, after `mon_02`). After an upgrade with `monitoring.prometheus.enabled` and `monitoring.grafana.enabled` (and `valkey.metrics.enabled` of `mon_02`), checked from pods of the release namespace. The Prometheus API is reached from a pod that the Prometheus NetworkPolicy admits: a pod carrying exactly the labels of that policy's ingress selector (the Grafana pods' labels, read from the live NetworkPolicy, not hard-coded). Within 120 s Prometheus `/-/ready` answers 200 from that pod and `/api/v1/targets` lists the `<release>-controller`, `mimic-sidecar` and `mimic-valkey` targets with health `up`, the injected pod's target carrying its `namespace`, `pod` and `deployment`; `POST /-/reload` and `POST /api/v1/admin/tsdb/snapshot` from that pod answer non-2xx. An unlabelled pod of the release namespace gets no HTTP answer from port 9090 (a timeout or a connection failure, status 0), so the policy is enforced, not vacuous. Grafana `/api/search` without credentials answers 401; with the admin credentials (read from the Secret into a variable, never printed) `/api/datasources/uid/mimic-prometheus/health` answers status `OK`, and a dashboard (uid `mimic-e2e`) put in a ConfigMap labelled `grafana_dashboard: "1"` by the test is listed by `/api/search` within 60 s, while one labelled `"0"` is not. The admin password appears in no log of any container of the release namespace (`grep -qF`, never printed), and a second `helm upgrade` with the same values keeps it (the sha256 of the Secret's data is unchanged). `kubectl auth can-i get secrets` answers `no` as the Prometheus and the Grafana ServiceAccounts, in the release namespace and in the app namespace.; the default login `admin:admin` gets 401. |
 | MON-22 | **E** (no cluster: `scripts/check-dashboards.py`, Python 3 standard library run with `python3 -I`, called by `scripts/check-chart.sh`). For every `deploy/helm/mimic/dashboards/*.json`: the file parses as JSON, is at most 150 KiB and equals its own re-serialisation with 2-space indentation and sorted keys; it holds every convention of §9.1 (`uid` equal to the base name and unique across files, `title`, `tags`, `id` null, `editable` false, `refresh` `30s`, `time`, `graphTooltip` 1, the single `dashboards` link, the variables of its dashboard with their queries); every `datasource` object anywhere in the file is `{"type": "prometheus", "uid": "${datasource}"}` and the string `mimic-prometheus` does not occur; panel types are in the §9.1 list, text panels are in `markdown` mode, no panel or link has a `url` and no panel has `alert`; every panel's unit is in the §9.1 list. Every PromQL expression (targets, variable queries, annotations), with `$__rate_interval` read as `1m`, `$__range` as `1h` and `$<var>` / `${<var>}` as a placeholder value, is tokenised; every metric name in it is a name of §9 (the backticked `mimic_*`, `process_*` and `redis_*` names of §9, the exporter list included) or `up`, with `_bucket`, `_count` and `_sum` accepted only after a §9 histogram; every label name obeys the §9.1 rule (labels of that metric, or of a metric inside the aggregation for `by`, the target labels, `le` on `_bucket`), and `without`, `label_replace`, `label_join` and a regex matcher on `authority` are absent. The panels of each file, by row and title, are exactly the rows of its §9.1 table, and every query the table lists for a panel is a query of that panel, once **C**, **S**, **V** and **L** are expanded and the table's escaped pipes read as plain ones. **U** (`scripts/test_check_dashboards.py`, run in CI with the other script tests): the shipped files pass, and a copy with each of these changes fails with a message naming the file and the cause: an unknown metric (`mimic_nope_total`), `_bucket` after a counter, an unknown label (`pod_ip` on `mimic_http_requests_total`), `by (authority)` over `mimic_store_writes_total`, a datasource uid `mimic-prometheus`, an `html` text panel, a duplicated `uid`, keys out of order, a file of 151 KiB, a panel missing from the §9.1 table. |
 | MON-23 | **E** (`helm template`, `scripts/check-chart.sh`). With the defaults no ConfigMap carries `grafana_dashboard` (the render is still the golden file of MON-01). With `monitoring.dashboards.enabled`, and also with `monitoring.grafana.enabled` alone, the render has exactly one ConfigMap per file of `dashboards/` (five), named `<release>-dashboard-<basename>`, in the release namespace, with the chart's labels and `grafana_dashboard: "1"`, and a single data key `<basename>.json` whose value is byte-identical to the file; `monitoring.dashboards.annotations` appear on each of them and on no other object. The two renders with and without `monitoring.dashboards.enabled` (Grafana off) differ by these ConfigMaps only. In a copy of the chart with one byte of a dashboard changed, the Grafana Deployment's checksum annotation is unchanged. `helm lint --strict` passes for `monitoring.dashboards.enabled`, and for it with `monitoring.grafana.enabled` and `monitoring.prometheus.enabled`. |
@@ -6052,7 +6201,7 @@ Levels as in §12.2, plus **M** (main session, recorded on the PR).
 | CHT-03 | **E** (`helm template`, `scripts/check-chart.sh`). Every container and init container of the overlay render has `resources.requests` with `cpu` and `memory`, and `resources.limits` with `memory`. The controller, Valkey and exporter containers and the injected sidecar (`MIMIC_INJECT_SIDECAR_RESOURCES`) also have `limits.cpu`. Two containers are outside this check: `mimic-init` (added to injected pods by the webhook, which sets no resources: a gap of the injection patch, §7.1) and `mimic-load` (resources from the controller's `MIMIC_LOAD_RESOURCES` default, not a chart value). They are not in the render. |
 | CHT-04 | **E** (`helm template`, `scripts/check-chart.sh`). Every `image` of the overlay render, and the values of `MIMIC_INJECT_SIDECAR_IMAGE` and `MIMIC_INJECT_INIT_IMAGE`, is `repository@sha256:` followed by 64 lowercase hex digits; no reference is by tag alone. `image.digest` and `inject.initImage.digest` of the overlay are set. |
 | CHT-05 | **E** (`helm template`, `scripts/check-chart.sh`). The overlay render has: the controller Deployment with 3 replicas and two `topologySpreadConstraints` (`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, on `topology.kubernetes.io/zone` and on `kubernetes.io/hostname`, selecting `app.kubernetes.io/name: mimic-controller`); the PodDisruptionBudget `<release>-controller` with `maxUnavailable: 1`; `priorityClassName: mimic-critical` on the controller and Valkey pods; the ServiceMonitor `<release>-controller`, the PodMonitors `<release>-sidecar` and `<release>-valkey`, and the Valkey exporter; no object `<release>-prometheus*` or `<release>-grafana*`, no MimicLoadTest CRD and no ValidatingAdmissionPolicy `mimic-load-job` (the one of `<release>-injector` stays); `networkPolicy.webhookFrom` holds one `ipBlock`; `MIMIC_LOG` of the controller and `MIMIC_LOG` of the injected sidecars are `info`; `valkey.persistence.enabled` is true. |
-| CHT-06 | **E** (`scripts/check-chart.sh`). `values-production.yaml` holds no secret: no non-empty scalar at a key path that names a password, passwd, token, secret, credential or private key, and no PEM block (`-----BEGIN`) or known token prefix (`AKIA`, `ghp_`, `sk_live_`). |
+| CHT-06 | **E** (`scripts/check-chart.sh`). `values-production.yaml` holds no secret: no non-empty scalar other than a boolean at a key path that names a password, passwd, token, secret, credential or private key, and no PEM block (`-----BEGIN`), known token prefix (`AKIA`, `ghp_`, `sk_live_`) or JWT (`eyJ` followed by a dot-separated token). The rules are in `scripts/lib/render-checks.sh`, shared with ADM-68. |
 | CHT-07 | **M** (main session, recorded on the PR). `trivy config` on a directory holding the overlay render (`helm template … -f values-production.yaml`) reports no HIGH or CRITICAL finding. |
 | CHT-08 | **E** (kind, `scripts/e2e.sh` section `cht_08`). One install with the overlay, with the kind adaptations listed in the script header (locally built images by tag, no Prometheus Operator CRDs, no webhook source CIDR, a PriorityClass `mimic-critical` created by the script): the controller Deployment has 3 Ready replicas, the Valkey StatefulSet is Ready, and the live PodDisruptionBudget, topology spread constraints and priority class are those of CHT-05. |
 | CHT-09 | **D** (review). `docs/wiki/Install.md` has a section *Production install* that explains each value of the overlay and each placeholder; `docs/wiki/Configuration.md` lists `controller.priorityClassName`, `valkey.priorityClassName` and `controller.topologySpreadConstraints`, and the overlay's values that differ from the defaults. |
@@ -6737,8 +6886,8 @@ files of the chart).
   reached the app.
 - **Metrics from a 100 ms tick**, not from the request path (ADM-32 headroom).
 
-**Out of scope:** the HPA, prometheus-adapter and its rule (#455, which reads
-`mimic_admission_utilization` per pod, or the `rate()` of `mimic_admission_requests_total`
+**Out of scope:** autoscaling (#455, KEDA's Prometheus scaler on
+`mimic_admission_utilization`, or the `rate()` of `mimic_admission_requests_total`
 over `mimic_admission_limit{kind="rps"}`); alert rules; showing `mimicErrors` in the explorer
 UI (the read API returns it with the stored summary); a printer column for refusals. Mesh
 traffic management beyond the milestones of the design is v2.
@@ -6762,6 +6911,75 @@ traffic management beyond the milestones of the design is v2.
 | ADM-64 | **M** (ADM-32 again, after the steps above). `SETUPS=mesh-admission scripts/bench.sh` on a quiet machine meets every ADM-32 check: the median p90 delta per protocol at most +0.5 ms with no error under the contract, the 2× load sent, the admitted rate within 5 %, the `overloaded` p99 and the longest `queue-timeout`. Its JSON is in `docs/bench/`, with the refusal durations as counts (ADM-63). Its rows and verdict table are in the M5 section, and the numbers are posted on #454. If the 200 rps p90 delta exceeds +0.5 ms, the run is repeated once and both runs are reported. The verdict stays the median of ADM-32. |
 | ADM-65 | **D** (documentation review). `docs/wiki/Monitoring.md`: the `mimic_admission_*` metrics, what the utilisation means (in flight and demand, 15 s, above 1 is refused demand, absent without a contract), the *Mesh* and *Admission* rows. `Load-test.md`: "Finding and setting the contract", in four steps. First, an open-model run without a contract, with rising `rate`, finds where latency breaks. Then a contract is set below it. A second run shows `mimicErrors` instead of the latency collapse. Then `utilization` at the planned load is read (the #455 `averageValue` of 700m is 70 %). It also says why the closed model spins on refusals. `Troubleshooting.md`: `mimicErrors` in a run's results, the utilisation above 1, `refused_admission`, `admission contract changed`. |
 | ADM-66 | **D** (security review). <ul><li>Every new label value is a fixed enumeration (`result`: 5 values, `kind`: 2, `mimic_load_requests_total{result}`: 3 more per endpoint, within `MIMIC_LOAD_MAX_ENDPOINTS`). No label, log field or results key comes from a header value, a path or a pod name.</li><li>The INFO line carries two integers, their previous values and the ETag.</li><li>The generator's trust of a refusal needs the target's pod and address (ADM-57). The app cannot forge one (ADM-57, ADM-25).</li><li>The controller refuses unknown `mimicErrors` keys (ADM-60).</li><li>`mesh::utilization` and `load::answer` have no clock, I/O or random source.</li><li>The request path gains no lock, counter or allocation: the metrics come from the 100 ms tick (§4.1 "Signals"), and ADM-64 measures it.</li><li>The §11.1 limits of #454 are written.</li><li>No `MIMIC_*` variable, RBAC rule, capability or chart value is added.</li></ul> |
+
+#### M5 autoscaling (#455)
+
+Design: `docs/design/mimic-mesh.md` §11, as amended by #455. The spec text is in:
+- §10.7: `monitoring.prometheus.queryFrom`, and "Autoscaling on the admission contract";
+- §11: the bundled Prometheus;
+- §11.1: M5 #455.
+
+It amends MON-20 (§12.13). Levels are as above, plus **E** for a check script without a
+cluster.
+
+No Rust code, `MIMIC_*` variable, metric, controller RBAC rule or capability is added. The
+signal is the gauge of #454, and ADM-52, ADM-54 and ADM-61 cover its value. Every earlier row
+must still pass.
+
+**Decisions recorded on #455:**
+- **KEDA, not prometheus-adapter** (maintainer decision, 2026-11-24): the Prometheus scaler on
+  `mimic_admission_utilization`. The adapter has had no release since 2024-05, and its image
+  has 57 HIGH or CRITICAL findings. This replaces the issue's `autoscaling.enabled` adapter and
+  the custom metrics API.
+
+The rest were taken with the recommended option while the maintainer is away:
+- **Examples only, no `ScaledObject` template.** KEDA is installed by the user.
+  - A `ScaledObject` belongs to the app's namespace and team.
+  - A chart template would make the mimic release own autoscaling objects in other
+    namespaces, which is "Mimic creating HPAs", out of scope in the issue.
+  - It would also need KEDA's CRDs at render.
+- **The bundled Prometheus is the example's default** (the issue's default). An external one is
+  `scaledobject-external.yaml`, with its token and CA in a Secret of KEDA's namespace, read
+  through a `ClusterTriggerAuthentication`, because the operator's Secret access is restricted
+  to that namespace.
+- **KEDA 2.21.1**, whose images show no Trivy finding, instead of 2.21.0, which has 7 HIGH and
+  is outside the cooldown. The pinning PR waits for the end of the cooldown on 2026-11-30.
+- **`values-production.yaml` is unchanged.** Its PodMonitors already give the labels the query
+  reads.
+- **The `rate()` variant is in the wiki only.** ADM-70 evaluates its queries.
+- **The kind e2e is a job of its own**, on Kubernetes 1.36 only, the pinned `kind-node-keda` stage (KEDA 2.21 needs 1.34 or
+  later). It does not add to the 35-minute e2e job.
+
+- **Audit fixes (#562 to #565)**, with the recommended options:
+  - **#562.** `keda-auth-policy.yaml` binds the `ClusterTriggerAuthentication` to its address
+    (ADM-73, ADM-74). It is a literal edited with the `ScaledObject`, not a parameter object,
+    to keep one file and no ConfigMap.
+  - **#563.** The bundled Prometheus gets fixed query limits, not values (ADM-76).
+  - **#564.** ADM-68 checks the exact NetworkPolicy rules.
+  - **#565.** `keda-scaledobject-editor.yaml` makes the narrow grant the easy one (ADM-75).
+  - The remaining risks are §11.1 limits.
+
+**Out of scope:**
+- mimic creating HPAs or `ScaledObject`s;
+- scale to zero;
+- KEDA's `fallback`;
+- alert rules;
+- prometheus-adapter.
+
+Mesh traffic management beyond the milestones of the design is v2.
+
+| ID | Criterion |
+|---|---|
+| ADM-67 | **E** (`helm template`, `scripts/check-chart.sh`). <ul><li>With `monitoring.prometheus.queryFrom` empty, MON-01 and MON-20 hold unchanged.</li><li>With `monitoring.prometheus.enabled`, `networkPolicy.enabled` and `queryFrom` set to two peers (a `namespaceSelector` with a `podSelector`, and an `ipBlock`), the NetworkPolicy `<release>-prometheus` has exactly one more ingress rule, after the Grafana rule when Grafana is on: TCP 9090 from those two peers, in order. With Grafana off it is the only ingress rule. Its egress is that of MON-20.</li><li>With `networkPolicy.enabled: false`, or Prometheus off, nothing is rendered for it.</li><li>The variants with Grafana on and off pass `helm lint --strict`.</li></ul> |
+| ADM-68 | **E** (no cluster: `scripts/check-autoscaling.sh`, run by the CI chart job). The script downloads the `keda` chart archive 2.21.1 and refuses it unless its SHA-256 is the one of §10.7. It then renders it (`helm template keda … -n keda`) with `deploy/autoscaling/keda-values.yaml`. In the render: <ul><li>There is exactly one `APIService`, `v1beta1.external.metrics.k8s.io`, with no `insecureSkipTLSVerify`.</li><li>The three Deployments use the three image references of §10.7, by tag and `@sha256:` with 64 hex digits, equal to the `images/Dockerfile` stages (`scripts/check-pins.sh`).</li><li>Every pod meets CHT-02 (Pod Security `restricted`). Every container has requests `cpu` and `memory` and a `memory` limit.</li><li>No ClusterRole rule names `secrets`, a `*` resource or a `*` API group. The only Role granting `secrets` is in namespace `keda`.</li><li>No ClusterRole carries an `aggregate-to-*` label.</li><li>Each of the three Deployments' pods is selected by exactly one NetworkPolicy, with `policyTypes: [Ingress, Egress]` (#564). <ul><li>Its ingress is exactly the chart's: TCP 9666 from every namespace (operator), TCP 6443 from any source (metrics server), TCP 9443 from any source (webhooks).</li><li>Its egress is exactly the chart's rules, in order: UDP and TCP 53 with no peer; TCP 443 and 6443 to every namespace; for the metrics server, TCP 9666 to the operator pods; every port to every namespace.</li><li>Then comes exactly one more rule: TCP 443 and 6443 with no peer and no other port.</li></ul></li><li>No rule grants any verb on `validatingadmissionpolicies` or `validatingadmissionpolicybindings`.</li></ul>The files of `deploy/autoscaling/` pass the CHT-06 secret scan. |
+| ADM-69 | **E** (`scripts/check-autoscaling.sh`). `scaledobject.yaml` is exactly one `keda.sh/v1alpha1` `ScaledObject`: <ul><li>Its `scaleTargetRef` names a Deployment. `minReplicaCount` is 1. `maxReplicaCount` is set and at least `minReplicaCount`.</li><li>There is no `fallback` and no `idleReplicaCount`.</li><li>It has exactly one trigger, `type: prometheus`, `metricType: AverageValue`, with the metadata of §10.7: `threshold` `"0.7"` and `ignoreNullValues` `"false"`. Its `query` holds `job="mimic-sidecar"`, the `ScaledObject`'s namespace and the target's name as `deployment`, and the gauge `mimic_admission_utilization` of §9.</li></ul>`scaledobject-external.yaml` has the same `ScaledObject` with `authModes: bearer`, an `https://` `serverAddress` and an `authenticationRef` to a `ClusterTriggerAuthentication`. That object takes exactly `bearerToken` and `ca` from `secretTargetRef` entries, and has no `customHeaders`. |
+| ADM-70 | **E** (kind, `scripts/e2e-autoscaling.sh`, its own cluster, CI job `e2e-autoscaling` on the kind node image of the newest Kubernetes minor that KEDA 2.21 supports, 1.36, pinned by digest as the `kind-node-keda` stage of `images/Dockerfile`). Its `scripts/ci_plan.py` gate covers `deploy/autoscaling/`, the script, the chart's Prometheus templates and values, and the sidecar and `mimic-core` admission sources, and is tested in `scripts/test_ci_plan.py`. **Set-up:**<ul><li>Release `mimic` in `mimic-system`, with `monitoring.prometheus.enabled`, `metrics.podMonitor.interval: 5s` and the `queryFrom` peer of §10.7.</li><li>KEDA in `keda`, from the checked archive and `keda-values.yaml` unchanged.</li><li>An injected namespace `shop` with a Deployment `cart` (1 replica, a Python app answering at once) and its Service.</li><li>The `ScaledObject` of `scaledobject.yaml`, with `maxReplicaCount: 2` and `advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds: 0`, so that a false 0 would scale down at once.</li><li>A non-injected client sending 6 requests/s, open model, to the Service for the whole test.</li></ul>**Checks:**<ul><li>**TLS.** The `APIService` `v1beta1.external.metrics.k8s.io` is `Available` with a non-empty `caBundle`.</li><li>**No contract.** Over 60 s, the HPA named by the `ScaledObject`'s `status.hpaName` has `ScalingActive` `False` with reason `FailedGetExternalMetric`. `cart` stays at 1 replica.</li><li>**Scale-up.** A `MimicConfig` with `admission: {concurrency: 50, rps: 5}` on `cart` is then applied. Within 60 s, `kubectl get --raw /apis/external.metrics.k8s.io/v1beta1/namespaces/shop/<status.externalMetricNames[0]>?labelSelector=scaledobject.keda.sh/name=cart` answers one item with a value above 0. Within 180 s of the apply, `cart` has 2 Ready pods, and the HPA has `ScalingActive` `True` and `status.currentReplicas` 2.</li><li>**`rate()` variant.** While the load runs, the two queries of §10.7 sent to the bundled Prometheus each return a value above 0.</li><li>**Contract removed.** The `MimicConfig` is deleted, with the load still running. For the next 90 s `cart` keeps 2 replicas, and from 60 s at most the HPA has `ScalingActive` `False` with `FailedGetExternalMetric`.</li><li>**Delegated authentication.** From the client pod, an unauthenticated `GET https://keda-operator-metrics-apiserver.keda.svc/apis/external.metrics.k8s.io/v1beta1` answers `401` or `403`.</li><li>**Secrets.** `kubectl auth can-i get secrets -n shop --as system:serviceaccount:keda:keda-operator` answers `no`.</li></ul>The whole job takes under 15 minutes. |
+| ADM-71 | **D** (documentation review). `docs/wiki/Monitoring.md` has "Autoscaling on the admission contract", covering: <ul><li>What mimic ships and what it does not.</li><li>The KEDA install with the archive check, and `queryFrom`.</li><li>A cluster that already runs KEDA or another external metrics provider.</li><li>The external variant and its Secret keys, in KEDA's namespace.</li><li>The `ScaledObject`, why `0.7` with `AverageValue` and a sum, `maxReplicaCount` as the bound of what callers can drive (§11.1), and why `minReplicaCount` is at least 1.</li><li>The absent metric (`ignoreNullValues: "false"`, `FailedGetExternalMetric`, the HPA holds), new pods, and the delay from load to scale.</li><li>The `rate()` variant.</li><li>Who may write `ScaledObject`s (§11.1), and the Kubernetes 1.34 floor.</li><li>`keda-scaledobject-editor` with its RoleBinding, and why not `scaledjobs`, `triggerauthentications` or `clustertriggerauthentications` (#565).</li><li>`keda-auth-policy.yaml`: always applied with the external variant, its address edited together with the `serverAddress`, a read-only scoped token, and why a namespace restriction goes into the policy, never into a namespace selector on the binding (#562).</li><li>The shared-operator availability limit (#563).</li></ul>`Install.md` has an optional *Autoscaling* step that links to it. `Mesh.md` "Admission contract" links to it and to `Load-test.md` "Finding and setting the contract". `Configuration.md` lists `monitoring.prometheus.queryFrom`. |
+| ADM-72 | **M** (security review and scans, recorded on #455). <ul><li>`trivy config` runs on the render of ADM-68 and on every file of `deploy/autoscaling/`. The post lists **every** finding with its reason. For the 2.21.1 render that is 13 findings (audit of 2026-11-24): <ul><li>CRITICAL KSV-0114: the operator patches every `ValidatingWebhookConfiguration` and `APIService` for its certificates. Recorded in §11.1 "cluster-wide scaler" with its impact.</li><li>MEDIUM KSV-0048: Jobs, for `ScaledJob`. Recorded in §11.1 (#565).</li><li>MEDIUM KSV-0113 ×2: Secrets in `keda`, which is the restrict mode, intended.</li><li>MEDIUM KSV-0125 ×3: `ghcr.io` is not in Trivy's trusted registries. The images are pinned by digest.</li><li>LOW KSV-0020 and KSV-0021 ×6: UID and GID not above 10000. The pods are non-root and `restricted`.</li></ul>A finding not in this list is fixed, or added with its reason.</li><li>A Trivy image scan of the three pinned images is posted with its date and its counts by severity. A HIGH or CRITICAL finding is fixed by a bump, or written as a §11.1 limit with a review date.</li><li>The review checks: KEDA's RBAC (Secrets in its namespace only, no `*`, no aggregation, ADM-68, ADM-70); the `APIService` TLS (ADM-70); the Prometheus NetworkPolicy (ADM-67); the `job`, namespace and `deployment` matchers; `ignoreNullValues`; the #562 policy against the KEDA version's kinds that reference a `ClusterTriggerAuthentication`; and that mimic adds no RBAC, `MIMIC_*` variable, capability or Rust code.</li><li>Every §11.1 limit of #455 is written.</li></ul>Then the M5 security audit runs (one per milestone). |
+| ADM-73 | **E** (`scripts/check-autoscaling.sh`, #562). `keda-auth-policy.yaml` holds exactly one `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` and exactly one binding, both named `mimic-prometheus-address` (not the name of the Secret, so that a refusal message never holds the Secret's name). <ul><li>The policy has `failurePolicy: Fail` and matches `CREATE` and `UPDATE` of `scaledobjects` and `scaledjobs` in `keda.sh`.</li><li>Its variable `address` is a literal starting with `https://` and equal to the `serverAddress` of `scaledobject-external.yaml`.</li><li>Its validations name `mimic-prometheus` and `ClusterTriggerAuthentication`, and check `type`, `serverAddress`, `unsafeSsl` and the `FromEnv` keys.</li><li>The binding names the policy, has `validationActions: [Deny]`, and has no `paramRef`.</li></ul> |
+| ADM-74 | **E** (kind, `scripts/e2e-autoscaling.sh`, after ADM-70, #562). The policy and binding of `keda-auth-policy.yaml` are applied unchanged, with the `ClusterTriggerAuthentication` of `scaledobject-external.yaml` (no Secret is needed), in a namespace `other` holding a non-injected Deployment `cart`. The wait is until the first refused case is refused, at most 30 s. Each object below is sent with `kubectl apply --dry-run=server`. <ul><li>**Admitted:** <ul><li>the `ScaledObject` of `scaledobject-external.yaml`, moved to `other`;</li><li>the same with another `serverAddress` and no `authenticationRef`.</li></ul></li><li>**Refused, each with a message naming `mimic-prometheus`:** the same `ScaledObject` with <ul><li>`serverAddress: https://collector.other.svc:443`;</li><li>`unsafeSsl: "true"`;</li><li>a `serverAddressFromEnv` key;</li><li>`type: loki`;</li><li>`kind: clustertriggerauthentication` in lower case with another `serverAddress`: KEDA's CRD enum refuses it first (`Unsupported value`), so this one case is checked as a schema refusal; the policy's `lowerAscii` is defence in depth.</li></ul>A `ScaledJob` of `other` using the credential with another `serverAddress` is refused too.</li><li>**Update:** a patch of the live `shop/cart` `ScaledObject` of ADM-70, adding the credential and another `serverAddress`, is refused, and the object is unchanged.</li></ul>The messages hold neither the token nor the Secret's name. |
+| ADM-75 | **E** (`scripts/check-autoscaling.sh`, #565). `keda-scaledobject-editor.yaml` holds exactly one `ClusterRole` `keda-scaledobject-editor`, with exactly one rule: `apiGroups: [keda.sh]`, `resources: [scaledobjects]`, the seven verbs of §10.7. It has no `aggregationRule` and no `aggregate-to-*` label. |
+| ADM-76 | **E** (`helm template`, `scripts/check-chart.sh`, #563). With `monitoring.prometheus.enabled`, the Prometheus container's arguments hold `--query.timeout=15s`, `--query.max-samples=5000000` and `--query.max-concurrency=4` (MON-16 amended to nine arguments). In kind, MON-21 and MON-24 still pass with them. |
 
 ## 13. Test strategy
 

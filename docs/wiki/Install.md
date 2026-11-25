@@ -207,6 +207,19 @@ Two containers have no requests or limits from the chart: `mimic-init`, which th
 injection patch sets none), and the load generator `mimic-load`, whose resources come from the controller's default
 (`MIMIC_LOAD_RESOURCES`), not from a chart value. Both are known gaps of the injection and load paths, not settings of the overlay.
 
+### Autoscaling (optional)
+
+*Ops.* A Deployment with an [admission contract](Mesh#admission-contract) can be scaled on its utilisation with
+[KEDA](https://keda.sh/). Mimic does not install KEDA and its chart renders no KEDA object: it ships reviewed example
+files in `deploy/autoscaling/` of its repository. The steps, in
+[Autoscaling on the admission contract](Monitoring#autoscaling-on-the-admission-contract):
+
+1. Install KEDA 2.21.1 from its archive, after checking its SHA-256, with `deploy/autoscaling/keda-values.yaml`. KEDA
+   2.21 needs Kubernetes **1.34 or later**.
+2. Let the KEDA operator query Prometheus: with the bundled one, `monitoring.prometheus.queryFrom` admits it; with an
+   external one, `scaledobject-external.yaml` reads its token and CA from a Secret in KEDA's namespace.
+3. Apply a `ScaledObject` per Deployment, from `deploy/autoscaling/scaledobject.yaml`.
+
 ## Namespaces
 
 - **Release namespace** (`mimic-system` above): controller and Valkey. Never injected.

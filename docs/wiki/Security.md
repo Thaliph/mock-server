@@ -199,6 +199,12 @@ The main ones (full list: [the spec](https://github.com/Thaliph/mock-server/blob
   can reach a pod IP, and a namespace writer that lowers the contract, raise it, and an HPA built on it can be
   driven up to its `maxReplicas`. NetworkPolicy bounds who can reach the pods and `maxReplicas` bounds the cost.
   See [Monitoring](Monitoring#limits).
+- **Autoscaling with KEDA** (examples only, mimic installs none of it). Without `keda-auth-policy.yaml`, anyone who
+  can write a `ScaledObject` or `ScaledJob` in any namespace gets the external Prometheus token of the
+  `ClusterTriggerAuthentication` (#562): apply the policy with `scaledobject-external.yaml`, and use a read-only,
+  scoped token. Whoever can write a `ScaledObject` reads any series KEDA's Prometheus holds through the HPA's status;
+  a `queryFrom` peer reads every series; the KEDA operator pod is a cluster-wide scaler that can reach any pod; a
+  namespace writer can feed a fake series. See [Monitoring](Monitoring#limits).
 - **Release.** Images are rebuilt from the tagged commit; arm64 gets image checks and a scan but no kind
   e2e; repository admins can bypass the tag ruleset (a signature names its tag); signing depends on the public
   Sigstore service. This wiki is not versioned: `docs/wiki/` at a release tag documents that release.

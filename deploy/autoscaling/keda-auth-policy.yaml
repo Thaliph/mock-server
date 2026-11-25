@@ -1,0 +1,46 @@
+# Binds the ClusterTriggerAuthentication mimic-prometheus of scaledobject-external.yaml to one address (#455, #562,
+# docs/SPEC.md §10.7). KEDA lets any ScaledObject or ScaledJob of any namespace use a ClusterTriggerAuthentication, and the
+# Prometheus scaler sends its bearer token to the serverAddress of the trigger. Apply this file together with that one,
+# and edit `address` below together with its serverAddress. Without it, whoever may write a ScaledObject can read the token.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mimic-prometheus-address
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [keda.sh]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [scaledobjects, scaledjobs]
+  variables:
+    - name: address
+      expression: '"https://prometheus.example.com:9090"'
+    # The triggers that use the credential: its name, and its kind compared case-insensitively.
+    - name: uses
+      expression: >-
+        object.spec.?triggers.orValue([]).filter(t,
+          t.?authenticationRef.?name.orValue("") == "mimic-prometheus" &&
+          t.?authenticationRef.?kind.orValue("").lowerAscii() == "clustertriggerauthentication")
+  validations:
+    - expression: variables.uses.all(t, t.type == "prometheus")
+      messageExpression: >-
+        "a trigger that uses the ClusterTriggerAuthentication mimic-prometheus must be of type prometheus"
+    - expression: variables.uses.all(t, t.metadata[?"serverAddress"].orValue("") == variables.address)
+      messageExpression: >-
+        "a trigger that uses the ClusterTriggerAuthentication mimic-prometheus must have serverAddress " + variables.address
+    - expression: variables.uses.all(t, t.metadata[?"unsafeSsl"].orValue("false") == "false")
+      messageExpression: >-
+        "a trigger that uses the ClusterTriggerAuthentication mimic-prometheus must not set unsafeSsl"
+    - expression: variables.uses.all(t, !t.metadata.exists(k, k.endsWith("FromEnv")))
+      messageExpression: >-
+        "a trigger that uses the ClusterTriggerAuthentication mimic-prometheus must not use a FromEnv metadata key"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mimic-prometheus-address
+spec:
+  policyName: mimic-prometheus-address
+  validationActions: [Deny]

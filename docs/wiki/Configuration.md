@@ -88,6 +88,7 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `networkPolicy.sidecarApiFrom` | `[]` | `from` peers for the sidecar API port. Empty: any source (injected pods can be anywhere). |
 | `metrics.serviceMonitor.enabled` | `false` | Prometheus Operator `ServiceMonitor` for the controller admin port. |
 | `metrics.serviceMonitor.interval` | `30s` | |
+| `monitoring.prometheus.queryFrom` | `[]` | NetworkPolicy `from` peers admitted to TCP 9090 of the bundled Prometheus besides the Grafana pods, rendered only with `networkPolicy.enabled`. Empty: no rule is added. For the KEDA operator: `{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: keda}}, podSelector: {matchLabels: {app: keda-operator}}}` ([Autoscaling](Monitoring#autoscaling-on-the-admission-contract)). Each peer reads every series. |
 
 The mesh values are the variables of the same name (an invalid one exits the controller with 2); see [Mesh](Mesh).
 

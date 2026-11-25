@@ -1,0 +1,13 @@
+# The narrow grant for whoever manages autoscaling in a namespace (#455, #565, docs/SPEC.md §10.7, §11.1): ScaledObjects
+# only. Bind it per namespace, for example:
+#   kubectl -n shop create rolebinding keda-scaledobject-editor --clusterrole=keda-scaledobject-editor --user=<subject>
+# It grants neither scaledjobs (pods run by proxy under any ServiceAccount) nor triggerauthentications nor
+# clustertriggerauthentications (cluster-wide).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keda-scaledobject-editor
+rules:
+  - apiGroups: [keda.sh]
+    resources: [scaledobjects]
+    verbs: [get, list, watch, create, update, patch, delete]

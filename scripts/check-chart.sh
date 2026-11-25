@@ -5,6 +5,8 @@
 #   assertions on the rendered objects with yq. Exit 0 when all hold, 1 on the first failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/lib/render-checks.sh
+source scripts/lib/render-checks.sh
 
 chart=deploy/helm/mimic
 digest="sha256:$(printf '0%.0s' $(seq 64))"
@@ -398,7 +400,7 @@ pod_sc=$(yq '.spec.template.spec.securityContext' <<<"$prom_dep")
 [[ $(yq -r '.spec.replicas' <<<"$prom_dep") == 1 ]] || fail "mon_16: the Deployment has not 1 replica"
 [[ $(yq -r '.spec.strategy.type' <<<"$prom_dep") == Recreate ]] || fail "mon_16: the strategy is not Recreate"
 [[ $(yq -r '.image' <<<"$ctr") == quay.io/prometheus/prometheus:v3.15.1@sha256:* ]] || fail "mon_16: the image is not the pinned Prometheus"
-[[ $(yq -r '.args | join(" ")' <<<"$ctr") == "--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=24h --storage.tsdb.retention.size=800MB --web.listen-address=:9090 --log.format=json" ]] \
+[[ $(yq -r '.args | join(" ")' <<<"$ctr") == "--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=24h --storage.tsdb.retention.size=800MB --web.listen-address=:9090 --log.format=json --query.timeout=15s --query.max-samples=5000000 --query.max-concurrency=4" ]] \
   || fail "mon_16: the Prometheus arguments are not those of §10.7: $(yq -r '.args | join(" ")' <<<"$ctr")"
 grep -qE 'enable-admin-api|enable-lifecycle|remote-write|otlp' <<<"$ctr" && fail "mon_16: an admin, lifecycle, remote-write or OTLP flag is set"
 cs() { yq -r 'select(.kind == "Deployment" and .metadata.name == "mimic-prometheus") | .spec.template.metadata.annotations["checksum/config"]' "$1"; }
@@ -663,6 +665,35 @@ render --set monitoring.grafana.enabled=true --set networkPolicy.enabled=false >
   || fail "mon_20: a monitoring NetworkPolicy is rendered with networkPolicy.enabled false"
 echo "mon_20: the Grafana NetworkPolicy admits 3000 from the release namespace, and Prometheus admits 9090 from Grafana only"
 
+# ADM-67: monitoring.prometheus.queryFrom adds one ingress rule, after the Grafana rule; empty changes nothing.
+qf=(--set 'monitoring.prometheus.queryFrom[0].namespaceSelector.matchLabels.kubernetes\.io/metadata\.name=keda'
+  --set 'monitoring.prometheus.queryFrom[0].podSelector.matchLabels.app=keda-operator'
+  --set 'monitoring.prometheus.queryFrom[1].ipBlock.cidr=10.30.0.0/16')
+pnp() { yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$1"; }
+render --set monitoring.prometheus.enabled=true "${qf[@]}" > "$tmp/qf-nog.yaml"
+render --set monitoring.prometheus.enabled=true --set monitoring.grafana.enabled=true "${qf[@]}" > "$tmp/qf-g.yaml"
+for f in qf-nog qf-g; do
+  np=$(pnp "$tmp/$f.yaml")
+  n=$([[ $f == qf-g ]] && echo 1 || echo 0)
+  [[ $(yq -r '.spec.ingress | length' <<<"$np") == $((n + 1)) ]] || fail "adm_67: $f: the ingress has not $((n + 1)) rule(s)"
+  [[ $(yq -o json -I0 ".spec.ingress[$n].ports" <<<"$np") == '[{"port":9090,"protocol":"TCP"}]' ]] || fail "adm_67: $f: the queryFrom rule is not TCP 9090"
+  [[ $(yq -o json -I0 ".spec.ingress[$n].from" <<<"$np") == '[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"keda"}},"podSelector":{"matchLabels":{"app":"keda-operator"}}},{"ipBlock":{"cidr":"10.30.0.0/16"}}]' ]] \
+    || fail "adm_67: $f: the queryFrom peers are not the two given, in order"
+  [[ $(yq -r '[.spec.egress[].ports[].port] | join(",")' <<<"$np") == "15100,8081,443,6443" ]] || fail "adm_67: $f: the egress changed"
+done
+[[ $(yq -r '.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$(pnp "$tmp/qf-g.yaml")") == mimic-grafana ]] \
+  || fail "adm_67: the Grafana rule is not first"
+render --set monitoring.prometheus.enabled=true --set networkPolicy.enabled=false "${qf[@]}" > "$tmp/qf-off.yaml"
+render "${qf[@]}" > "$tmp/qf-noprom.yaml"
+[[ -z $(pnp "$tmp/qf-off.yaml") && -z $(pnp "$tmp/qf-noprom.yaml") ]] || fail "adm_67: the Prometheus policy is rendered with networkPolicy off or Prometheus off"
+render --set monitoring.prometheus.enabled=true --set monitoring.prometheus.queryFrom=null > "$tmp/qf-null.yaml"
+cmp -s <(pnp "$tmp/np-prom-novalkey.yaml") <(pnp "$tmp/qf-null.yaml") || fail "adm_67: an empty queryFrom changes the policy"
+for g in true false; do
+  helm lint --strict "$chart" --set monitoring.prometheus.enabled=true --set monitoring.grafana.enabled=$g "${qf[@]}" >/dev/null \
+    || fail "adm_67: helm lint --strict fails with grafana $g"
+done
+echo "adm_67: queryFrom adds one TCP 9090 ingress rule after Grafana's; empty, networkPolicy off and Prometheus off change nothing"
+
 # MON-20 (#379, datasourceEgress): the rules of datasourceEgress are appended only with datasourceUrl set.
 ext=(--set monitoring.grafana.enabled=true --set networkPolicy.enabled=true
   --set 'monitoring.grafana.datasourceEgress[0].to[0].ipBlock.cidr=10.20.0.0/16'
@@ -725,25 +756,14 @@ lint production -f "$overlay"
 helm template mimic "$chart" -n mimic-system --set valkey.existingSecret=golden -f "$overlay" > "$tmp/prod.yaml" \
   || fail "cht_02: the overlay does not render"
 # docs: the rendered objects as one JSON array; pods: the pod specs of the Deployments and StatefulSets.
-docs=$(yq -o=json -I0 '.' "$tmp/prod.yaml" | jq -cs '[.[] | select(. != null)]')
+docs=$(render_docs "$tmp/prod.yaml")
 pods=$(jq -c '[.[] | select(.kind == "Deployment" or .kind == "StatefulSet") | .spec.template.spec]' <<<"$docs")
 # obj <kind> <name>: the rendered object, as JSON, or nothing.
 obj() { jq -c --arg k "$1" --arg n "$2" '.[] | select(.kind == $k and .metadata.name == $n)' <<<"$docs"; }
 
 # CHT-02, Pod Security restricted: no host namespace or hostPath; runAsNonRoot and seccomp RuntimeDefault on each
 # container (its own setting, else the pod's); allowPrivilegeEscalation false, drop ALL, no added capability.
-violations=$(jq -r '
-  def eff($sc; $p; $f): if ($sc | has($f)) then $sc[$f] else ($p.securityContext[$f]) end;
-  .[] | . as $p
-  | (if ($p.hostNetwork // false) or ($p.hostPID // false) or ($p.hostIPC // false) then "host namespace" else empty end),
-    ((.volumes // [])[] | select(has("hostPath")) | "hostPath volume \(.name)"),
-    (((.containers // []) + (.initContainers // []))[] | . as $c | ($c.securityContext // {}) as $sc
-      | (if eff($sc; $p; "runAsNonRoot") == true then empty else "\($c.name): not runAsNonRoot" end),
-        (if (eff($sc; $p; "seccompProfile") // {}).type == "RuntimeDefault" then empty else "\($c.name): seccomp is not RuntimeDefault" end),
-        (if $sc.allowPrivilegeEscalation == false then empty else "\($c.name): allowPrivilegeEscalation is not false" end),
-        (if (($sc.capabilities.drop // []) | index("ALL")) != null then empty else "\($c.name): capabilities are not dropped ALL" end),
-        (if (($sc.capabilities.add // []) | length) == 0 then empty else "\($c.name): a capability is added" end))
-' <<<"$pods")
+violations=$(pss_violations <<<"$pods")
 [[ -z $violations ]] || fail "cht_02: Pod Security restricted: $(tr '\n' ';' <<<"$violations")"
 echo "cht_02: every pod of the overlay render is Pod Security restricted"
 
@@ -805,10 +825,9 @@ jq -e '.spec.ingress[0].from | length == 1 and (.[0].ipBlock.cidr | type == "str
 echo "cht_05: 3 spread controllers with a PDB, priority class, monitors, no bundled monitoring, no load test, webhook narrowed"
 
 # CHT-06: no secret in the file: no non-empty scalar at a key named like a secret, and no key material or token.
-secrets=$(yq -o=json '.' "$overlay" | jq -r '[paths(scalars) as $p | {k: ($p | map(tostring) | join(".")), v: getpath($p)}]
-  | .[] | select(.k | test("pass|token|secret|credential|private"; "i")) | select(.v != "" and .v != null and .v != false) | .k')
+secrets=$(secret_keys "$overlay")
 [[ -z $secrets ]] || fail "cht_06: values-production.yaml sets a secret-like value: $secrets"
-if grep -qE -- '-----BEGIN|AKIA|ghp_|sk_live_' "$overlay"; then fail "cht_06: values-production.yaml holds key or token material"; fi
+if has_token_material "$overlay"; then fail "cht_06: values-production.yaml holds key or token material"; fi
 echo "cht_06: values-production.yaml holds no secret"
 
 # UI-14 (#437, spec §12.7): the controller container declares mimic-ui on 8080/TCP, for information only. The read API

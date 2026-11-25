@@ -132,24 +132,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-clusters=$(kind get clusters) || { echo "FAIL kind get clusters failed" >&2; exit 1; }
-if ! found -x "$CLUSTER" <<<"$clusters"; then
-  log "create kind cluster $CLUSTER"
-  node_args=()
-  [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
-  kind create cluster --name "$CLUSTER" --wait 120s "${node_args[@]}"
-fi
-kubectl config use-context "kind-$CLUSTER" >/dev/null
+e2e_cluster_up
 server=$(kubectl version -o json | sed -n 's/.*"gitVersion": "v\([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
 log "kubernetes $server"
 
-if [[ ${SKIP_BUILD:-0} != 1 ]]; then
-  log "build $IMAGE and $INIT_IMAGE"
-  docker build -q -t "$IMAGE" .
-  docker build -q -t "$INIT_IMAGE" --target init .
-  BUILT=1
-fi
-kind load docker-image --name "$CLUSTER" "$IMAGE" "$INIT_IMAGE"
+e2e_load_images
 
 log "fnd_08: namespace enforces Pod Security restricted"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
