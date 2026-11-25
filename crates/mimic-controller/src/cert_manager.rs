@@ -176,7 +176,9 @@ async fn publish_ca(
     if operations.is_empty() {
         return Ok(());
     }
-    let patch: json_patch::Patch =
+    // The type is the `json_patch::Patch` of kube itself (inferred from `Patch::Json`), so the
+    // controller needs no direct json-patch dependency in step with kube's.
+    let patch =
         serde_json::from_value(json!(operations)).map_err(|e| format!("caBundle patch: {e}"))?;
     configurations
         .patch(name, &PatchParams::default(), &Patch::Json::<()>(patch))
