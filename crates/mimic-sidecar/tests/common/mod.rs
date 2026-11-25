@@ -8,6 +8,8 @@ use std::time::Duration;
 
 pub mod admission;
 pub mod faults;
+pub mod gateway_rig;
+pub mod h2_frames;
 pub mod mesh_pods;
 pub mod mock_rig;
 pub mod prx_corpus;
@@ -337,6 +339,17 @@ pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("never: {what}");
+}
+
+/// Peak resident set size of `pid` (`VmHWM`), in bytes.
+pub fn peak_rss(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let kb: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("VmHWM");
+    kb * 1024
 }
 
 pub fn median(mut values: Vec<u64>) -> u64 {

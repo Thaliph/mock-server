@@ -5,6 +5,7 @@ pub mod connection;
 pub mod discovery;
 pub mod egress;
 pub mod exchange;
+pub mod gateway;
 pub mod h2;
 pub mod hardening;
 pub mod http1;
