@@ -1015,7 +1015,7 @@ logic in `mimic-core` (`discovery` module).
   cleartext connection or on a TLS connection that §5 intercepted (the decrypted exchange,
   through the same tap, `h2` tee, capture budget and queue as inbound), except `unframed` and
   `rejected` exchanges, `CONNECT` requests and `invalid` paths, as inbound. The sidecar's own
-  traffic (probes, sidecar API calls) runs as UID 1337 and is never captured (§4). Unlike
+  traffic (probes, sidecar API calls, from #462 reflection lookups, §6.5) runs as UID 1337 and is never captured (§4). Unlike
   inbound, an outbound `404` or `405` is recorded like any other status: it creates its
   endpoint and is a sample candidate. The app chose the call, and a mock (F10) must answer it
   as the destination did; the bounds below contain an app that forwards paths chosen by its
@@ -1186,9 +1186,11 @@ length or hash of what it replaces.
   bytes value, so that one invalid byte does not hide a JWT, a PEM block or a card; a hit
   replaces the whole value by its placeholder. A fixed64, like a varint, holding a card number
   (Luhn, 13 to 19 digits) is replaced as a card.
-- **Field names** (when descriptors are known, from reflection): a field whose name fires a
+- **Field names** (when descriptors are known, from reflection, §6.5): a field whose name fires a
   name rule of §6 (`password`, `token`, ...) is replaced, whatever its type and also a nested
-  message (the whole subtree), by that rule's placeholder.
+  message (the whole subtree), by that rule's placeholder. The extra names of
+  `MIMIC_DISCOVERY_REDACT_NAMES` and `spec.discovery.redact` are name rules too. Names only add
+  redaction: the value detectors and the entropy rule apply to every field, named or not.
 - **Per-field rules** (`MimicWorkload.spec.discovery.grpc.redact`): a rule is a method
   `<package.Service>/<Method>`, a direction (`request` or `response`) and a field path, dotted
   segments each a field number (`3.1`) or, when descriptors are known, a field name; every
@@ -1212,8 +1214,9 @@ the recorder keeps the first message of each side:
   `grpc-encoding` is not `gzip`) or `opaque` (a bad flag, a truncated first frame, a payload
   that is not a message); `empty`, `budget` and `absent` are the capture's. A trailing partial
   frame is ignored. The response messages after the first are read as a stream (below).
-- **Redact** (§6.3, `GrpcRedactor::message` with the rules and names known: none before
-  reflection and per-field rules) the message **before** it is kept; metadata is redacted with
+- **Redact** (§6.3, `GrpcRedactor::message` with the per-field rules and the names known: from
+  #462 the names of §6.5 for an inbound message of a port with a schema, else none) the message
+  **before** it is kept; metadata is redacted with
   `GrpcRedactor::metadata` for request and response headers and for the trailers. No frame, no
   payload byte and no length of what was read is kept: the sample holds the canonical JSON of
   §6.2 of the redacted message, as the `body` of the side with the media type of the
@@ -1252,6 +1255,119 @@ the recorder keeps the first message of each side:
   matches a gRPC request on its first message (§8); `request_payload` and `response_payload` of a
   sample hold no gRPC body (a gRPC message is read through `request_message` and
   `response_message`), and the load plan skips `grpc` endpoints (§7.8).
+
+### 6.5 gRPC reflection (F14, #462)
+
+If the app offers gRPC server reflection, the inbound sidecar reads the field names of the app's
+messages. The names feed the name rules of §6.3 and appear in the samples and the documents. The
+messages stay keyed by field number (§6.2), so the mock, the egress set and the formats do not
+change. No `MIMIC_*` variable configures reflection: its bounds are constants.
+
+- **Trigger.** A **lookup** is the set of reflection calls that the sidecar makes for one port.
+  The trigger is an inbound exchange that reaches the recorder from an `h2c` connection, with
+  the response `content-type` `application/grpc` or `application/grpc+proto`. If the port of
+  that exchange has no lookup yet, the sidecar starts a lookup for it. The response
+  `content-type` comes from the app. Thus a client cannot start a lookup on a port that does not
+  serve gRPC.
+  - The sidecar does one lookup per port per start. After a failure, it does not try again.
+  - The sidecar does a lookup for at most 4 ports per start. A fifth port gets the result `limit`.
+  - Outbound exchanges never start a lookup. The sidecar never calls reflection on an egress
+    destination.
+  - In mode `none` the recorder does not run (§3), so no lookup starts. In `discovery` and
+    `mock` inbound exchanges are recorded, so a lookup can start.
+  - Inbound TLS is not decrypted (§5). Thus a TLS port is never recorded and never gets a lookup.
+- **Target.** Security limit: the target must be the pod's own app. The sidecar connects to the
+  original destination (address and port) of the inbound connection that carried the exchange.
+  The inbound redirection of §4 applies only to local addresses of the pod, so this address is
+  always local. The sidecar never takes the target from `:authority`, `Host` or another request
+  field. It connects from UID 1337, so §4 does not capture the connection (as for a probe). The
+  connection is cleartext HTTP/2 with prior knowledge, like the `grpc` probe of §4.
+- **Not app traffic.** A lookup does not go through the listeners, the mesh (§7.9) or the
+  admission contract (§4.1). It writes no access line and changes no RED metric (§9). The
+  recorder never sees it, so it creates no endpoint and no sample.
+- **Protocol.** The sidecar calls `grpc.reflection.v1.ServerReflection/ServerReflectionInfo`. If
+  the first answer has `grpc-status` 12 (`UNIMPLEMENTED`) or the HTTP status 404, the sidecar
+  calls `grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo` on the same connection.
+  Each round is one stream: the sidecar sends all the requests of the round, ends the stream,
+  then reads the responses until the trailers. The rounds are, in this order:
+  1. One `list_services` request.
+  2. One `file_containing_symbol` request for each listed service, in byte order. The sidecar
+     skips `grpc.reflection.v1.ServerReflection` and `grpc.reflection.v1alpha.ServerReflection`.
+     If the list holds more than 64 other services, the sidecar asks for the first 64 only.
+  3. One `file_by_filename` request for each file that a received file imports and that the
+     sidecar did not receive. The sidecar does this round at most 6 times.
+
+  An `error_response` to one request is not a failure: that service or file is missing. The
+  requests and the responses are encoded and read by `mimic_core::grpc::reflection` (pure).
+- **Budget.** Security limit: a lookup must stop 2 s after it starts. The connect, both versions
+  and all rounds count in the 2 s. The responses of a lookup must not exceed 1 MiB in total, frame
+  headers included. A lookup reads at most 256 files. If a bound is passed, the sidecar closes the
+  connection and keeps nothing of the lookup. The result is then `timeout` or `too_large`. The
+  sidecar runs one lookup at a time. At `SIGTERM` it cancels a running lookup at once.
+- **Schema** (pure, `mimic_core::grpc::schema`). The sidecar reads each file as a
+  `FileDescriptorProto` with its own bounded reader, on the wire primitives of §6.2. It keeps only
+  these parts:
+  - the package of each file;
+  - the services, their methods, and the input and output type of each method;
+  - the messages, nested messages included;
+  - for each field: its number, its name, and its type name when its type is a message.
+
+  It ignores every other part: options, default values, comments, enums and extensions. The
+  bounds are 256 files, 2048 messages, 8192 fields, 1024 methods and 32 levels of nested message
+  declarations. A name (of a package, a file, a service, a method, a message or a field) has at
+  most 128 bytes. If a bound is passed, the result is `too_large` and the sidecar keeps no schema.
+  If a file does not parse, or two messages have the same full name, the result is `invalid`.
+- **Lenient parts.** These parts do not stop the read:
+  - a file that the sidecar receives twice (same file name) is read once;
+  - a field name that is not a protobuf identifier (`[A-Za-z_][A-Za-z0-9_]*`) is not kept, so the
+    field stays numbered;
+  - a type reference that is not fully qualified (`.pkg.Msg`), or that names a message the schema
+    does not hold, gives the field no type;
+  - a method whose input or output type is missing has no names for that side.
+- **Custody.** The schema of a port stays in the sidecar's memory until the process stops. The
+  sidecar never writes a descriptor or a schema to a log, the report, Valkey or a file. A schema
+  at the bounds holds at most 4 MiB.
+- **Names of a message** (`Schema::names`, pure). The walk reads the decoded message (§6.2) and
+  the schema together. It starts at the input type (request) or the output type (response) of the
+  method of the gRPC path `/<package.Service>/<Method>`. For each field that the type declares,
+  the walk gives the field's path of numbers its name. If the declared type is a message and the
+  value is a nested message, the walk continues in that type. The walk follows the decoded message
+  only. Thus a recursive type cannot make it loop or go deeper than the message (32 levels and
+  4096 fields, §6.2). A field that the type does not declare, and a method that the schema does
+  not know, stay numbered. A declared type never changes how §6.2 reads a value.
+- **Pending.** The recorder drops the exchange that starts a lookup. While the lookup runs, the
+  recorder drops the gRPC exchanges of its port too. Each one counts in `mimic_discovery_exchanges_total{result="reflection_pending"}`. Thus no
+  message of that port is recorded without the names that the lookup can give. The relay of these
+  exchanges does not change. After the lookup ends, the recorder records the exchanges of the port
+  again, with the names of the schema or without names.
+- **Fields in the sample.** If names are known for a recorded inbound message, the side of the
+  sample holds `fields`: an object from a dotted path of field numbers (`3.1`) to the field name.
+  - The keys are in the order of their numbers, segment by segment (`2` before `10`, `3` before
+    `3.1`).
+  - `fields` holds only the paths of fields that the redacted message holds. A field below a
+    subtree that redaction replaced has no entry.
+  - For the response, the paths of the `stream` messages (§6.4) count too.
+  - One side holds at most 1024 entries and 64 KiB of JSON in `fields`. The first entries in
+    path order are kept.
+  - Without names, `fields` is absent. The sidecar never writes an empty `fields`.
+  - An outbound sample never holds `fields`.
+
+  `fields` is part of the sample: of its size, its hash and the budgets of §7.3. A sample with
+  `fields` makes the report `"version": 3` (§6.4). `without_grpc` and the egress format 1 remove
+  `fields`.
+- **Metrics and logs** (`target` = `discovery`). `mimic_grpc_reflection_total{result}` counts each
+  lookup once, when it ends, and each port that the port bound refuses. The results are:
+  - `loaded`: the sidecar keeps a schema;
+  - `unavailable`: no connection, no reflection service in either version, another
+    `grpc-status`, another HTTP status, or an HTTP/2 error;
+  - `timeout`, `too_large`, `invalid` and `limit`, as above.
+
+  The sidecar writes INFO `grpc reflection loaded` once for a `loaded` port, with `port`,
+  `version` (`v1` or `v1alpha`) and the counts `services`, `messages` and `fields`. It writes INFO
+  `grpc reflection unavailable` once for every other result, with `port` and `result`. No line
+  holds a name, a descriptor, or a `grpc-message` or `error_message` of the app.
+- **Out of scope.** The upload of `.proto` files; reflection on outbound destinations; a second
+  lookup while the sidecar runs; the descriptors, or a digest of them, in the report.
 
 ## 7. Controller and storage
 
@@ -1703,7 +1819,13 @@ the recorder keeps the first message of each side:
     `application/grpc+proto`) and of at most 256 KiB, at most 64 `trailers` per sample, from #464 at most 63 `stream` steps per sample (only
     with a gRPC response body; each message a canonical message within 256 KiB, all messages
     of the sample together within 256 KiB, each `delay_ms` a bucket bound of §6.4: reason
-    `malformed`), no unknown field.
+    `malformed`), no unknown field. From #462 a side of a sample can hold `fields` (§6.5). These
+    rules apply to it, with the reason `malformed`:
+    - the sample is inbound, and the side has a gRPC body;
+    - each key is a dotted path of 1 to 32 field numbers, each 1 to 2^29-1 with no leading zero;
+    - each key names a field of the side's message or, for the response, of a `stream` message;
+    - each value is a protobuf identifier of 1 to 128 bytes;
+    - the keys are in path order, and `fields` holds 1 to 1024 entries and at most 64 KiB.
     A template's length counts each literal segment's bytes plus its `/`, and a parameter as
     its `/` alone (the rendered `{name}` can be longer than the raw path); the `{}` that marks
     a schema's cut level is not a level.
@@ -1739,7 +1861,9 @@ the recorder keeps the first message of each side:
     cannot put a value into Valkey that the controller's rules redact. From F14 a sample's gRPC body is read back as a message and redacted by §6.3
     again (a body that is not a message is replaced by `mimic-secret`; so is each message of its
     `stream`), and its trailers as metadata, and every `-bin` header value, whatever the `content-type` of the request (a
-    sample with trailers and a request that is not gRPC is redacted the same way), so a faulty sidecar cannot store a value that §6.3 replaces. From F13 re-redaction
+    sample with trailers and a request that is not gRPC is redacted the same way), so a faulty sidecar cannot store a value that §6.3 replaces. From #462 the names of a side's `fields` are the
+    field names of that redaction (§6.3), with the extra names of `spec.discovery.redact`. If
+    re-redaction replaces a subtree, the entries of `fields` below it are removed. From F13 re-redaction
     starts with the placeholder upgrade of §6, so a push of an F12 sidecar is stored with
     placeholders; no value detector catches a placeholder and a name rule gives the same one
     again, so re-redaction stays idempotent.
@@ -2259,7 +2383,10 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
     `requestBody` and the responses have a `content` entry `application/grpc` (or
     `application/grpc+proto`) with the §6 schema of the decoded message (properties named by
     field number, `{"$bytes": …}` and the other `$` forms as objects) and the samples' messages
-    as examples; the sample's trailers are not in the document. No `operationId` (it would need disambiguation and nothing uses it).
+    as examples; the sample's trailers are not in the document. From #462 a property gets
+    `"title": "<name>"` when the `fields` of a sample of the operation names its path (§6.5). If
+    the samples give two names for one path, the title is the first name in byte order. The
+    property keys stay field numbers, so that they match the examples. No `operationId` (it would need disambiguation and nothing uses it).
 - **Bounds.** The document is a function of a report that passed the §7.3 check, so its size
   is bounded by the store limits (at most 20 samples per endpoint, `MIMIC_STORE_SAMPLE_BUDGET`
   of sample bytes per deployment).
@@ -3915,7 +4042,8 @@ random numbers it hands to the draw.
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
-  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`, from F11 `load`: an inbound load request forwarded and not recorded, §7.8, from M1 `synthetic`: an answer the mesh generated itself, §4.1, from M5 also an inbound request the admission refused, §4.1 "Admission contract") |
+  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`, from F11 `load`: an inbound load request forwarded and not recorded, §7.8, from M1 `synthetic`: an answer the mesh generated itself, §4.1, from M5 also an inbound request the admission refused, §4.1 "Admission contract", from #462 `reflection_pending`: an inbound gRPC exchange of a port whose reflection lookup runs, §6.5) |
+  | `mimic_grpc_reflection_total` | counter (#462, sidecar), reflection lookups when they end, and ports that the port bound refuses (§6.5) | `result` (`loaded`, `unavailable`, `timeout`, `too_large`, `invalid`, `limit`) |
   | `mimic_discovery_bodies_total` | counter (F4), bodies of recorded exchanges | `direction`, `part` (`request`, `response`), `result` (`parsed`, `empty`, `opaque`, `too_large`, `encoding`, `invalid`, `budget`) |
   | `mimic_discovery_samples_total` | counter (F4), sample admissions | `direction`, `result` (`kept`, `replaced`, `rejected`, `budget`) |
   | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`, from F7 `outbound_header`, §6.1) |
@@ -4746,6 +4874,12 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   the listener's own; Swagger UI has no "Try it out" and no validator, so a browser on the
   UI never sends a request to a workload or to the Internet. Swagger UI is vendored at a pinned
   version, verified against its npm `sha512` and embedded in the binary.
+- gRPC reflection (#462, §6.5) adds no privilege, port, RBAC rule, Kubernetes object or
+  variable. The inbound sidecar calls only the original destination of an inbound gRPC exchange,
+  which is a local address of the pod, from UID 1337. It makes one lookup per port and start, for
+  at most 4 ports, one at a time, within 2 s and 1 MiB each. It never calls reflection on an
+  outbound destination. The schema stays in the sidecar's memory. Only the field names of recorded
+  messages leave it, in `fields`, and the controller checks them and uses them to redact again.
 - Egress recording (F7, §6.1) adds no privilege, Kubernetes object, RBAC rule or variable set
   by the webhook. Decrypted outbound exchanges exist only in the sidecar's memory, within the
   capture budget, and leave it only redacted, through `/discovery` on loopback; outbound
@@ -5394,6 +5528,24 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   address the caller dialled and the pod name, as the `connect-failed` answer of #518 does. A
   caller that reached the pod already knows its address. The pod name is not a secret
   (Kubernetes objects, DNS of headless Services).
+- (#462) **The app sees the reflection lookups.** They are gRPC calls from the pod's own address
+  to the app's reflection service. They are not recorded, and they write no access line and no
+  RED metric (§6.5). An app that logs or counts its own calls shows them. The admission contract
+  does not count them.
+- (#462) **The names come from the app.** The app chooses its field names, so it can make a name
+  rule fire or not. Names only add redaction: the value detectors and the entropy rule still apply
+  to every field. A name segment of a per-field rule depends on the app's names. A number segment
+  does not.
+- (#462) **Field names leave the pod.** The names of the fields of recorded messages reach the
+  controller, Valkey and the UI, as the JSON keys of §6 do. They are the schema of the app's API,
+  not values. A name is a protobuf identifier of at most 128 bytes. No descriptor leaves the pod.
+- (#462) **The first gRPC exchanges of a port are not recorded.** While the lookup of a port runs
+  (at most 2 s), the recorder drops the gRPC exchanges of the port (`reflection_pending`). The
+  relay, the access lines and the RED metrics still show them.
+- (#462) **The schema does not change while the sidecar runs.** The sidecar does one lookup per
+  port and start. If the app serves other descriptors later, or starts its reflection service
+  after the first gRPC exchange, the names stay those of the first lookup, or absent, until the
+  sidecar restarts.
 
 ## 12. Delivery plan
 
@@ -5920,7 +6072,8 @@ Golden files are regenerated in the step that changes their bytes, and the diff 
 ### 12.16 F14 — gRPC (#459 and following)
 
 Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the decoding is
-§6.2, the later steps (redaction, recording, reflection, mock) add their own.
+§6.2, the later steps (redaction, recording, reflection, mock) add their own. Reflection (#462,
+§6.5) has GRP-49 to GRP-65.
 
 | ID | Criterion |
 |---|---|
@@ -5972,6 +6125,23 @@ Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the
 | GRP-46 | **E.** On kind (`scripts/e2e.sh`, after GRP-28 and GRP-35): a server-streaming method of the Python gRPC service (5 messages 200 ms apart, one of them holding a secret-looking field) is called by `grpc-a`'s client through `grpc-b`; the report for `grpc-b` holds 4 steps (placeholders, no canary, `delay_ms` bucket values); with `grpc-a` in `mock` and `grpc-b` scaled to 0 the client gets the 5 messages in order (the first as recorded, the others over at least 600 ms in all) and `OK`. |
 | GRP-47 | **F.** The `grpc` fuzz target also feeds arbitrary bytes and arbitrary marks to `steps`: no panic, at most 63 steps, every `delay_ms` a bucket bound, marks in any order give steps in order, no allocation beyond the bounds of §6.2. |
 | GRP-48 | **D** (review). Security review of #464: memory per stream is bounded (64 messages, 256 KiB, 256 marks in the capture budget; a replay holds a shared answer, one timer and one slot), no timer is unbounded (300 s), a cancel frees them, no exact timestamp or raw message reaches Valkey, a log or a label, steps are redacted before the sample exists and again by the controller, the stream joins the unreleased format 2 and `format=1` stays what a sidecar of 0.2.0-alpha.3 reads; `docs/wiki/Mock-mode.md` and `docs/wiki/Reading-the-API.md` describe streams; `CHANGELOG.md` `[Unreleased]` names them. |
+| GRP-49 | **U.** Reflection messages (§6.5, `grpc::reflection`). The requests `list_services`, `file_containing_symbol` `pkg.Users` and `file_by_filename` `a.proto` encode to the bytes of fixtures made from the reflection proto. A `list_services_response` with 3 services, a `file_descriptor_response` with 2 files and an `error_response` read back as their fixtures. An unknown field is skipped. A payload that is not a message, a known field with another wire type, and a response over 1 MiB are errors. No input panics (property). |
+| GRP-50 | **U.** Lookup rounds (§6.5, `grpc::reflection::Lookup`, without I/O), fed by a fake server. Round 1 asks `list_services`. Round 2 asks one `file_containing_symbol` per service in byte order, without the two reflection services, and for the first 64 of 65 services. Round 3 asks `file_by_filename` only for the imports not received, and a file received twice is read once. An import chain of 8 levels stops after 6 dependency rounds, and the result keeps the files received. An `error_response` for one service gives `loaded`, and the methods of that service have no names. 257 files are `too_large`. Responses whose sum is 1 MiB + 1 byte are `too_large`, and exactly 1 MiB is read. |
+| GRP-51 | **U.** Schema reader (§6.5, `grpc::schema`). The input is a fixture file. It has a package, a service of 2 methods, nested messages, a map field, a `oneof` and a recursive message. It also has options, default values, enums and an extension. The schema holds the methods with their input and output types, and the fields with their numbers, names and message types. It holds no option, default value, enum or extension. A relative type reference and a reference to a missing message give no type. The field names `bad-name`, `9x` and a name of 129 bytes are not kept. A file that does not parse, and two messages with one full name, are `invalid`. 2049 messages, 8193 fields, 1025 methods, 257 files and 33 levels of nested declarations are `too_large`; 2048, 8192, 1024, 256 and 32 are read. 200 000 levels of nested declarations do not overflow the stack. No input panics (property). |
+| GRP-52 | **U.** Schema memory (§6.5, counting allocator). A schema at the bounds (2048 messages, 8192 fields, names of 128 bytes) holds at most 4 MiB after its build. Its build allocates at most 5 MiB at its peak. 1 MiB of descriptors made of messages of one field each is `too_large`. Its read allocates at most 5 MiB at its peak. |
+| GRP-53 | **U.** Names (§6.5, `Schema::names`), with the schema of GRP-51. For `/pkg.Users/Get`, the request `{"1": "ann", "2": "x", "3": {"1": 7}}` gives `1` `name`, `2` `password`, `3` `address` and `3.1` `zip`. The response uses the output type. A recursive type `Node {Node child = 1; string label = 2}` and a message of 32 levels give names for the 32 levels and stop at the message. A field that the type does not declare, a declared message field whose value is a string, and an unknown method give no name. A repeated field gives one entry for all its values. The message is not changed. The same input always gives the same names. |
+| GRP-54 | **U.** Redaction with names (§6.3, §6.5), with the schema of GRP-51. `hunter2` under `password` gives `mimic-password`, and the same message without the schema keeps `hunter2`. A nested message under a field named `token` gives `mimic-token`. A JWT under `note` stays `mimic-jwt`, and a 32-byte random value under `label` stays `mimic-secret`. A per-field rule with the name segment `password` applies with the schema only. The extra name `pin` (`MIMIC_DISCOVERY_REDACT_NAMES`) gives `mimic-secret` for a field named `pin`. |
+| GRP-55 | **U.** Sample (§6.5, the recorder's sample). An inbound sample with a schema holds `request.fields` and `response.fields`, with keys in path order (`2` before `10`). It has no entry below a replaced subtree, and the response holds the paths of the `stream` messages. 1025 distinct paths keep the first 1024. Names that pass 64 KiB end the list. An outbound sample never holds `fields`. Without a schema, a sample has no `fields` and serialises byte for byte as before #462. A sample with `fields` makes the report version 3. `without_grpc` and `project_as(report, 1)` hold no `fields`. Two samples that differ only by `fields` are two samples. |
+| GRP-56 | **U.** Check and re-redaction (§7.3). These `fields` are `malformed`: on an outbound sample; on a side without a gRPC body; with a key `0`, `01`, `3.` or of 33 segments; with a key that names no field of the message; with the value `bad-name` or a value of 129 bytes; with keys out of path order; with 1025 entries; over 64 KiB. A push whose `fields` names field 2 `password`, with `hunter2` at field 2, is stored with `mimic-password`. An extra name of `spec.discovery.redact` applies the same way. If re-redaction replaces a subtree, the entries below it are removed. Re-redaction is idempotent. |
+| GRP-57 | **U.** OpenAPI (§7.6). A gRPC operation whose samples hold `fields` has `title` on the properties of the named paths, nested and array properties included. Two names for one path give the first in byte order. Without `fields`, the document is the document of GRP-26. |
+| GRP-58 | **I** (sidecar, a fake app with a unary method and `grpc.reflection.v1`, on `h2c`). Inbound, in discovery: the first call starts one lookup. The fake sees one reflection connection, on the original destination port. The first call and the calls during the lookup are relayed unchanged and counted `reflection_pending`. After `mimic_grpc_reflection_total{result="loaded"}` is 1, the next call is recorded with `fields`, and `hunter2` under `password` is `mimic-password`. INFO `grpc reflection loaded` holds `port`, `version` `v1` and the counts. It holds no name. 100 more calls, also of another method of the port, start no other lookup. The lookup writes no access line, does not change `mimic_http_requests_total`, and gives no `grpc.reflection` endpoint in the report. A second gRPC port gets its own lookup. |
+| GRP-59 | **I** (sidecar, fake apps). An app with only `v1alpha` gives `loaded` with `version` `v1alpha`. An app without reflection (`grpc-status: 12` in both versions) gives `unavailable` and one INFO `grpc reflection unavailable` with `port` and `result`. Its later calls are recorded without `fields`, as GRP-25 says, and no other lookup starts. An app that closes the reflection connection gives `unavailable`. No log line holds the `grpc-message` of the app. |
+| GRP-60 | **I** (sidecar, fake apps). Reflection responses of 1 MiB + 1 byte in total give `too_large`. A reflection service that stops answering gives `timeout` within 2.2 s, and the sidecar closes the connection. Files of 2049 messages give `too_large`. Bytes that are not a descriptor give `invalid`. After each failure, the calls of the port are recorded without `fields`. The relay of the app's calls does not change. gRPC calls on 5 ports give 4 lookups and one `limit`. A `SIGTERM` during a lookup does not make the shutdown wait for it. |
+| GRP-61 | **I** (sidecar). Outbound, gRPC calls to a fake destination that serves reflection start no lookup: the destination gets no reflection call and `mimic_grpc_reflection_total` stays absent. An inbound call can name another listener of the test in `:authority`. Its lookup goes to the original destination only, and the other listener gets no connection. An inbound gRPC request that the app answers with `content-type: application/json` starts no lookup. In mode `none`, no lookup starts. In mode `mock`, an inbound gRPC call starts one. |
+| GRP-62 | **I** (controller, real Valkey). A version 3 push with `fields` is `200`. `:grpc` holds the `fields`, and `:report` holds none. The report route and the document answer the names, the document as titles. A push with `malformed` `fields` is `400` with the reason `malformed`. |
+| GRP-63 | **E.** On kind (`scripts/e2e.sh`, after GRP-28). A Python gRPC service with reflection gets calls (`grpcio-reflection`, `v1alpha`, descriptors built at run time). The request holds `name` and a `password` canary that no detector catches. The controller's report holds `request.fields` with `name` and `password`, the value `mimic-password` and no canary. The OpenAPI document from the UI listener has the two titles. The sidecar's `mimic_grpc_reflection_total{result="loaded"}` is 1, and its log holds `grpc reflection loaded` once. The sidecar of `grpc-b` (no reflection) logs `grpc reflection unavailable` once, and the report of `grpc-b` has no `fields`. |
+| GRP-64 | **F.** The `grpc` fuzz target also feeds arbitrary bytes to `Lookup` as reflection responses and to the schema reader as files. It feeds each decoded payload to `Schema::names`. It finds no panic and no allocation beyond the bounds of §6.5. The same input gives the same output. |
+| GRP-65 | **D** (review). Security review of #462. The lookup calls only the original destination, from UID 1337, never an outbound destination, within the bounds of §6.5. No descriptor, schema or name reaches a log or a metric label. Names only add redaction, and the controller redacts again with `fields`. `docs/wiki/Discovery-and-redaction.md` has a gRPC reflection section. `CHANGELOG.md` `[Unreleased]` names the lookup, `fields`, `mimic_grpc_reflection_total` and `reflection_pending`. |
 
 ### 12.17 F15 — Explorer UI shell and the Workloads tab (#465)
 
