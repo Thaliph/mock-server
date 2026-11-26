@@ -1,7 +1,8 @@
 //! The gateway reconciler (spec §7.10): the tables the watches feed, and the passes that apply
 //! the objects of each accepted Gateway, write the status of each mimic GatewayClass and of each
-//! Gateway of a mimic class, and delete the managed objects no accepted Gateway needs. Both
-//! replicas run it (no leader): equal applies change nothing in the cluster.
+//! Gateway of a mimic class in a listed namespace, and delete the managed objects no accepted
+//! Gateway needs. Both replicas run it (no leader): equal applies change nothing in the cluster.
+//! The Gateways mimic does not serve are stubs (#576): they start no work.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,7 +21,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::cluster::{ApiError, Cluster, StatusTarget};
-use super::convert::{self, Seen};
+use super::convert::{self, GatewayEntry, Seen};
 use super::metrics::{GatewayMetrics, GatewayState, Outcome};
 use crate::mesh::Event;
 use crate::mesh::convert::Key;
@@ -36,7 +37,7 @@ const RESYNC: Duration = Duration::from_secs(300);
 #[derive(Default)]
 struct Tables {
     classes: Table<GatewayClass>,
-    gateways: Table<Gateway>,
+    gateways: Table<GatewayEntry>,
     deployments: Table<Seen<DeploymentState>>,
     services: Table<Seen<ServiceState>>,
     /// The `gateways` CRD is served: false until the first look.
@@ -44,20 +45,22 @@ struct Tables {
     /// UIDs of the Gateways this replica saw deleted: their objects are the garbage
     /// collector's. Kept while a watched object names one as its owner.
     tombstones: BTreeSet<String>,
+    /// The copy of the last pass, while no table changed: a retry or the resync copies nothing.
+    picture: Option<Arc<Picture>>,
 }
 
 /// A copy of the tables a pass works on, taken once they all listed.
 struct Picture {
     classes: BTreeMap<Key, GatewayClass>,
-    gateways: BTreeMap<Key, Gateway>,
+    gateways: BTreeMap<Key, GatewayEntry>,
     deployments: BTreeMap<Key, Seen<DeploymentState>>,
     services: BTreeMap<Key, Seen<ServiceState>>,
     tombstones: BTreeSet<String>,
 }
 
 impl Picture {
-    fn class_of(&self, gw: &Gateway) -> Option<&GatewayClass> {
-        self.classes.get(&(String::new(), gw.class.clone()))
+    fn class_of(&self, class: &str) -> Option<&GatewayClass> {
+        self.classes.get(&(String::new(), class.to_string()))
     }
 
     /// The watched Deployment `key` when it is managed for the Gateway `gateway`.
@@ -95,6 +98,9 @@ pub struct Reconciler {
     state: tokio::sync::Mutex<State>,
     /// Counts the changes of the tables and of the presence; `run` waits on it.
     changes: watch::Sender<u64>,
+    /// Counts the mimic classes that appeared: the `gateways` watch lists again, so that their
+    /// stubs are converted in full (§7.10).
+    relists: watch::Sender<u64>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -171,67 +177,89 @@ impl Reconciler {
                 resync_at: Instant::now() + RESYNC,
             }),
             changes: watch::channel(0).0,
+            relists: watch::channel(0).0,
         })
     }
 
-    fn changed(&self) {
+    /// A table changed: the next pass takes a new copy.
+    fn changed(&self, mut tables: std::sync::MutexGuard<'_, Tables>) {
+        tables.picture = None;
+        drop(tables);
         self.changes.send_modify(|n| *n += 1);
     }
 
+    /// The Gateway `namespace`/… of class `class` is served: converted in full and reconciled.
+    pub fn serves(&self, namespace: &str, class: &str) -> bool {
+        self.settings.namespaces.contains(namespace)
+            && lock(&self.tables)
+                .classes
+                .items
+                .contains_key(&(String::new(), class.to_string()))
+    }
+
+    /// Changes when a mimic class appears: the `gateways` watch then lists again.
+    pub fn relists(&self) -> watch::Receiver<u64> {
+        self.relists.subscribe()
+    }
+
     pub fn feed_classes(&self, event: Event<GatewayClass>) {
-        if lock(&self.tables).classes.feed(event) {
-            self.changed();
+        let mut tables = lock(&self.tables);
+        let before: BTreeSet<Key> = tables.classes.items.keys().cloned().collect();
+        if tables.classes.feed(event) {
+            let added = tables.classes.items.keys().any(|k| !before.contains(k));
+            self.changed(tables);
+            if added {
+                self.relists.send_modify(|n| *n += 1);
+            }
         }
     }
 
-    pub fn feed_gateways(&self, event: Event<Gateway>) {
-        let changed = {
-            let mut tables = lock(&self.tables);
-            if let Event::Delete(key) = &event
-                && let Some(gone) = tables.gateways.items.get(key)
-            {
-                let uid = gone.uid.clone();
-                tables.tombstones.insert(uid);
-            }
-            tables.gateways.feed(event)
-        };
-        if changed {
-            self.changed();
+    pub fn feed_gateways(&self, event: Event<GatewayEntry>) {
+        let mut tables = lock(&self.tables);
+        if let Event::Delete(key) = &event
+            && let Some(GatewayEntry::Full(gone)) = tables.gateways.items.get(key)
+        {
+            let uid = gone.uid.clone();
+            tables.tombstones.insert(uid);
+        }
+        if tables.gateways.feed(event) {
+            self.changed(tables);
         }
     }
 
     pub fn feed_deployments(&self, event: Event<Seen<DeploymentState>>) {
-        if lock(&self.tables).deployments.feed(event) {
-            self.changed();
+        let mut tables = lock(&self.tables);
+        if tables.deployments.feed(event) {
+            self.changed(tables);
         }
     }
 
     pub fn feed_services(&self, event: Event<Seen<ServiceState>>) {
-        if lock(&self.tables).services.feed(event) {
-            self.changed();
+        let mut tables = lock(&self.tables);
+        if tables.services.feed(event) {
+            self.changed(tables);
         }
     }
 
     /// The `gateways` CRD is served or not; when it is not, the gateway table is emptied and a
     /// pass waits for a new full list (GW-15).
     pub fn crd(&self, present: bool) {
-        let changed = {
-            let mut tables = lock(&self.tables);
-            let changed = tables.crd != present;
-            tables.crd = present;
-            if !present {
-                tables.gateways = Table::default();
-            }
-            changed
-        };
+        let mut tables = lock(&self.tables);
+        let changed = tables.crd != present;
+        tables.crd = present;
+        if !present {
+            tables.gateways = Table::default();
+            tables.picture = None;
+        }
         if changed {
-            self.changed();
+            self.changed(tables);
         }
     }
 
     /// A copy of the tables, or `None` while the picture is partial: the CRD absent or a table
-    /// not listed yet (GW-13). The tombstones no watched object names any more are dropped.
-    fn picture(&self) -> Option<Picture> {
+    /// not listed yet (GW-13). The copy is kept until a table changes. The tombstones no watched
+    /// object names any more are dropped.
+    fn picture(&self) -> Option<Arc<Picture>> {
         let mut tables = lock(&self.tables);
         let t = &mut *tables;
         if !t.crd
@@ -241,6 +269,9 @@ impl Reconciler {
             || !t.services.synced
         {
             return None;
+        }
+        if let Some(picture) = &t.picture {
+            return Some(picture.clone());
         }
         let owners: BTreeSet<&String> = t
             .deployments
@@ -256,13 +287,15 @@ impl Reconciler {
             .cloned()
             .collect();
         t.tombstones = kept;
-        Some(Picture {
+        let picture = Arc::new(Picture {
             classes: t.classes.items.clone(),
             gateways: t.gateways.items.clone(),
             deployments: t.deployments.items.clone(),
             services: t.services.items.clone(),
             tombstones: t.tombstones.clone(),
-        })
+        });
+        t.picture = Some(picture.clone());
+        Some(picture)
     }
 
     /// One pass (spec §7.10): the classes, each Gateway of a mimic class, then the managed
@@ -291,10 +324,18 @@ impl Reconciler {
             state.failing.remove(key);
         }
         let mut states = BTreeMap::new();
-        for (key, gw) in &picture.gateways {
-            let Some(class) = picture.class_of(gw) else {
+        for (key, entry) in &picture.gateways {
+            // A stub (another class, a namespace not listed, or a class that became a mimic one
+            // before the relist) gets nothing.
+            let Some(gw) = entry.full() else {
                 continue;
             };
+            let Some(class) = picture.class_of(&gw.class) else {
+                continue;
+            };
+            if !self.settings.namespaces.contains(&gw.namespace) {
+                continue;
+            }
             if !state.due(key, at) {
                 if let Some(kept) = state.states.get(key) {
                     states.insert(key.clone(), *kept);
@@ -365,12 +406,8 @@ impl Reconciler {
         let mut outcome = if !acceptance.is_accepted() {
             state.unmanaged.remove(&key);
             state.conflicts.remove(&key);
-            if self.settings.namespaces.contains(&gw.namespace) {
-                self.delete_objects(state, picture, &object_key, &gw.name)
-                    .await
-            } else {
-                Ok(())
-            }
+            self.delete_objects(state, picture, &object_key, &gw.name)
+                .await
         } else {
             self.objects(state, picture, gw, acceptance, &key, &object_key)
                 .await
@@ -613,7 +650,9 @@ impl Reconciler {
                     None => !owner
                         .as_ref()
                         .is_some_and(|o| picture.tombstones.contains(o)),
-                    Some(gw) => picture.class_of(gw).is_none() && k.1 == objects::name(gateway),
+                    Some(gw) => {
+                        picture.class_of(gw.class()).is_none() && k.1 == objects::name(gateway)
+                    }
                 }
             })
             .map(|(k, gateway, _, _)| (k.clone(), gateway.clone()))

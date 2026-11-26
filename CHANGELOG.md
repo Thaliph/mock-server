@@ -30,14 +30,19 @@ All notable changes to mimic are documented in this file. The format follows
   `MIMIC_ROLE=gateway`: HTTP/1.1 and HTTP/2 with prior knowledge on the `HTTP` listener ports, every request answered
   `404` `x-mimic-error: no-route` until routing (#457); HTTPS listeners come with #458. Replicas come from the
   annotation `mimic.platform.io/replicas` in `spec.infrastructure.annotations` (default 2, no HPA). The controller
-  refuses, never applies in part: a namespace that is not listed (`NamespaceNotAllowed`), `spec.tls`,
+  refuses, never applies in part: `spec.tls`,
   `spec.addresses`, `spec.allowedListeners`, `spec.infrastructure.labels` and other annotations, unknown fields,
   listener `filters`, `allowedRoutes.namespaces.from: Selector`, and protocols other than `HTTP`. It never changes or
   deletes an object of the generated name that it does not manage (`Programmed: False`, `Invalid`, WARN
-  `gateway object not managed`). New chart values `gateway.enabled`, `gateway.namespaces`, `gateway.serviceType`
-  (`ClusterIP`, `NodePort`, `LoadBalancer`), `gateway.maxReplicas` (10) and `gateway.resources`; the chart fails
-  without `mesh.enabled`, `image.digest`, a namespace or the Gateway API CRDs. New controller variables
-  `MIMIC_GATEWAY_NAMESPACES`, `MIMIC_GATEWAY_SERVICE_TYPE`, `MIMIC_GATEWAY_MAX_REPLICAS`, `MIMIC_GATEWAY_RESOURCES`;
+  `gateway object not managed`). A Gateway of a mimic class in a namespace that is not listed gets no status, and the
+  controller keeps only the namespace, name and class of the Gateways it does not serve. New chart values
+  `gateway.enabled`, `gateway.namespaces`, `gateway.serviceType` (`ClusterIP`, `NodePort`, `LoadBalancer`),
+  `gateway.maxReplicas` (10), `gateway.maxConnections` (1024, the connection cap of each gateway pod),
+  `gateway.admittedAnnotations` (`[]`) and `gateway.resources` (limit memory `192Mi`); the chart fails without
+  `mesh.enabled`, `image.digest`, a namespace, the Gateway API CRDs or `limits.memory`, and when
+  `gateway.maxConnections` × 96 KiB + 32 MiB does not fit `limits.memory`. New controller variables
+  `MIMIC_GATEWAY_NAMESPACES`, `MIMIC_GATEWAY_SERVICE_TYPE`, `MIMIC_GATEWAY_MAX_REPLICAS`,
+  `MIMIC_GATEWAY_MAX_CONNECTIONS`, `MIMIC_GATEWAY_RESOURCES`;
   new sidecar variables `MIMIC_ROLE`, `MIMIC_GATEWAY_PORTS`, `MIMIC_GATEWAY_HEADER_TIMEOUT`,
   `MIMIC_GATEWAY_IDLE_TIMEOUT`. New metrics `mimic_gateway_reconciles_total{result}` and
   `mimic_gateway_gateways{state}`; the gateway pods give `component="gateway"`. **New RBAC** (only with
@@ -46,7 +51,8 @@ All notable changes to mimic are documented in this file. The format follows
   ClusterRole `<release>-gateway` bound by a RoleBinding in each listed namespace only. No Secret, pod or Namespace
   read is added. **New admission policy** `<release>-gateway` (`failurePolicy: Fail`): the controller can write only
   labelled gateway objects of the fixed shape (the chart image by digest, no volume, no token, no host access, no
-  capability) in the listed namespaces. Gateway pods run as UID 65532 under Pod Security `restricted`. Delete the
+  capability) in the listed namespaces, checked by key allowlists and exact label sets; it admits no annotation
+  that the controller adds, but the keys of `gateway.admittedAnnotations`. Gateway pods run as UID 65532 under Pod Security `restricted`. Delete the
   Gateways before you disable the gateway or unlist a namespace: their objects stay unreconciled otherwise. See the
   wiki pages Gateway, Security, Monitoring and Troubleshooting.
 

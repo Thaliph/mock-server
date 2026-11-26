@@ -135,6 +135,8 @@ spec:
               value: {{ .Values.gateway.serviceType | quote }}
             - name: MIMIC_GATEWAY_MAX_REPLICAS
               value: {{ .Values.gateway.maxReplicas | quote }}
+            - name: MIMIC_GATEWAY_MAX_CONNECTIONS
+              value: {{ .Values.gateway.maxConnections | int64 | quote }}
             - name: MIMIC_GATEWAY_RESOURCES
               value: {{ toJson .Values.gateway.resources | quote }}
             {{- end }}

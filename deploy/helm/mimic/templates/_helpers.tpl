@@ -72,18 +72,28 @@ guarded with has(); dyn() keeps the map literal heterogeneous.
 {{- end -}}
 
 {{/*
-Valkey maxmemory in bytes: 75 % of valkey.resources.limits.memory (spec §7.3). The limit is a whole
-number with an optional binary (Ki, Mi, Gi, Ti) or decimal (K, M, G, T) suffix, as Kubernetes writes it.
+A memory quantity in bytes: (dict "name" <value path> "value" <quantity>). The quantity is a whole number with
+an optional binary (Ki, Mi, Gi, Ti) or decimal (K, M, G, T) suffix, as Kubernetes writes it; else the chart
+fails naming the value.
 */}}
-{{- define "mimic.valkeyMaxmemory" -}}
-{{- $limit := required "valkey.resources.limits.memory is required" .Values.valkey.resources.limits.memory | toString -}}
+{{- define "mimic.memoryBytes" -}}
+{{- $limit := .value | toString -}}
 {{- if not (regexMatch "^[1-9][0-9]*(Ki|Mi|Gi|Ti|K|M|G|T)?$" $limit) -}}
-{{- fail (printf "valkey.resources.limits.memory %q is not a whole quantity such as 1Gi" $limit) -}}
+{{- fail (printf "%s %q is not a whole quantity such as 1Gi" .name $limit) -}}
 {{- end -}}
 {{- $num := regexFind "^[0-9]+" $limit -}}
 {{- $unit := trimPrefix $num $limit -}}
 {{- $multiplier := dict "" 1 "K" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 -}}
-{{- div (mul (mul (int64 $num) (index $multiplier $unit)) 3) 4 -}}
+{{- mul (int64 $num) (index $multiplier $unit) -}}
+{{- end -}}
+
+{{/*
+Valkey maxmemory in bytes: 75 % of valkey.resources.limits.memory (spec §7.3).
+*/}}
+{{- define "mimic.valkeyMaxmemory" -}}
+{{- $limit := required "valkey.resources.limits.memory is required" .Values.valkey.resources.limits.memory -}}
+{{- $bytes := include "mimic.memoryBytes" (dict "name" "valkey.resources.limits.memory" "value" $limit) | int64 -}}
+{{- div (mul $bytes 3) 4 -}}
 {{- end -}}
 
 {{/* Pod Security "restricted" container settings (spec §11). */}}

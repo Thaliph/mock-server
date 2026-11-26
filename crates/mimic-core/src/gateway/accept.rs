@@ -74,15 +74,9 @@ pub fn gateway(gw: &Gateway, class: &GatewayClass, settings: &Settings) -> Accep
         .map(|(i, l)| listener(i, l))
         .collect();
     let replicas = replicas(&gw.infrastructure, settings.max_replicas);
-    let accepted = if !settings.namespaces.contains(&gw.namespace) {
-        Condition::refused(
-            "NamespaceNotAllowed",
-            bounded(&format!(
-                "namespace {} is not in gateway.namespaces",
-                gw.namespace
-            )),
-        )
-    } else if !self::class(class).ok {
+    // A Gateway outside the listed namespaces is not served at all (no status, §7.10): the
+    // reconciler never asks for its acceptance.
+    let accepted = if !self::class(class).ok {
         Condition::refused(
             "InvalidParameters",
             bounded(&format!("GatewayClass {} is not accepted", class.name)),
@@ -121,7 +115,7 @@ pub fn gateway(gw: &Gateway, class: &GatewayClass, settings: &Settings) -> Accep
     }
 }
 
-/// Case 3: the first field the gateway cannot serve, in document order.
+/// Case 2: the first field the gateway cannot serve, in document order.
 fn first_unsupported(gw: &Gateway) -> Option<String> {
     if gw.name.chars().count() > MAX_NAME {
         return Some("name longer than 63 characters".into());
@@ -156,7 +150,7 @@ fn first_unsupported(gw: &Gateway) -> Option<String> {
     first_in_order(paths)
 }
 
-/// Case 5: `parametersRef`, or a replicas value out of range. The annotation comes first in
+/// Case 4: `parametersRef`, or a replicas value out of range. The annotation comes first in
 /// document order.
 fn invalid_parameters(infrastructure: &Infrastructure, max: u32) -> Option<String> {
     if infrastructure.replicas.is_some() && replicas(infrastructure, max).is_none() {

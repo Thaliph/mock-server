@@ -149,7 +149,10 @@ fn gw_16_each_variable_is_checked() {
         ("MIMIC_GATEWAY_RESOURCES", r#"{"requests":{"memory":""}}"#),
         ("MIMIC_GATEWAY_RESOURCES", r#"{"claims":[{"name":"a"}]}"#),
         // The memory budget needs a limit.
-        ("MIMIC_GATEWAY_RESOURCES", r#"{"requests":{"memory":"128Mi"}}"#),
+        (
+            "MIMIC_GATEWAY_RESOURCES",
+            r#"{"requests":{"memory":"128Mi"}}"#,
+        ),
         ("MIMIC_GATEWAY_RESOURCES", r#"{"limits":{"cpu":"1"}}"#),
         ("MIMIC_GATEWAY_MAX_CONNECTIONS", "0"),
         ("MIMIC_GATEWAY_MAX_CONNECTIONS", "1000001"),

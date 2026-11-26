@@ -172,11 +172,17 @@ gateway:
   serviceType: ClusterIP
   # Highest mimic.platform.io/replicas a Gateway can ask for (1 to 100).
   maxReplicas: 10
-  # resources of the gateway container. Write the quantities in canonical form (100m, 64Mi, 1Gi): the API
-  # server stores them so, and the admission policy compares them as written here.
+  # Connections that one gateway pod serves at once (1 to 1000000). The memory budget: maxConnections x 96 KiB
+  # + 32 MiB must fit resources.limits.memory, else the chart fails (1706 fit the default 192Mi).
+  maxConnections: 1024
+  # Annotation keys that a mutating webhook of the platform adds to the gateway objects (for example
+  # cloud.google.com/neg). The admission policy admits them; the controller never writes them.
+  admittedAnnotations: []
+  # resources of the gateway container, with limits.memory. Write the quantities in canonical form (100m,
+  # 128Mi, 1Gi): the API server stores them so, and the admission policy compares them as written here.
   resources:
-    requests: {cpu: 100m, memory: 64Mi}
-    limits: {memory: 128Mi}
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 192Mi}
 
 metrics:
   # Prometheus Operator ServiceMonitor for the controller.

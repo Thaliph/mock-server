@@ -91,7 +91,7 @@ fn find<'a>(conditions: &'a Value, kind: &str) -> &'a Value {
 fn gw_08_programmed_cases() {
     let refused = {
         let mut g = gw();
-        g.namespace = "other".into();
+        g.has_tls = true;
         accept(&g)
     };
     let ok = accept(&gw());

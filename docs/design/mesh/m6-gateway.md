@@ -22,7 +22,7 @@ Gateway API status of the class and of the Gateway. In #456 the gateway pods ans
 | The generated names follow GEP-1762: `<gateway>-mimic`, else a hashed form (`.` to `-`, a `g` prefix, cut to 46 characters, the first 10 hex digits of the SHA-256 of the name, `-mimic`) | One standard name that a user can predict, and a valid DNS-1035 label of at most 63 characters for any Gateway name | *autonomous*, #456, GW-01 |
 | `spec.infrastructure` labels and annotations other than `mimic.platform.io/replicas` are refused (`UnsupportedValue`), not propagated | No cloud load balancer annotation reaches the Service; a Gateway is never applied in part | *autonomous*, #456, GW-03 |
 | `allowedRoutes.namespaces.from: Selector` is refused | It needs a cluster-wide Namespace read, which the controller does not get | *autonomous*, #456, GW-04 |
-| A Gateway outside `gateway.namespaces` gets `Accepted: False`, `NamespaceNotAllowed`, and no object | The cluster admin opts namespaces in; the controller has RBAC only there, and the user sees why | *autonomous*, #456, GW-03, GW-15 |
+| A Gateway outside `gateway.namespaces` gets no status and no object; the controller keeps only a stub (namespace, name, class) of it and of the Gateways of other classes | The cluster admin opts namespaces in; the controller has RBAC only there, and unlisted namespaces cannot load the reconciler (#576; it was `NamespaceNotAllowed`) | *autonomous*, #456, #576, GW-03, GW-15 |
 | A Gateway that is not accepted has no objects; its managed objects are deleted | Nothing half-applied runs at the edge | *autonomous*, #456, GW-07, GW-13 |
 | Ports below 1024 through the safe, namespaced sysctl `net.ipv4.ip_unprivileged_port_start=0`, not a port remap and not a capability | Pod Security `restricted` permits it; the container port is the listener port | *autonomous*, #456, GW-05, GW-23 |
 | The replica count comes from the annotation only (default `min(2, MIMIC_GATEWAY_MAX_REPLICAS)`, 1 to the max); no HPA in M6 | The apply forces the count, so an HPA would fight it | *autonomous*, #456, GW-03, GW-05 |
@@ -33,9 +33,9 @@ Gateway API status of the class and of the Gateway. In #456 the gateway pods ans
 | A failed request is retried after 1 s, doubled up to 30 s, with one WARN `gateway reconcile failed` per Gateway and streak; the `error` is the status reason and code only | Bounded load on the API server; no object body in a log | spec §7.10, GW-14 |
 | A status message holds only field paths, annotation keys and identifiers that the API server validated and bounded; never a hostname, an annotation value or another `spec` value | No user value reaches a log, a metric label or a status | spec §7.10 "Status", GW-03, GW-17 |
 | RBAC: cluster-wide read of `gateways` and `gatewayclasses` and `patch` of their `status`; writes of `deployments`, `services` and `poddisruptionbudgets` through a ClusterRole bound by one RoleBinding per listed namespace | Writes stay in the namespaces that the cluster admin listed | spec §11, GW-21, GW-26 |
-| A `ValidatingAdmissionPolicy` `<release>-gateway` limits the writes of the controller to labelled objects of the fixed shape | RBAC cannot narrow `create`, `patch` and `delete` to labelled objects | spec §7.10 "Admission policy", §11.1, GW-27 |
+| A `ValidatingAdmissionPolicy` `<release>-gateway` limits the writes of the controller to labelled objects of the fixed shape, by key allowlists, exact label sets and no added annotation (`gateway.admittedAnnotations` for platform webhooks) | RBAC cannot narrow `create`, `patch` and `delete` to labelled objects; an allowlist also refuses the fields of later Kubernetes versions (#575) | spec §7.10 "Admission policy", §11.1, GW-27 |
 | The gateway pod has no token, no capability, no volume and no host access; UID 65532; Pod Security `restricted`; never injected | The listeners face clients that mimic does not trust | spec §7.10, §11, GW-05, GW-23 |
-| The listeners are bounded: `MIMIC_MAX_CONNECTIONS`, a 64 KiB head within `MIMIC_GATEWAY_HEADER_TIMEOUT` (10 s), `MIMIC_GATEWAY_IDLE_TIMEOUT` (60 s), 100 HTTP/2 streams | Untrusted clients cannot hold the gateway | spec §7.10 "Gateway role", GW-19, GW-28 |
+| The listeners are bounded: `MIMIC_MAX_CONNECTIONS` from `gateway.maxConnections` (1024), a 64 KiB head within `MIMIC_GATEWAY_HEADER_TIMEOUT` (10 s, HTTP/2 too), `MIMIC_GATEWAY_IDLE_TIMEOUT` (60 s), 100 HTTP/2 streams, 64 KiB windows; the cap × 96 KiB + 32 MiB fits `limits.memory` (192Mi) | Untrusted clients cannot hold the gateway or push it out of its memory limit (#574) | spec §7.10 "Gateway role", GW-19, GW-28 |
 | The gateway checks run in their own kind script `scripts/e2e-gateway.sh` and CI job `e2e-gateway`, on Kubernetes 1.33 and the latest that kind supports | `scripts/e2e.sh` has no time left, and its `msh_28` and `rte_*` sections delete the CRDs | GW-23 |
 
 ## Decision: the status of one Gateway
@@ -43,7 +43,7 @@ Gateway API status of the class and of the Gateway. In #456 the gateway pods ans
 ```mermaid
 flowchart TD
   G["Gateway of a mimic class"] --> NS{"Namespace in gateway.namespaces?"}
-  NS -->|"no: GW-03"| NNA["Accepted False NamespaceNotAllowed"]
+  NS -->|"no: GW-15"| Stub["A stub: no status, no object"]
   NS -->|yes| Cls{"Class Accepted?"}
   Cls -->|"no: GW-03"| IP1["Accepted False InvalidParameters"]
   Cls -->|yes| Uns{"Name over 63, spec over 64 KiB, unknown field, spec.tls, allowedListeners, infrastructure labels or other annotation?"}
@@ -56,8 +56,7 @@ flowchart TD
   Lis -->|none| LNV["Accepted False ListenersNotValid"]
   Lis -->|some| LNVT["Accepted True ListenersNotValid, refused ones named"]
   Lis -->|all| Acc["Accepted True Accepted"]
-  NNA --> NoObj["No object, managed ones deleted, Programmed False Invalid: GW-13"]
-  IP1 --> NoObj
+  IP1 --> NoObj["No object, managed ones deleted, Programmed False Invalid: GW-13"]
   UV --> NoObj
   UA --> NoObj
   IP2 --> NoObj

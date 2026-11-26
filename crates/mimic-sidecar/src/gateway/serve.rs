@@ -39,6 +39,9 @@ const ABORT_WAIT: Duration = Duration::from_millis(200);
 const MAX_HEAD: usize = 64 * 1024;
 const H2_STREAMS: u32 = 100;
 const H2_HEADER_LIST: u32 = 64 * 1024;
+/// The connection and stream windows: the protocol's initial 64 KiB, not hyper's 1 MiB, so that a
+/// stream holds at most that much unread data (the memory budget, §7.10).
+const H2_WINDOW: u32 = 65_535;
 const H2_PENDING_ACCEPT_RESETS: usize = 20;
 const H2_LOCAL_ERROR_RESETS: usize = 1024;
 
@@ -205,12 +208,12 @@ async fn accept_loop(gateway: Arc<Gateway>, listener: TcpListener) {
 /// Where a connection is, for its timers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// Waiting for a request head since the instant (the accept, or the first byte after an
-    /// answer).
+    /// Waiting for a request head since the instant (the accept, or the first HTTP/1 byte after
+    /// an answer).
     Head(Instant),
     /// That many requests being answered.
     Busy(usize),
-    /// Every request answered at the instant, no byte since.
+    /// Every request answered at the instant, no byte since (HTTP/1) or no new request (HTTP/2).
     Idle(Instant),
 }
 
@@ -268,12 +271,16 @@ async fn connection(gateway: Arc<Gateway>, mut tcp: TcpStream, _active: Active) 
         idle,
     };
     if h2 {
-        phase.send_replace(Phase::Idle(Instant::now()));
+        // From the accept, the first request has the header timeout: a connection that sends
+        // only the preface and SETTINGS is closed then (#574). The idle timeout starts at the
+        // first answer.
         let served = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
             .auto_date_header(false)
             .max_concurrent_streams(H2_STREAMS)
             .max_header_list_size(H2_HEADER_LIST)
+            .initial_stream_window_size(H2_WINDOW)
+            .initial_connection_window_size(H2_WINDOW)
             .max_pending_accept_reset_streams(H2_PENDING_ACCEPT_RESETS)
             .max_local_error_reset_streams(H2_LOCAL_ERROR_RESETS)
             .serve_connection(TokioIo::new(stream), service);

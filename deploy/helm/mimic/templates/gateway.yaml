@@ -14,9 +14,30 @@
 {{- if not (has .Values.gateway.serviceType (list "ClusterIP" "NodePort" "LoadBalancer")) }}
 {{- fail "gateway.serviceType must be ClusterIP, NodePort or LoadBalancer" }}
 {{- end }}
+{{- $memory := dig "limits" "memory" "" (.Values.gateway.resources | default dict) }}
+{{- if not $memory }}
+{{- fail "gateway.resources needs limits.memory: the connection cap is sized against it (spec §7.10)" }}
+{{- end }}
+{{- $maxRaw := .Values.gateway.maxConnections }}
+{{- $maxConnections := int64 $maxRaw }}
+{{- if or (lt $maxConnections 1) (gt $maxConnections 1000000) (ne (float64 $maxConnections) (float64 $maxRaw)) }}
+{{- fail (printf "gateway.maxConnections %v must be a whole number from 1 to 1000000" $maxRaw) }}
+{{- end }}
+{{- $memoryBytes := include "mimic.memoryBytes" (dict "name" "gateway.resources.limits.memory" "value" $memory) | int64 }}
+{{- if gt (add (mul $maxConnections 98304) 33554432) $memoryBytes }}
+{{- fail (printf "gateway.maxConnections %d x 96 KiB + 32 MiB is more than gateway.resources.limits.memory %v: lower the cap or raise the limit (spec §7.10)" $maxConnections $memory) }}
+{{- end }}
+{{- $admittedKeys := list }}
+{{- range .Values.gateway.admittedAnnotations }}
+{{- if not (regexMatch "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$" (toString .)) }}
+{{- fail (printf "gateway.admittedAnnotations: %q is not an annotation key" (toString .)) }}
+{{- end }}
+{{- $admittedKeys = append $admittedKeys (printf "'%s'" .) }}
+{{- end }}
 {{- $ns := .Values.gateway.namespaces | sortAlpha }}
 {{- $nsList := printf "['%s']" (join "', '" $ns) }}
 {{- $sysctls := "[{'name': 'net.ipv4.ip_unprivileged_port_start', 'value': '0'}]" }}
+{{- /* A CEL map literal holds one value type: dyn() mixes them, else the API server refuses the policy. */}}
 {{- $dp := "!variables.isDeployment || (" }}
 {{- $dc := "!variables.isDeployment || (size(variables.pod.containers) == 1 && " }}
 # The mimic Gateway (spec §7.10, M6): the class, the namespaced write RBAC and the admission policy
@@ -119,6 +140,9 @@ spec:
       expression: 'has(variables.pod.securityContext) ? variables.pod.securityContext : dyn({})'
     - name: sc
       expression: 'has(variables.container.securityContext) ? variables.container.securityContext : dyn({})'
+    # The annotation keys of gateway.admittedAnnotations, admitted at all times (spec 7.10).
+    - name: admitted
+      expression: "[{{ join ", " $admittedKeys }}]"
   validations:
     # All three kinds.
     - expression: >-
@@ -126,6 +150,19 @@ spec:
         && variables.labels['app.kubernetes.io/managed-by'] == 'mimic'
         && 'mimic.platform.io/gateway' in variables.labels
       message: "gateway objects: metadata.labels must hold app.kubernetes.io/managed-by mimic and mimic.platform.io/gateway (spec 7.10)"
+    # #575: key allowlists and exact sets, so that a field nobody listed (a later Kubernetes one too) is refused.
+    - expression: >-
+        variables.isDelete || (size(variables.labels) == 5
+        && variables.labels.all(k, k in ['app.kubernetes.io/managed-by', 'app.kubernetes.io/name', 'gateway.networking.k8s.io/gateway-class-name', 'gateway.networking.k8s.io/gateway-name', 'mimic.platform.io/gateway'])
+        && variables.labels['app.kubernetes.io/name'] == 'mimic-gateway')
+      message: "gateway objects: metadata.labels must be exactly app.kubernetes.io/managed-by, app.kubernetes.io/name mimic-gateway, gateway.networking.k8s.io/gateway-class-name, gateway.networking.k8s.io/gateway-name and mimic.platform.io/gateway"
+    - expression: 'variables.isDelete || !has(variables.target.metadata.finalizers) || size(variables.target.metadata.finalizers) == 0'
+      message: "gateway objects: metadata.finalizers must be absent"
+    - expression: >-
+        variables.isDelete || !has(object.metadata.annotations) || object.metadata.annotations.all(k, k in variables.admitted
+        || (request.operation == 'UPDATE' && has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations
+        && oldObject.metadata.annotations[k] == object.metadata.annotations[k]))
+      message: "gateway objects: metadata.annotations must hold no key on CREATE, and on UPDATE only the keys and values already in the cluster, besides gateway.admittedAnnotations"
     - expression: >-
         variables.isDelete || request.namespace in {{ $nsList }}
       message: "gateway objects: the namespace must be one of gateway.namespaces (spec 7.10)"
@@ -154,8 +191,67 @@ spec:
       message: "gateway objects: metadata.ownerReferences must be the one Gateway named by mimic.platform.io/gateway, controller true, blockOwnerDeletion absent or false"
     # Deployments.
     - expression: >-
+        {{ $dp }}object.spec.all(k, k in ['replicas', 'selector', 'strategy', 'template', 'revisionHistoryLimit', 'progressDeadlineSeconds'])
+        && (!has(object.spec.revisionHistoryLimit) || object.spec.revisionHistoryLimit == 10)
+        && (!has(object.spec.progressDeadlineSeconds) || object.spec.progressDeadlineSeconds == 600))
+      message: "gateway deployment: spec keys must be replicas, selector, strategy, template, and revisionHistoryLimit 10 and progressDeadlineSeconds 600 at their defaults"
+    - expression: >-
         {{ $dp }}object.spec.selector == {'matchLabels': {'mimic.platform.io/gateway': variables.v}})
       message: "gateway deployment: spec.selector must be matchLabels mimic.platform.io/gateway only"
+    # The API server serialises the empty creationTimestamp of a template as null.
+    - expression: >-
+        {{ $dp }}object.spec.template.metadata.all(k, k in ['labels', 'annotations']
+        || (k == 'creationTimestamp' && dyn(object.spec.template.metadata.creationTimestamp) == null)))
+      message: "gateway deployment: spec.template.metadata keys must be labels and annotations only"
+    - expression: >-
+        {{ $dp }}has(object.spec.template.metadata.labels) && size(object.spec.template.metadata.labels) == 3
+        && object.spec.template.metadata.labels.all(k, k in ['app.kubernetes.io/name', 'mimic.platform.io/gateway', 'mimic.platform.io/inject'])
+        && object.spec.template.metadata.labels['app.kubernetes.io/name'] == 'mimic-gateway')
+      message: "gateway deployment: spec.template.metadata.labels must be exactly app.kubernetes.io/name mimic-gateway, mimic.platform.io/gateway and mimic.platform.io/inject"
+    - expression: >-
+        {{ $dp }}!has(object.spec.template.metadata.annotations) || object.spec.template.metadata.annotations.all(k, k in variables.admitted
+        || (request.operation == 'UPDATE' && has(oldObject.spec.template.metadata.annotations) && k in oldObject.spec.template.metadata.annotations
+        && oldObject.spec.template.metadata.annotations[k] == object.spec.template.metadata.annotations[k])))
+      message: "gateway deployment: spec.template.metadata.annotations must hold no key on CREATE, and on UPDATE only the keys and values already in the cluster, besides gateway.admittedAnnotations"
+    - expression: >-
+        {{ $dp }}variables.pod.all(k, k in ['containers', 'automountServiceAccountToken', 'enableServiceLinks', 'securityContext', 'topologySpreadConstraints', 'dnsPolicy', 'restartPolicy', 'terminationGracePeriodSeconds', 'schedulerName'])
+        && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')
+        && (!has(variables.pod.restartPolicy) || variables.pod.restartPolicy == 'Always')
+        && (!has(variables.pod.terminationGracePeriodSeconds) || variables.pod.terminationGracePeriodSeconds == 30))
+      message: "gateway deployment: pod spec keys must be containers, automountServiceAccountToken, enableServiceLinks, securityContext, topologySpreadConstraints, and dnsPolicy ClusterFirst, restartPolicy Always, terminationGracePeriodSeconds 30 and schedulerName at their defaults"
+    - expression: >-
+        {{ $dp }}has(variables.pod.topologySpreadConstraints) && variables.pod.topologySpreadConstraints == [{'labelSelector': dyn({'matchLabels': {'mimic.platform.io/gateway': variables.v}}),
+        'maxSkew': dyn(1), 'topologyKey': dyn('kubernetes.io/hostname'), 'whenUnsatisfiable': dyn('ScheduleAnyway')}])
+      message: "gateway deployment: topologySpreadConstraints must be exactly the spread of the gateway pods over kubernetes.io/hostname (spec 7.10)"
+    - expression: >-
+        {{ $dc }}variables.container.all(k, k in ['name', 'image', 'command', 'env', 'ports', 'readinessProbe', 'livenessProbe', 'resources', 'securityContext', 'imagePullPolicy', 'terminationMessagePath', 'terminationMessagePolicy'])
+        && variables.container.name == 'gateway'
+        && (!has(variables.container.imagePullPolicy) || variables.container.imagePullPolicy == 'IfNotPresent')
+        && (!has(variables.container.terminationMessagePath) || variables.container.terminationMessagePath == '/dev/termination-log')
+        && (!has(variables.container.terminationMessagePolicy) || variables.container.terminationMessagePolicy == 'File'))
+      message: "gateway deployment: container keys must be name gateway, image, command, env, ports, readinessProbe, livenessProbe, resources, securityContext, and imagePullPolicy, terminationMessagePath and terminationMessagePolicy at their defaults"
+    - expression: >-
+        {{ $dc }}has(variables.container.env) && size(variables.container.env) == 4
+        && ['MIMIC_GATEWAY_PORTS', 'MIMIC_LOG', 'MIMIC_MAX_CONNECTIONS', 'MIMIC_ROLE'].all(n, variables.container.env.exists(e, e.name == n))
+        && variables.container.env.all(e, e.all(k, k in ['name', 'value'])))
+      message: "gateway deployment: env names must be exactly MIMIC_GATEWAY_PORTS, MIMIC_LOG, MIMIC_MAX_CONNECTIONS and MIMIC_ROLE, each with a literal value"
+    - expression: >-
+        {{ $dc }}has(variables.container.env)
+        && variables.container.env.exists(e, e.name == 'MIMIC_MAX_CONNECTIONS' && has(e.value) && e.value == '{{ $maxConnections }}'))
+      message: "gateway deployment: env MIMIC_MAX_CONNECTIONS must be gateway.maxConnections"
+    - expression: >-
+        {{ $dc }}!has(variables.container.ports) || variables.container.ports.all(p, p.all(k, k in ['containerPort', 'name', 'protocol'])
+        && (!has(p.protocol) || p.protocol == 'TCP')))
+      message: "gateway deployment: container port keys must be containerPort, name and protocol TCP"
+{{- range $probe := list "readinessProbe" "livenessProbe" }}
+    - expression: >-
+        {{ $dc }}!has(variables.container.{{ $probe }}) || (
+        variables.container.{{ $probe }}.all(k, k in ['httpGet', 'initialDelaySeconds', 'timeoutSeconds', 'periodSeconds', 'successThreshold', 'failureThreshold', 'terminationGracePeriodSeconds'])
+        && has(variables.container.{{ $probe }}.httpGet)
+        && variables.container.{{ $probe }}.httpGet.all(k, k in ['path', 'port', 'scheme'])
+        && (!has(variables.container.{{ $probe }}.httpGet.scheme) || variables.container.{{ $probe }}.httpGet.scheme == 'HTTP')))
+      message: "gateway deployment: {{ $probe }} keys must be httpGet with path, port and scheme HTTP, and the timing keys"
+{{- end }}
     - expression: >-
         {{ $dp }}has(object.spec.template.metadata.labels)
         && 'mimic.platform.io/gateway' in object.spec.template.metadata.labels
@@ -177,10 +273,6 @@ spec:
       message: "gateway deployment: command must be [/usr/local/bin/mimic-sidecar]"
     - expression: '{{ $dc }}!has(variables.container.args))'
       message: "gateway deployment: args must be absent"
-    - expression: >-
-        {{ $dc }}has(variables.container.env)
-        && variables.container.env.all(e, e.name in ['MIMIC_ROLE', 'MIMIC_GATEWAY_PORTS', 'MIMIC_LOG']))
-      message: "gateway deployment: env names must be MIMIC_ROLE, MIMIC_GATEWAY_PORTS and MIMIC_LOG only"
     - expression: '{{ $dc }}has(variables.container.env) && variables.container.env.all(e, !has(e.valueFrom)))'
       message: "gateway deployment: env must hold literal values, no valueFrom"
     - expression: >-
@@ -260,20 +352,44 @@ spec:
         {{ $dc }}has(variables.psc.sysctls) && variables.psc.sysctls == {{ $sysctls }})
       message: "gateway deployment: the pod securityContext sysctls must be net.ipv4.ip_unprivileged_port_start 0 only"
     - expression: >-
-        {{ $dc }}variables.psc == {'runAsNonRoot': true, 'runAsUser': 65532, 'runAsGroup': 65532,
-        'seccompProfile': {'type': 'RuntimeDefault'}, 'sysctls': {{ $sysctls }}})
+        {{ $dc }}variables.psc == {'runAsNonRoot': dyn(true), 'runAsUser': dyn(65532), 'runAsGroup': dyn(65532),
+        'seccompProfile': dyn({'type': 'RuntimeDefault'}), 'sysctls': dyn({{ $sysctls }})})
       message: "gateway deployment: the pod securityContext must be exactly runAsNonRoot, runAsUser 65532, runAsGroup 65532, seccompProfile RuntimeDefault and the one sysctl (spec 7.10)"
     - expression: >-
         {{ $dc }}has(variables.sc.capabilities) && variables.sc.capabilities == {'drop': ['ALL']})
       message: "gateway deployment: capabilities must be exactly drop ALL"
     - expression: >-
-        {{ $dc }}variables.sc == {'allowPrivilegeEscalation': false, 'readOnlyRootFilesystem': true,
-        'capabilities': {'drop': ['ALL']}})
+        {{ $dc }}variables.sc == {'allowPrivilegeEscalation': dyn(false), 'readOnlyRootFilesystem': dyn(true),
+        'capabilities': dyn({'drop': ['ALL']})})
       message: "gateway deployment: the container securityContext must be exactly allowPrivilegeEscalation false, readOnlyRootFilesystem true and capabilities drop ALL (spec 7.10)"
     - expression: >-
         {{ $dc }}has(variables.container.resources) && variables.container.resources == {{ toJson .Values.gateway.resources }})
       message: "gateway deployment: resources must be those of gateway.resources"
     # Services.
+{{- $serviceKeys := list "'type'" "'selector'" "'ports'" "'sessionAffinity'" "'internalTrafficPolicy'" }}
+{{- if has .Values.gateway.serviceType (list "NodePort" "LoadBalancer") }}
+{{- $serviceKeys = append $serviceKeys "'externalTrafficPolicy'" }}
+{{- end }}
+{{- if eq .Values.gateway.serviceType "LoadBalancer" }}
+{{- $serviceKeys = append $serviceKeys "'allocateLoadBalancerNodePorts'" }}
+{{- end }}
+{{- $serviceKeys = concat $serviceKeys (list "'clusterIP'" "'clusterIPs'" "'ipFamilies'" "'ipFamilyPolicy'") }}
+    - expression: >-
+        !variables.isService || (object.spec.all(k, k in [{{ join ", " $serviceKeys }}])
+        && (!has(object.spec.allocateLoadBalancerNodePorts) || object.spec.allocateLoadBalancerNodePorts == true))
+      message: "gateway service: spec keys must be type, selector, ports, the defaults sessionAffinity, internalTrafficPolicy, externalTrafficPolicy and allocateLoadBalancerNodePorts of the type, and the addresses"
+    - expression: >-
+        !variables.isService || request.operation == 'CREATE' || (
+        (has(object.spec.clusterIP) ? object.spec.clusterIP : '') == (has(oldObject.spec.clusterIP) ? oldObject.spec.clusterIP : '')
+        && (has(object.spec.clusterIPs) ? object.spec.clusterIPs : dyn([])) == (has(oldObject.spec.clusterIPs) ? oldObject.spec.clusterIPs : dyn([])))
+      message: "gateway service: clusterIP and clusterIPs must not change on UPDATE"
+    - expression: >-
+        !variables.isService || !has(object.spec.ports) || object.spec.ports.all(p, p.all(k, k in ['name', 'port', 'targetPort', 'protocol', 'nodePort']))
+      message: "gateway service: port keys must be name, port, targetPort, protocol and nodePort"
+    - expression: >-
+        !variables.isService || request.operation == 'CREATE' || !has(object.spec.ports) || !has(oldObject.spec.ports)
+        || object.spec.ports.all(p, !has(p.nodePort) || oldObject.spec.ports.all(o, o.port != p.port || !has(o.nodePort) || o.nodePort == p.nodePort))
+      message: "gateway service: nodePort must not change on UPDATE"
     - expression: "!variables.isService || (has(object.spec.type) ? object.spec.type : 'ClusterIP') == '{{ .Values.gateway.serviceType }}'"
       message: "gateway service: spec.type must be gateway.serviceType"
     - expression: >-
@@ -303,6 +419,8 @@ spec:
     - expression: '!variables.isService || !has(object.spec.publishNotReadyAddresses) || object.spec.publishNotReadyAddresses == false'
       message: "gateway service: publishNotReadyAddresses must be absent or false"
     # PodDisruptionBudgets.
+    - expression: "!variables.isPdb || object.spec.all(k, k in ['selector', 'maxUnavailable'])"
+      message: "gateway poddisruptionbudget: spec keys must be selector and maxUnavailable only"
     - expression: >-
         !variables.isPdb || (has(object.spec.selector)
         && object.spec.selector == {'matchLabels': {'mimic.platform.io/gateway': variables.v}})

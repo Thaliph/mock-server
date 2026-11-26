@@ -181,7 +181,7 @@ fn gw_07_a_refused_gateway_has_no_object() {
     g.listeners = vec![listener("tcp", "TCP", 9000)];
     assert_eq!(build(&g, &settings()), None);
     let mut g = fixture();
-    g.namespace = "other".into();
+    g.has_tls = true;
     assert_eq!(build(&g, &settings()), None);
 }
 

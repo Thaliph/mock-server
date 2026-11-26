@@ -161,12 +161,32 @@ Deployments, Services and PodDisruptionBudgets. It admits only:
 - a `DELETE` of an object with the labels `app.kubernetes.io/managed-by: mimic` and `mimic.platform.io/gateway`;
 - a `CREATE` or an `UPDATE` in a namespace of `gateway.namespaces`, of an object with those labels and one owner
   reference to the Gateway that the label names; an `UPDATE` only of an object that had those labels before;
+- objects whose labels are exactly the five labels of the generated objects, with no finalizer;
 - a Deployment of the fixed gateway shape: one container, the image of the chart by digest, the fixed `command`
-  and no `args`, the three `env` names with literal values, no volume, no host access, the exact security contexts,
-  replicas from 1 to `gateway.maxReplicas`, `resources` equal to `gateway.resources`;
+  and no `args`, exactly the four `env` names with literal values (`MIMIC_MAX_CONNECTIONS` equal to
+  `gateway.maxConnections`), no volume, no host access, the exact security contexts, replicas from 1 to
+  `gateway.maxReplicas`, `resources` equal to `gateway.resources`, and pod labels that are exactly
+  `app.kubernetes.io/name`, `mimic.platform.io/gateway` and `mimic.platform.io/inject: disabled`;
 - a Service of the type `gateway.serviceType`, with the gateway selector, no port 15100 and no `externalIPs`,
-  `externalName`, `loadBalancerIP`, `loadBalancerSourceRanges` or `loadBalancerClass`;
+  `externalName`, `loadBalancerIP`, `loadBalancerSourceRanges`, `loadBalancerClass` or `healthCheckNodePort`;
 - a PodDisruptionBudget with the gateway selector and `maxUnavailable: 1`.
+
+The policy checks these shapes by **key allowlists**: the Deployment `spec`, the pod `spec`, the container, its
+ports and probes, the Service `spec` and its ports, and the PodDisruptionBudget `spec` may hold only the keys that
+the controller writes, plus the keys that the API server sets by default, at their default values. So the policy
+also refuses `nodeSelector`, `dnsConfig`, `imagePullSecrets`, `resourceClaims`, `schedulingGates` and every field that
+a later Kubernetes version adds.
+
+**Annotations.** On `CREATE` the policy admits no annotation, on the objects and on the pod template. On `UPDATE`
+the controller cannot add or change an annotation key of the object in the cluster: other writers can (the
+Deployment controller, `kubectl rollout restart`). If a mutating webhook of your platform annotates the gateway
+objects (for example GKE's `cloud.google.com/neg`), list its keys in `gateway.admittedAnnotations`. Otherwise the
+policy refuses the controller's `CREATE`, and the Gateway stays `Programmed: False` with `gateway reconcile failed`
+in the log.
+
+**Service addresses.** The API server allocates `clusterIP`, `clusterIPs` and `nodePort` before the policy runs, so
+the policy admits any value on `CREATE`: a stolen controller token can choose a free cluster IP or node port when it
+creates a gateway Service. An `UPDATE` cannot change them.
 
 Each refusal message names the refused field. The full list is in section 7.10 of
 [the spec](https://github.com/Thaliph/mock-server/blob/main/docs/SPEC.md#710-the-mimic-gateway-m6).
@@ -179,8 +199,19 @@ real Gateway. A stolen controller token can still do these things in the listed 
 - change the ports of a gateway, or delete the gateway objects (a denial of service of the gateways);
 - write the status of any Gateway or GatewayClass.
 
-It cannot run another image or command, mount a volume, use the host or add a capability. It cannot take over or
-delete an object without the labels of mimic, or select pods other than those labelled `mimic.platform.io/gateway`.
+It cannot run another image or command, mount a volume, use the host or add a capability. It cannot add a pod
+label or an annotation, pin the pods to nodes, or change their DNS. It cannot take over or delete an object without
+the labels of mimic, or select pods other than those labelled `mimic.platform.io/gateway`.
+
+**Gateways that mimic does not serve.** The controller watches `gateways` in all namespaces, so any namespace can
+send it Gateway events. For a Gateway of another class, or in a namespace that is not listed, it keeps only the
+namespace, the name and the class, and does no work: no status, no request. A change of such a Gateway that keeps
+its class starts no reconcile.
+
+**Connections.** Each gateway pod serves at most `gateway.maxConnections` connections, sized so that the pod stays
+inside its memory limit ([the memory rule](Gateway#the-memory-rule)). The cap counts all clients together: a client
+with many source addresses can fill it and delay other clients. Per-source limits belong to a load balancer or a
+WAF in front of the gateway.
 
 **The gateway pod.** It runs as UID and GID 65532, with `runAsNonRoot`, `RuntimeDefault` seccomp, a read-only root
 filesystem and all capabilities dropped. It has no service account token (`automountServiceAccountToken: false`), no

@@ -182,13 +182,10 @@ async fn gw_15_a_new_mimic_class_lists_the_gateways_again() {
         scripted(&seen, move |uri| {
             let watching = uri.query().unwrap_or("").contains("watch=true");
             match uri.path() {
-                CLASSES if watching => watch_then(
-                    &fire,
-                    json!({"type": "ADDED", "object": mimic_class()}),
-                ),
-                GATEWAYS | DEPLOYMENTS | SERVICES if watching => {
-                    watch_until_gone(&present, true)
+                CLASSES if watching => {
+                    watch_then(&fire, json!({"type": "ADDED", "object": mimic_class()}))
                 }
+                GATEWAYS | DEPLOYMENTS | SERVICES if watching => watch_until_gone(&present, true),
                 CLASSES => reply(
                     200,
                     &list("gateway.networking.k8s.io/v1", "GatewayClass", vec![]),

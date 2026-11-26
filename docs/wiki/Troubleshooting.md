@@ -315,13 +315,17 @@ kubectl -n <ns> get gateway <name> -o json | jq '.status.conditions, [.status.li
 ```
 
 **`helm install` or `helm upgrade` fails with `gateway.enabled`.** The message names the missing requirement:
-`mesh.enabled: true`, `image.digest`, a non-empty `gateway.namespaces`, or the Gateway API CRDs. Install the CRDs
+`mesh.enabled: true`, `image.digest`, a non-empty `gateway.namespaces`, the Gateway API CRDs, `limits.memory` in
+`gateway.resources`, or a `gateway.maxConnections` that does not fit that limit
+([the memory rule](Gateway#the-memory-rule)). Install the CRDs
 before the chart ([Install](Install#gateway-api-optional)). Each namespace of `gateway.namespaces` must exist
 before the install, because the chart renders a RoleBinding in it.
 
-**A Gateway has `Accepted: False`, reason `NamespaceNotAllowed`.** Its namespace is not in `gateway.namespaces`, so
-the controller creates no object for it. Add the namespace to `gateway.namespaces` with `helm upgrade`, or create
-the Gateway in a listed namespace.
+**A Gateway with no status: its namespace is not listed.** A Gateway of class `mimic` (or of another class with
+mimic's `controllerName`) whose namespace is not in `gateway.namespaces` gets no condition and no object: mimic
+does not serve it, so it does not write to it. Add the namespace to `gateway.namespaces` with `helm upgrade`, or
+create the Gateway in a listed namespace. If the namespace is listed, check that the GatewayClass has
+`Accepted: True` and that the controller logs no `gateway watch error`.
 
 **A Gateway or a listener has `Accepted: False`, reason `UnsupportedValue`.** The message names the first field
 that mimic does not support, as `unsupported: <field path>`. For an annotation it names the key, never the value.
@@ -346,7 +350,9 @@ after 1 s, then doubles the wait up to 30 s, and logs one WARN per Gateway and s
 
 - `422` `Invalid`: the admission policy `<release>-gateway` refused the apply. During a chart upgrade, an old
   controller replica applies the old image digest until it is replaced: wait for the rollout. A namespace user who
-  added a container to a generated object also makes the apply fail.
+  added a container to a generated object also makes the apply fail. A mutating webhook of the platform that
+  annotates the gateway objects makes every `CREATE` fail: list its annotation keys in
+  `gateway.admittedAnnotations`.
 
 **A Gateway stays `Programmed: False`, reason `Pending` (`<a> of <r> replicas available`).** The gateway Deployment
 is missing, is rolling, or has no available replica. Look at the Deployment and its pods:

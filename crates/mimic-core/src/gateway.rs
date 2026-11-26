@@ -49,6 +49,11 @@ pub const ADMIN_PORT_NAME: &str = "mimic-admin";
 pub const UID: i64 = 65532;
 /// Most `status.addresses` entries written.
 pub const MAX_ADDRESSES: usize = 16;
+/// The memory budget of the gateway role (§7.10): what one held connection uses at most, and the
+/// process without any. `MIMIC_GATEWAY_MAX_CONNECTIONS` × the first + the second must fit the
+/// memory limit of the gateway container.
+pub const MEMORY_PER_CONNECTION: u64 = 96 * 1024;
+pub const MEMORY_BASE: u64 = 32 * 1024 * 1024;
 /// `apiVersion` of `Gateway` and `GatewayClass`.
 pub const GATEWAY_API_VERSION: &str = "gateway.networking.k8s.io/v1";
 
@@ -91,4 +96,6 @@ pub struct Settings {
     pub log: String,
     /// `MIMIC_GATEWAY_RESOURCES`, a JSON `resources` object.
     pub resources: Value,
+    /// `MIMIC_GATEWAY_MAX_CONNECTIONS`: the `MIMIC_MAX_CONNECTIONS` of the gateway pods.
+    pub max_connections: u32,
 }

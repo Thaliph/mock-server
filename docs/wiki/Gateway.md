@@ -44,7 +44,9 @@ helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version <version> -n mim
 | `gateway.namespaces` | `[]` | Namespaces whose Gateways get objects (`MIMIC_GATEWAY_NAMESPACES`). Each must exist at install. |
 | `gateway.serviceType` | `ClusterIP` | `type` of every gateway Service: `ClusterIP`, `NodePort` or `LoadBalancer` (`MIMIC_GATEWAY_SERVICE_TYPE`). |
 | `gateway.maxReplicas` | `10` | Highest replica count that a Gateway can ask for (`MIMIC_GATEWAY_MAX_REPLICAS`), 1 to 100. |
-| `gateway.resources` | requests `100m` / `64Mi`; limit memory `128Mi` | `resources` of the gateway container (`MIMIC_GATEWAY_RESOURCES`). |
+| `gateway.maxConnections` | `1024` | Connections that one gateway pod serves at once (`MIMIC_GATEWAY_MAX_CONNECTIONS`, given to the pod as `MIMIC_MAX_CONNECTIONS`). It must fit the memory limit: see [the memory rule](#the-memory-rule). |
+| `gateway.admittedAnnotations` | `[]` | Annotation keys that a mutating webhook of your platform adds to the gateway objects, for example `cloud.google.com/neg`. The admission policy admits these keys. The controller never writes them. |
+| `gateway.resources` | requests `100m` / `128Mi`; limit memory `192Mi` | `resources` of the gateway container (`MIMIC_GATEWAY_RESOURCES`). It must have `limits.memory`. |
 
 With `gateway.enabled: false` the chart renders none of these objects. The controller then watches no Gateway API
 object other than those of the mesh (`HTTPRoute`, `ReferenceGrant`).
@@ -196,14 +198,16 @@ The controller writes no `SupportedVersion` condition and no `supportedFeatures`
 
 | # | When | `Accepted` | Reason | Message |
 |---|---|---|---|---|
-| 1 | The namespace is not in `gateway.namespaces` | `False` | `NamespaceNotAllowed` | `namespace <ns> is not in gateway.namespaces` |
-| 2 | The class has `Accepted: False` | `False` | `InvalidParameters` | `GatewayClass <name> is not accepted` |
-| 3 | A field that mimic does not support ([What is refused](#what-is-refused-and-why)) | `False` | `UnsupportedValue` | `unsupported: <field path>`, the first in document order |
-| 4 | `spec.addresses` is not empty | `False` | `UnsupportedAddress` | `spec.addresses is not supported` |
-| 5 | `spec.infrastructure.parametersRef`, or a replicas value that is not valid | `False` | `InvalidParameters` | the field, and `must be 1 to <max>` for the replicas |
-| 6 | No listener is accepted | `False` | `ListenersNotValid` | `no valid listener` |
-| 7 | Some listeners are not accepted | `True` | `ListenersNotValid` | the names of those listeners |
-| 8 | Else | `True` | `Accepted` | |
+| 1 | The class has `Accepted: False` | `False` | `InvalidParameters` | `GatewayClass <name> is not accepted` |
+| 2 | A field that mimic does not support ([What is refused](#what-is-refused-and-why)) | `False` | `UnsupportedValue` | `unsupported: <field path>`, the first in document order |
+| 3 | `spec.addresses` is not empty | `False` | `UnsupportedAddress` | `spec.addresses is not supported` |
+| 4 | `spec.infrastructure.parametersRef`, or a replicas value that is not valid | `False` | `InvalidParameters` | the field, and `must be 1 to <max>` for the replicas |
+| 5 | No listener is accepted | `False` | `ListenersNotValid` | `no valid listener` |
+| 6 | Some listeners are not accepted | `True` | `ListenersNotValid` | the names of those listeners |
+| 7 | Else | `True` | `Accepted` | |
+
+A Gateway of a mimic class in a namespace that is not in `gateway.namespaces` gets no condition, no status and no
+object. mimic does not serve it, so it does not write to it.
 
 **Gateway `Programmed`.** The first row that applies gives the condition:
 
@@ -229,8 +233,8 @@ The controller writes no `SupportedVersion` condition and no `supportedFeatures`
 
 **What the messages hold.** A status message holds only field paths, annotation keys and identifiers that the API
 server validated and bounded (names, kinds, protocols, ports, replica counts). It never holds a hostname, an
-annotation value or another `spec` value. Messages are cut to 1024 bytes. A Gateway of a mimic class in any
-namespace gets a status, also with `NamespaceNotAllowed`.
+annotation value or another `spec` value. Messages are cut to 1024 bytes. Only a Gateway of a mimic class in a
+namespace of `gateway.namespaces` gets a status.
 
 ## What is refused, and why
 
@@ -239,7 +243,7 @@ accepted has no objects.
 
 | Field | Result | Why |
 |---|---|---|
-| A namespace not in `gateway.namespaces` | Gateway `NamespaceNotAllowed` | The cluster admin opts namespaces in. The controller has RBAC only there. |
+| A namespace not in `gateway.namespaces` | No status and no object | The cluster admin opts namespaces in. The controller has RBAC only there, and it keeps only the namespace, name and class of such a Gateway. |
 | A name longer than 63 characters | Gateway `UnsupportedValue` | It does not fit the label values of the generated objects. |
 | A `spec` larger than 64 KiB | Gateway `UnsupportedValue` | The controller keeps only the key, generation and class of such a Gateway. |
 | A field that the controller does not know, at any level of `spec` | Gateway or listener `UnsupportedValue` | mimic cannot apply a field that it does not know. The controller keeps only its path. |
@@ -266,14 +270,32 @@ The listeners face clients that mimic does not trust, so they have bounds:
 
 | Bound | Value |
 |---|---|
-| Connections over all listeners | `MIMIC_MAX_CONNECTIONS` (default 16384); the gateway closes the next ones at accept |
-| Time for a request head | `MIMIC_GATEWAY_HEADER_TIMEOUT` (default `10s`) |
+| Connections over all listeners | `MIMIC_MAX_CONNECTIONS`, which the controller sets from `gateway.maxConnections` (default 1024); the gateway closes the next ones at accept |
+| Time for a request head | `MIMIC_GATEWAY_HEADER_TIMEOUT` (default `10s`), from the accept and again after each answer, for HTTP/1 and HTTP/2. An HTTP/2 connection that sends no `HEADERS` is closed at this timeout. |
 | Size of a request head | 64 KiB, else `431` or the connection is closed |
-| Idle keep-alive connection | closed after `MIMIC_GATEWAY_IDLE_TIMEOUT` (default `60s`) |
-| HTTP/2 | 100 concurrent streams and a 64 KiB header list per connection, with the reset-flood limits of `hyper` |
+| Idle keep-alive connection | closed after `MIMIC_GATEWAY_IDLE_TIMEOUT` (default `60s`), once the connection has had its first answer |
+| HTTP/2 | 100 concurrent streams, a 64 KiB header list, connection and stream windows of 64 KiB, and the reset-flood limits of `hyper` |
 
-The controller sets only `MIMIC_ROLE`, `MIMIC_GATEWAY_PORTS` and `MIMIC_LOG`, so the gateway pods use the defaults of
-the other variables.
+The controller sets only `MIMIC_ROLE`, `MIMIC_GATEWAY_PORTS`, `MIMIC_LOG` and `MIMIC_MAX_CONNECTIONS`, so the gateway
+pods use the defaults of the other variables.
+
+### The memory rule
+
+One held connection uses at most 96 KiB of the gateway's memory, in the worst case: a 63 KiB request head without
+its end, or an HTTP/2 stream with 64 KiB of unread data. The process itself uses at most 32 MiB. So
+`gateway.maxConnections` × 96 KiB + 32 MiB must fit `gateway.resources.limits.memory`:
+
+| `limits.memory` | Highest `gateway.maxConnections` |
+|---|---|
+| `128Mi` | 1024 |
+| `192Mi` (default) | 1706 |
+| `256Mi` | 2389 |
+| `512Mi` | 5120 |
+
+The chart fails when the cap does not fit, or when `gateway.resources` has no `limits.memory`. The controller
+checks the same rule on `MIMIC_GATEWAY_MAX_CONNECTIONS` and exits 2. The cap counts every client together: a
+client with many source addresses can fill it. Per-source limits belong to a load balancer or a WAF in front of
+the gateway.
 
 `/readyz` on port 15100 answers `200` when every listener is bound. On `SIGTERM`, `/readyz` answers `503`, the
 listeners accept no new connection, and the gateway drains the open connections within `MIMIC_SHUTDOWN_GRACE`. The gateway pod

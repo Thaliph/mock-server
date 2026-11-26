@@ -176,7 +176,7 @@ namespace, a hostname or another `spec` value.
 | Metric (controller) | Type | Labels |
 |---|---|---|
 | `mimic_gateway_reconciles_total` | counter, reconciles of the Gateways of a mimic class | `result`: `ok` (the objects and the status are correct, after writes or with none), `invalid` (the Gateway is not accepted, so it has no object), `conflict` (an object of the generated name is not managed), `error` (a request failed) |
-| `mimic_gateway_gateways` | gauge, the Gateways of a mimic class at the last pass | `state` (`programmed`, `pending`, `not_accepted`) |
+| `mimic_gateway_gateways` | gauge, the Gateways of a mimic class in the listed namespaces at the last pass | `state` (`programmed`, `pending`, `not_accepted`) |
 
 The controller probes the `gateways` CRD as it probes the `HTTPRoute` CRD. While the CRD is absent,
 `mimic_mesh_gateway_api_present` is 0 and the controller applies, writes and deletes nothing for the gateways.

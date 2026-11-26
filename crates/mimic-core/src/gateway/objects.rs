@@ -145,6 +145,7 @@ pub fn objects(gw: &Gateway, acceptance: &Acceptance, settings: &Settings) -> Op
                         "env": [
                             {"name": "MIMIC_GATEWAY_PORTS", "value": ports_env},
                             {"name": "MIMIC_LOG", "value": literal(&settings.log)},
+                            {"name": "MIMIC_MAX_CONNECTIONS", "value": settings.max_connections.to_string()},
                             {"name": "MIMIC_ROLE", "value": "gateway"},
                         ],
                         "image": settings.image,

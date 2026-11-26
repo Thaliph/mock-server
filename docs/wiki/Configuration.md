@@ -74,7 +74,9 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `gateway.namespaces` | `[]` | Namespaces whose Gateways get objects. Each must exist at install (the chart renders a RoleBinding in it). `MIMIC_GATEWAY_NAMESPACES`, sorted. |
 | `gateway.serviceType` | `ClusterIP` | `ClusterIP`, `NodePort` or `LoadBalancer`. `MIMIC_GATEWAY_SERVICE_TYPE`. |
 | `gateway.maxReplicas` | `10` | 1-100. `MIMIC_GATEWAY_MAX_REPLICAS`. |
-| `gateway.resources` | requests `100m` / `64Mi`; limit memory `128Mi` | Resources of the gateway container. `MIMIC_GATEWAY_RESOURCES`. |
+| `gateway.maxConnections` | `1024` | Connections of one gateway pod (`MIMIC_GATEWAY_MAX_CONNECTIONS`). × 96 KiB + 32 MiB must fit `gateway.resources.limits.memory` ([the memory rule](Gateway#the-memory-rule)). |
+| `gateway.admittedAnnotations` | `[]` | Annotation keys that a platform webhook adds to the gateway objects; the admission policy admits them. |
+| `gateway.resources` | requests `100m` / `128Mi`; limit memory `192Mi` | Resources of the gateway container, with `limits.memory`. `MIMIC_GATEWAY_RESOURCES`. |
 | `inject.initImage.repository` | `ghcr.io/thaliph/mimic-init` | |
 | `inject.initImage.tag` / `.digest` | `""` / `""` | Tag defaults to the appVersion; digest wins. |
 | `inject.sidecarResources` | requests `50m` / `64Mi`; limit memory `128Mi` | Resources of `mimic-sidecar` in injected pods (JSON in `MIMIC_INJECT_SIDECAR_RESOURCES`). |
@@ -165,7 +167,8 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_GATEWAY_NAMESPACES` | empty | Namespaces whose Gateways of a mimic class get objects ([Gateway](Gateway)): comma-separated DNS-1123 labels, at most 256, distinct. Empty: no Gateway, GatewayClass, labelled Deployment or Service is watched. Set with `MIMIC_MESH=off`: exit 2 (chart: `gateway.namespaces`). |
 | `MIMIC_GATEWAY_SERVICE_TYPE` | `ClusterIP` | `type` of the gateway Services: `ClusterIP`, `NodePort` or `LoadBalancer` (chart: `gateway.serviceType`). |
 | `MIMIC_GATEWAY_MAX_REPLICAS` | `10` | Highest `mimic.platform.io/replicas` accepted, 1-100 (chart: `gateway.maxReplicas`). |
-| `MIMIC_GATEWAY_RESOURCES` | `{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | Gateway container `resources`, JSON (chart: `gateway.resources`). The gateway image is `MIMIC_INJECT_SIDECAR_IMAGE` and its `MIMIC_LOG` is `MIMIC_INJECT_SIDECAR_LOG`. |
+| `MIMIC_GATEWAY_MAX_CONNECTIONS` | `1024` | `MIMIC_MAX_CONNECTIONS` of the gateway pods, 1-1000000 (chart: `gateway.maxConnections`). Exits 2 when `MIMIC_GATEWAY_RESOURCES` has no memory limit, or when this × 96 KiB + 32 MiB is more than that limit. |
+| `MIMIC_GATEWAY_RESOURCES` | `{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"memory":"192Mi"}}` | Gateway container `resources`, JSON (chart: `gateway.resources`). The gateway image is `MIMIC_INJECT_SIDECAR_IMAGE` and its `MIMIC_LOG` is `MIMIC_INJECT_SIDECAR_LOG`. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API; plain HTTP, loopback peers only. |
 
 ### Sidecar
@@ -215,8 +218,8 @@ Set by the webhook; the defaults are what it sets unless noted.
 ### Gateway role
 
 The gateway Deployment sets `MIMIC_ROLE=gateway` ([Gateway](Gateway#the-gateway-pod)). In this role the sidecar
-variables above are ignored and none is required, except `MIMIC_MAX_CONNECTIONS` (over all listeners). The common
-variables apply.
+variables above are ignored and none is required, except `MIMIC_MAX_CONNECTIONS` (over all listeners), which the
+controller sets from `gateway.maxConnections`. The common variables apply.
 
 | Variable | Default | Meaning |
 |---|---|---|

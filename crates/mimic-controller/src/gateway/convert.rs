@@ -46,8 +46,63 @@ fn set(value: &Value, field: &str) -> bool {
     value.get(field).is_some_and(|v| !v.is_null())
 }
 
-/// A Gateway of any class (a class can become a mimic one later); `None` without a namespace
-/// or a name.
+/// What the reconciler keeps of a Gateway (§7.10 "What is read").
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayEntry {
+    /// A Gateway of a mimic class in a listed namespace, converted in full (boxed: a stub is
+    /// small).
+    Full(Box<Gateway>),
+    /// Any other Gateway: mimic does no work for it.
+    Stub(Stub),
+}
+
+/// The namespace, the name and the class of a Gateway that mimic does not serve: no listener,
+/// hostname or status of it is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stub {
+    pub namespace: String,
+    pub name: String,
+    pub class: String,
+}
+
+impl GatewayEntry {
+    pub fn class(&self) -> &str {
+        match self {
+            GatewayEntry::Full(gw) => &gw.class,
+            GatewayEntry::Stub(stub) => &stub.class,
+        }
+    }
+
+    pub fn full(&self) -> Option<&Gateway> {
+        match self {
+            GatewayEntry::Full(gw) => Some(gw.as_ref()),
+            GatewayEntry::Stub(_) => None,
+        }
+    }
+}
+
+/// A Gateway as the reconciler keeps it: in full when `serves(namespace, class)`, else a stub
+/// read from its key and `spec.gatewayClassName` only; `None` without a namespace or a name.
+pub fn entry(
+    object: &DynamicObject,
+    serves: impl Fn(&str, &str) -> bool,
+) -> Option<(Key, GatewayEntry)> {
+    let key = key(&object.metadata)?;
+    let spec = object.data.get("spec").unwrap_or(&Value::Null);
+    let class = text(spec, "gatewayClassName").unwrap_or_default();
+    if serves(&key.0, &class) {
+        let (key, gw) = gateway(object)?;
+        return Some((key, GatewayEntry::Full(Box::new(gw))));
+    }
+    let stub = Stub {
+        namespace: key.0.clone(),
+        name: key.1.clone(),
+        class,
+    };
+    Some((key, GatewayEntry::Stub(stub)))
+}
+
+/// A Gateway converted in full; `None` without a namespace or a name.
 pub fn gateway(object: &DynamicObject) -> Option<(Key, Gateway)> {
     let key = key(&object.metadata)?;
     let spec = object.data.get("spec").unwrap_or(&Value::Null);

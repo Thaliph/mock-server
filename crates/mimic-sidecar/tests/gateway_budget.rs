@@ -112,11 +112,7 @@ fn scope_args() -> Option<Vec<String>> {
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    probe
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| args)
+    probe.status().ok().filter(|s| s.success()).map(|_| args)
 }
 
 /// The gateway of the generated pod on `port`: `MIMIC_MAX_CONNECTIONS` at the cap, and timeouts
@@ -165,11 +161,18 @@ fn run(held: Held) -> (u64, u64) {
     server_holds(port, CAP, Duration::from_secs(30));
     std::thread::sleep(Duration::from_millis(300));
     let (now, peak) = rss(gateway.pid());
-    assert_eq!(server_connections(port), CAP, "{held:?}: a connection closed");
+    assert_eq!(
+        server_connections(port),
+        CAP,
+        "{held:?}: a connection closed"
+    );
 
     let mut over = connect(port);
     over.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    assert!(closed(&mut over), "{held:?}: the connection over the cap is open");
+    assert!(
+        closed(&mut over),
+        "{held:?}: the connection over the cap is open"
+    );
 
     let per = now.saturating_sub(base) / CAP as u64;
     println!(

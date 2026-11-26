@@ -77,7 +77,8 @@ async fn services(client: kube::Client, reconciler: Arc<Reconciler>) {
 
 /// `Gateway`s, when the CRD exists: it may be installed after the controller started (and
 /// removed), so it is looked for again every [`CRD_LOOK`] (GW-15). The hub logs the changes of
-/// presence.
+/// presence. A Gateway mimic does not serve is kept as a stub; when a mimic class appears, the
+/// watch lists again, so that the stubs of that class are converted in full (#576).
 pub(crate) async fn gateways(client: kube::Client, hub: Arc<Hub>, reconciler: Arc<Reconciler>) {
     let api = Api::<DynamicObject>::all_with(client, &gateway_api("v1", "Gateway"));
     let reconciler = &*reconciler;
@@ -90,16 +91,28 @@ pub(crate) async fn gateways(client: kube::Client, hub: Arc<Hub>, reconciler: Ar
             hub.gateway_crd(present);
         },
         |api| async move {
-            let events =
-                watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
-            forward(
-                events,
-                convert::gateway,
-                |e| reconciler.feed_gateways(e),
-                Some(&api),
-                failed,
-            )
-            .await;
+            let mut relists = reconciler.relists();
+            loop {
+                relists.borrow_and_update();
+                let events =
+                    watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
+                let watched = forward(
+                    events,
+                    |object| convert::entry(object, |ns, class| reconciler.serves(ns, class)),
+                    |e| reconciler.feed_gateways(e),
+                    Some(&api),
+                    failed,
+                );
+                tokio::select! {
+                    () = watched => return,
+                    // A new mimic class: a new list; the table keeps its content until it ends.
+                    relisted = relists.changed() => {
+                        if relisted.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
         },
         |error| tracing::warn!(error = %ApiError::from(error), "gateway CRD lookup failed"),
     )

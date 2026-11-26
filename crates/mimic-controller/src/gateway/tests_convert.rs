@@ -423,7 +423,7 @@ fn gw_15_gateways_mimic_does_not_serve_convert_to_stubs() {
     let (key, full) = convert::entry(&object(web()), serves).expect("a gateway");
     assert_eq!(key, ("shop".to_string(), "web".to_string()));
     let (_, want) = convert::gateway(&object(web())).unwrap();
-    assert_eq!(full, convert::GatewayEntry::Full(want));
+    assert_eq!(full, convert::GatewayEntry::Full(Box::new(want)));
 
     let stub = |namespace: &str, class: &str| {
         convert::GatewayEntry::Stub(convert::Stub {

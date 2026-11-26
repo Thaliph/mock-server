@@ -18,23 +18,6 @@ use crate::mesh::Event;
 use crate::mesh::metrics::label;
 use crate::mesh::tests::Lines;
 
-/// `(type, status, reason)` of the top-level conditions of a Gateway status body.
-fn conditions(body: &Value) -> Vec<(String, String, String)> {
-    body["status"]["conditions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| {
-            let s = |f: &str| c[f].as_str().unwrap().to_string();
-            (s("type"), s("status"), s("reason"))
-        })
-        .collect()
-}
-
-fn triple(kind: &str, status: &str, reason: &str) -> (String, String, String) {
-    (kind.into(), status.into(), reason.into())
-}
-
 /// A rig of one replica with the namespaces `{shop}`, the class `mimic` and no Gateway.
 fn mimic_only() -> Rig {
     let rig = Rig::new(1, &settings(&["shop"]));
@@ -66,6 +49,11 @@ async fn gw_15_a_not_listed_gateway_gets_no_status_and_no_object_request() {
         "no status"
     );
     assert_eq!(state(&rig.metrics[0], "not_accepted"), 0, "not counted");
+    // Converted as a stub: only a mimic class in a listed namespace is served.
+    let r = &rig.replicas[0];
+    assert!(r.serves("shop", "mimic"));
+    assert!(!r.serves("other", "mimic"));
+    assert!(!r.serves("shop", "istio"));
 
     rig.api.clear();
     rig.round(0).await;
@@ -99,7 +87,11 @@ fn no_objects(rig: &Rig) {
 async fn gw_15_no_pass_without_the_crd_or_a_full_list() {
     let rig = mimic_only();
     let r = &rig.replicas[0];
-    let refused = convert::GatewayEntry::Full(gateway("shop", "web", vec![listener("tcp", 9000, "TCP")]));
+    let refused = convert::GatewayEntry::Full(Box::new(gateway(
+        "shop",
+        "web",
+        vec![listener("tcp", 9000, "TCP")],
+    )));
     no_objects(&rig);
     r.crd(true);
     r.feed_classes(Event::Init);
@@ -1037,8 +1029,16 @@ async fn gw_15_gateways_mimic_does_not_serve_do_not_delay_a_listed_one() {
     let foreign: Vec<(String, String, String)> = (0..1000)
         .flat_map(|i| {
             [
-                ("shop".to_string(), format!("istio-{i}"), "istio".to_string()),
-                ("other".to_string(), format!("mimic-{i}"), "mimic".to_string()),
+                (
+                    "shop".to_string(),
+                    format!("istio-{i}"),
+                    "istio".to_string(),
+                ),
+                (
+                    "other".to_string(),
+                    format!("mimic-{i}"),
+                    "mimic".to_string(),
+                ),
             ]
         })
         .collect();
@@ -1097,7 +1097,10 @@ async fn gw_15_gateways_mimic_does_not_serve_do_not_delay_a_listed_one() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let generations = churn.await.unwrap();
     assert!(generations > 2, "the loop ran: {generations}");
-    assert!(applied < Duration::from_secs(2), "first apply after {applied:?}");
+    assert!(
+        applied < Duration::from_secs(2),
+        "first apply after {applied:?}"
+    );
     let named: Vec<String> = rig
         .api
         .whats()

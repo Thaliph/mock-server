@@ -1069,7 +1069,12 @@ gw_holds() { # gw_holds <render file> <message part> <expression part>...: that 
 gw_holds "$tmp/gw-on.yaml" "metadata.labels must be exactly" "variables.labels.all(k, k in ['app.kubernetes.io/managed-by', 'app.kubernetes.io/name', 'gateway.networking.k8s.io/gateway-class-name', 'gateway.networking.k8s.io/gateway-name', 'mimic.platform.io/gateway'])" "size(variables.labels) == 5"
 gw_holds "$tmp/gw-on.yaml" "metadata.finalizers" "!has(variables.target.metadata.finalizers)"
 gw_holds "$tmp/gw-on.yaml" "spec.template.metadata.labels must be exactly" "['app.kubernetes.io/name', 'mimic.platform.io/gateway', 'mimic.platform.io/inject']" "size(object.spec.template.metadata.labels) == 3"
-gw_holds "$tmp/gw-on.yaml" "spec.template.metadata keys" "object.spec.template.metadata.all(k, k in ['labels', 'annotations'])"
+gw_holds "$tmp/gw-on.yaml" "spec.template.metadata keys" "object.spec.template.metadata.all(k, k in ['labels', 'annotations']" \
+  "k == 'creationTimestamp' && dyn(object.spec.template.metadata.creationTimestamp) == null"
+# A CEL map literal holds one value type: the API server refuses a policy that mixes them without dyn().
+gw_holds "$tmp/gw-on.yaml" "the pod securityContext must be exactly" "{'runAsNonRoot': dyn(true), 'runAsUser': dyn(65532), 'runAsGroup': dyn(65532)"
+gw_holds "$tmp/gw-on.yaml" "the container securityContext must be exactly" "{'allowPrivilegeEscalation': dyn(false), 'readOnlyRootFilesystem': dyn(true)"
+gw_holds "$tmp/gw-on.yaml" "topologySpreadConstraints must be exactly" "'maxSkew': dyn(1)"
 gw_holds "$tmp/gw-on.yaml" "objects: metadata.annotations" "!has(object.metadata.annotations)" "request.operation == 'UPDATE'" "oldObject.metadata.annotations[k] == object.metadata.annotations[k]" "k in variables.admitted"
 gw_holds "$tmp/gw-on.yaml" "spec.template.metadata.annotations" "request.operation == 'UPDATE'" "oldObject.spec.template.metadata.annotations[k] == object.spec.template.metadata.annotations[k]" "k in variables.admitted"
 gw_holds "$tmp/gw-on.yaml" "deployment: spec keys" "object.spec.all(k, k in ['replicas', 'selector', 'strategy', 'template', 'revisionHistoryLimit', 'progressDeadlineSeconds'])"
