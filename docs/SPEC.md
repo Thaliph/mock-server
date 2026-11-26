@@ -1314,13 +1314,14 @@ change. No `MIMIC_*` variable configures reflection: its bounds are constants.
 
   It ignores every other part: options, default values, comments, enums and extensions. The
   bounds are 256 files, 2048 messages, 8192 fields, 1024 methods and 32 levels of nested message
-  declarations. A name (of a package, a file, a service, a method, a message or a field) has at
-  most 128 bytes. If a bound is passed, the result is `too_large` and the sidecar keeps no schema.
+  declarations. A name of a package, a file, a service, a method or a message has at most 128
+  bytes. If a bound is passed, the result is `too_large` and the sidecar keeps no schema.
   If a file does not parse, or two messages have the same full name, the result is `invalid`.
 - **Lenient parts.** These parts do not stop the read:
   - a file that the sidecar receives twice (same file name) is read once;
-  - a field name that is not a protobuf identifier (`[A-Za-z_][A-Za-z0-9_]*`) is not kept, so the
-    field stays numbered;
+  - a field name that is not a protobuf identifier (`[A-Za-z_][A-Za-z0-9_]*`), or that has more
+    than 128 bytes, is not kept: the field stays numbered, and the sidecar keeps the rest of the
+    schema;
   - a type reference that is not fully qualified (`.pkg.Msg`), or that names a message the schema
     does not hold, gives the field no type;
   - a method whose input or output type is missing has no names for that side.
