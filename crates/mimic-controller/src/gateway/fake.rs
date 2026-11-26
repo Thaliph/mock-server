@@ -33,8 +33,9 @@ pub(super) fn settings(namespaces: &[&str]) -> Settings {
         service_type: ServiceType::ClusterIP,
         image: "ghcr.io/thaliph/mimic-sidecar@sha256:00".into(),
         log: "info".into(),
-        resources: json!({"requests": {"cpu": "100m", "memory": "64Mi"},
-                          "limits": {"memory": "128Mi"}}),
+        resources: json!({"requests": {"cpu": "100m", "memory": "128Mi"},
+                          "limits": {"memory": "192Mi"}}),
+        max_connections: 1024,
     }
 }
 
@@ -448,7 +449,7 @@ impl Rig {
         relist(
             self.of("Gateway")
                 .into_iter()
-                .filter_map(|v| convert::gateway(&dynamic(v)))
+                .filter_map(|v| convert::entry(&dynamic(v), |n, c| r.serves(n, c)))
                 .collect(),
             |e| r.feed_gateways(e),
         );

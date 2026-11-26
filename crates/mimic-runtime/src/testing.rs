@@ -19,8 +19,14 @@ pub struct Process {
 impl Process {
     /// Starts `bin` with only `PATH` and the given variables in its environment.
     pub fn spawn(bin: &str, env: &[(&str, &str)]) -> Process {
+        Process::spawn_args(bin, &[], env)
+    }
+
+    /// [`Process::spawn`] with `args`.
+    pub fn spawn_args(bin: &str, args: &[&str], env: &[(&str, &str)]) -> Process {
         let mut command = Command::new(bin);
         command
+            .args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .stdout(Stdio::piped())

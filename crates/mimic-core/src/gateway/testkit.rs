@@ -69,7 +69,8 @@ pub fn settings() -> Settings {
         service_type: ServiceType::ClusterIP,
         image: format!("registry.example/mimic-sidecar@sha256:{}", "0".repeat(64)),
         log: "info".into(),
-        resources: json!({"requests": {"cpu": "100m", "memory": "64Mi"}, "limits": {"memory": "128Mi"}}),
+        resources: json!({"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"memory": "192Mi"}}),
+        max_connections: 1024,
     }
 }
 

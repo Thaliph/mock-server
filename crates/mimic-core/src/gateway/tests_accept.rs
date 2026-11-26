@@ -42,22 +42,22 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
     let unsupported = |path: &str| cond(false, "UnsupportedValue", &format!("unsupported: {path}"));
     let mut cases: Vec<(&str, Gateway, GatewayClass, Condition)> = vec![];
 
-    // 1, with other faults too.
+    // 1. The namespace is not a case (#576): a Gateway outside the listed namespaces gets no
+    // status at all, so the class's refusal is the first.
     let mut g = gw();
     g.namespace = "other".into();
     g.has_tls = true;
     g.has_addresses = true;
     cases.push((
-        "namespace",
+        "class, namespace not listed",
         g,
         refs_class(),
         cond(
             false,
-            "NamespaceNotAllowed",
-            "namespace other is not in gateway.namespaces",
+            "InvalidParameters",
+            "GatewayClass mimic is not accepted",
         ),
     ));
-    // 2.
     cases.push((
         "class",
         gw(),
@@ -68,7 +68,7 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
             "GatewayClass mimic is not accepted",
         ),
     ));
-    // 3.
+    // 2.
     let mut g = gw();
     g.name = "a".repeat(64);
     cases.push((
@@ -121,7 +121,7 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
     let mut g = gw();
     g.listeners = (0..65).map(|i| http(&format!("l{i}"), 80)).collect();
     cases.push(("65 listeners", g, class(), unsupported("spec.listeners")));
-    // 4.
+    // 3.
     let mut g = gw();
     g.has_addresses = true;
     cases.push((
@@ -134,7 +134,7 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
             "spec.addresses is not supported",
         ),
     ));
-    // 5.
+    // 4.
     let mut g = gw();
     g.infrastructure.has_parameters_ref = true;
     cases.push((
@@ -155,7 +155,7 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
         class(),
         cond(false, "InvalidParameters", ANNOTATION_RANGE),
     ));
-    // 6.
+    // 5.
     let mut g = gw();
     g.listeners = vec![];
     cases.push((
@@ -172,7 +172,7 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
         class(),
         cond(false, "ListenersNotValid", "no valid listener"),
     ));
-    // 7.
+    // 6.
     let mut g = gw();
     g.listeners.push(listener("tcp", "TCP", 9000));
     cases.push((
@@ -181,7 +181,7 @@ fn gw_03_each_case_gives_its_status_reason_and_message() {
         class(),
         cond(true, "ListenersNotValid", "listeners not valid: tcp"),
     ));
-    // 8.
+    // 7.
     cases.push(("valid", gw(), class(), cond(true, "Accepted", "")));
     let mut g = gw();
     g.allowed_listeners_from = Some("None".into());
@@ -208,8 +208,6 @@ fn gw_03_the_first_case_wins() {
     let mut g = faulty();
     let mut c = refs_class();
     let mut got = vec![gateway(&g, &c, &settings()).accepted];
-    g.namespace = "shop".into();
-    got.push(gateway(&g, &c, &settings()).accepted);
     c = class();
     got.push(gateway(&g, &c, &settings()).accepted);
     g.has_tls = false;
@@ -221,11 +219,6 @@ fn gw_03_the_first_case_wins() {
     assert_eq!(
         got,
         vec![
-            cond(
-                false,
-                "NamespaceNotAllowed",
-                "namespace other is not in gateway.namespaces"
-            ),
             cond(
                 false,
                 "InvalidParameters",
@@ -562,7 +555,7 @@ fn gw_04_conflicted_and_attached_routes_everywhere() {
         http("admin", 15100),
     ];
     let mut refused = g.clone();
-    refused.namespace = "other".into();
+    refused.has_tls = true;
     for g in [g, refused] {
         let got = accept(&g);
         let names: Vec<&str> = got.listeners.iter().map(|l| l.name.as_str()).collect();

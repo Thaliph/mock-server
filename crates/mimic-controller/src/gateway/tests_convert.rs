@@ -415,3 +415,57 @@ fn gw_08_deployment_and_service_convert_to_their_seen_state() {
         convert::service(&again).unwrap().1.digest
     });
 }
+
+#[test]
+fn gw_15_gateways_mimic_does_not_serve_convert_to_stubs() {
+    // Served: class `mimic` in `shop`.
+    let serves = |namespace: &str, class: &str| namespace == "shop" && class == "mimic";
+    let (key, full) = convert::entry(&object(web()), serves).expect("a gateway");
+    assert_eq!(key, ("shop".to_string(), "web".to_string()));
+    let (_, want) = convert::gateway(&object(web())).unwrap();
+    assert_eq!(full, convert::GatewayEntry::Full(want));
+
+    let stub = |namespace: &str, class: &str| {
+        convert::GatewayEntry::Stub(convert::Stub {
+            namespace: namespace.into(),
+            name: "web".into(),
+            class: class.into(),
+        })
+    };
+    // Another class, and the mimic class in a namespace that is not listed: the namespace, the
+    // name and the class only, whatever the listeners, hostnames and status hold.
+    let mut istio = web();
+    istio["spec"]["gatewayClassName"] = json!("istio");
+    let mut other = web();
+    other["metadata"]["namespace"] = json!("other");
+    let mut big = web();
+    big["metadata"]["namespace"] = json!("other");
+    big["spec"]["listeners"][0]["hostname"] = json!("x".repeat(70 * 1024));
+    for (value, want) in [
+        (istio, stub("shop", "istio")),
+        (other, stub("other", "mimic")),
+        (big, stub("other", "mimic")),
+    ] {
+        let (_, got) = convert::entry(&object(value), serves).expect("a gateway");
+        assert_eq!(got, want);
+        let debug = format!("{got:?}");
+        assert!(
+            !debug.contains("example.com") && !debug.contains("10.96.0.10"),
+            "{debug}"
+        );
+    }
+
+    // A spec change that keeps the class keeps the stub equal: no pass starts.
+    let mut moved = web();
+    moved["spec"]["gatewayClassName"] = json!("istio");
+    moved["metadata"]["generation"] = json!(9);
+    moved["spec"]["listeners"][0]["port"] = json!(9090);
+    moved["status"] = json!({});
+    assert_eq!(
+        convert::entry(&object(moved), serves).map(|(_, e)| e),
+        Some(stub("shop", "istio"))
+    );
+    let mut value = web();
+    value["metadata"].as_object_mut().unwrap().remove("name");
+    assert_eq!(convert::entry(&object(value), serves), None);
+}

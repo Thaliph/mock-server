@@ -32,8 +32,9 @@ fn gw_16_each_variable_is_checked() {
             service_type: ServiceType::ClusterIP,
             image: "mimic-sidecar:test".into(),
             log: "debug".into(),
-            resources: json!({"requests": {"cpu": "100m", "memory": "64Mi"},
-                              "limits": {"memory": "128Mi"}}),
+            resources: json!({"requests": {"cpu": "100m", "memory": "128Mi"},
+                              "limits": {"memory": "192Mi"}}),
+            max_connections: 1024,
         }
     );
 
@@ -64,11 +65,51 @@ fn gw_16_each_variable_is_checked() {
     assert_eq!(
         on(
             "MIMIC_GATEWAY_RESOURCES",
-            r#"{"requests":{"cpu":"0.5","memory":"1e3"}}"#
+            r#"{"requests":{"cpu":"0.5","memory":"1e3"},"limits":{"memory":"0.2e9"}}"#
         )
         .resources,
-        json!({"requests": {"cpu": "0.5", "memory": "1e3"}})
+        json!({"requests": {"cpu": "0.5", "memory": "1e3"}, "limits": {"memory": "0.2e9"}})
     );
+    assert_eq!(on("MIMIC_GATEWAY_MAX_CONNECTIONS", "1").max_connections, 1);
+    // The budget of §7.10: 1706 × 96 KiB + 32 MiB fits 192 MiB, 1707 does not.
+    assert_eq!(
+        on("MIMIC_GATEWAY_MAX_CONNECTIONS", "1706").max_connections,
+        1706
+    );
+    let fits = |connections: &str, memory: &str| {
+        let resources = format!(r#"{{"limits":{{"memory":"{memory}"}}}}"#);
+        parse(
+            &[
+                ("MIMIC_GATEWAY_NAMESPACES", "shop"),
+                ("MIMIC_GATEWAY_MAX_CONNECTIONS", connections),
+                ("MIMIC_GATEWAY_RESOURCES", &resources),
+            ],
+            true,
+        )
+        .map(|s| s.expect("on").max_connections)
+    };
+    // Exactly the budget: 1024 × 96 KiB + 32 MiB = 128 MiB, in each notation.
+    assert_eq!(fits("1024", "128Mi"), Ok(1024));
+    assert_eq!(fits("1024", "0.125Gi"), Ok(1024));
+    assert_eq!(fits("1024", "134217728"), Ok(1024));
+    assert_eq!(fits("1024", "134217.728k"), Ok(1024));
+    assert_eq!(fits("1024", "134217728000m"), Ok(1024));
+    assert_eq!(fits("1024", "1.34217728e8"), Ok(1024));
+    assert_eq!(fits("1000000", "100Gi"), Ok(1_000_000));
+    for (connections, memory) in [
+        ("1025", "128Mi"),
+        ("1024", "134217727"),
+        ("1024", "134M"),
+        ("1", "32Mi"),
+        ("1", "-1Gi"),
+        ("1024", "134217727999m"),
+    ] {
+        let error = fits(connections, memory).expect_err(memory);
+        assert!(
+            error.contains("MIMIC_GATEWAY_MAX_CONNECTIONS") && error.contains("96 KiB"),
+            "{connections} with {memory}: {error}"
+        );
+    }
     let mut many: Vec<String> = (0..256).map(|i| format!("ns-{i}")).collect();
     assert_eq!(
         on("MIMIC_GATEWAY_NAMESPACES", &many.join(","))
@@ -107,6 +148,13 @@ fn gw_16_each_variable_is_checked() {
         ),
         ("MIMIC_GATEWAY_RESOURCES", r#"{"requests":{"memory":""}}"#),
         ("MIMIC_GATEWAY_RESOURCES", r#"{"claims":[{"name":"a"}]}"#),
+        // The memory budget needs a limit.
+        ("MIMIC_GATEWAY_RESOURCES", r#"{"requests":{"memory":"128Mi"}}"#),
+        ("MIMIC_GATEWAY_RESOURCES", r#"{"limits":{"cpu":"1"}}"#),
+        ("MIMIC_GATEWAY_MAX_CONNECTIONS", "0"),
+        ("MIMIC_GATEWAY_MAX_CONNECTIONS", "1000001"),
+        ("MIMIC_GATEWAY_MAX_CONNECTIONS", "2000"),
+        ("MIMIC_GATEWAY_MAX_CONNECTIONS", "many"),
     ];
     let joined = many.join(",");
     for (var, value) in refused
@@ -136,6 +184,9 @@ fn gw_16_the_other_variables_are_checked_while_the_gateway_is_off() {
         ("MIMIC_GATEWAY_SERVICE_TYPE", "ExternalName"),
         ("MIMIC_GATEWAY_MAX_REPLICAS", "0"),
         ("MIMIC_GATEWAY_RESOURCES", "[]"),
+        ("MIMIC_GATEWAY_RESOURCES", r#"{"limits":{"cpu":"1"}}"#),
+        ("MIMIC_GATEWAY_MAX_CONNECTIONS", "0"),
+        ("MIMIC_GATEWAY_MAX_CONNECTIONS", "2000"),
     ] {
         let error = parse(&[(var, value)], false).expect_err(var);
         assert!(error.contains(var), "{var}: {error}");

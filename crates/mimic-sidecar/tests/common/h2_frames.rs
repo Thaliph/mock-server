@@ -11,12 +11,14 @@ pub const HEADERS: u8 = 0x1;
 pub const RST_STREAM: u8 = 0x3;
 pub const SETTINGS: u8 = 0x4;
 pub const GOAWAY: u8 = 0x7;
+pub const WINDOW_UPDATE: u8 = 0x8;
 
 pub const END_STREAM: u8 = 0x1;
 pub const END_HEADERS: u8 = 0x4;
 pub const ACK: u8 = 0x1;
 
 pub const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+pub const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
 
 pub const REFUSED_STREAM: u32 = 0x7;

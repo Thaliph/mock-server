@@ -13,7 +13,8 @@ use common::gateway_rig::{
 };
 use common::h2_frames::{
     self, ENHANCE_YOUR_CALM, GOAWAY, HEADERS, REFUSED_STREAM, RST_STREAM, SETTINGS,
-    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_HEADER_LIST_SIZE,
+    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_HEADER_LIST_SIZE,
+    WINDOW_UPDATE,
 };
 use common::{h2_client, h2_send, peak_rss};
 use mimic_runtime::testing::Process;
@@ -102,11 +103,24 @@ fn gw_19_a_slow_or_silent_head_is_closed_at_the_header_timeout() {
         });
         closed_after(&mut a, start)
     });
+    // HTTP/2: the preface and SETTINGS, no HEADERS (#574). The time is the header timeout's,
+    // not the idle timeout's.
+    let preface = std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut c = connect(port);
+        c.write_all(&h2_frames::client_start()).unwrap();
+        closed_after(&mut c, start)
+    });
     let start = Instant::now();
     let mut b = connect(port);
     let silent = closed_after(&mut b, start);
     let slow = slow.join().unwrap();
-    for (name, t) in [("byte by byte", slow), ("silent", silent)] {
+    let preface = preface.join().unwrap();
+    for (name, t) in [
+        ("byte by byte", slow),
+        ("silent", silent),
+        ("h2 preface only", preface),
+    ] {
         assert!(
             t >= Duration::from_secs(1) && t < Duration::from_secs(2),
             "{name}: closed after {t:?}"
@@ -251,6 +265,13 @@ fn gw_19_h2_stream_limit_and_reset_flood() {
         values.contains(&(SETTINGS_MAX_HEADER_LIST_SIZE, 65_536)),
         "{values:?}"
     );
+    // The stream window stays at 64 KiB (#574), and so does the connection's: no WINDOW_UPDATE
+    // of stream 0, as no DATA was sent.
+    assert!(
+        values.contains(&(SETTINGS_INITIAL_WINDOW_SIZE, 65_535)),
+        "{values:?}"
+    );
+    let mut window_updates = 0;
     let mut refused = Vec::new();
     let mut answered = 0;
     let start = Instant::now();
@@ -263,10 +284,12 @@ fn gw_19_h2_stream_limit_and_reset_flood() {
         match frame.kind {
             RST_STREAM if frame.rst_code() == REFUSED_STREAM => refused.push(frame.stream),
             HEADERS => answered += 1,
+            WINDOW_UPDATE if frame.stream == 0 => window_updates += 1,
             _ => {}
         }
     }
     assert_eq!(refused, vec![201]);
+    assert_eq!(window_updates, 0, "the connection window was raised");
 
     assert_eq!(reset_flood(port), Some(ENHANCE_YOUR_CALM));
 }

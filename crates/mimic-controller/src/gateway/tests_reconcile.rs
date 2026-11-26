@@ -1,5 +1,5 @@
-//! GW-10 to GW-14 (objects, ownership, deletion, failures), GW-15 (classes and refused Gateways)
-//! and GW-17 (counts and lines): the passes of the gateway reconciler against the fake API of
+//! GW-10 to GW-14 (objects, ownership, deletion, failures), GW-15 (classes, refused Gateways,
+//! stubs and their load) and GW-17 (counts and lines): the passes of the gateway reconciler against the fake API of
 //! `fake.rs`, without a cluster.
 
 use std::collections::BTreeSet;
@@ -50,38 +50,23 @@ fn tcp_only() -> Value {
 }
 
 #[tokio::test]
-async fn gw_15_a_not_listed_gateway_gets_its_status_and_no_object_request() {
+async fn gw_15_a_not_listed_gateway_gets_no_status_and_no_object_request() {
     let rig = mimic_only();
     rig.api
         .put("Gateway", gateway_object("other", "web", http(80)));
     rig.round(0).await;
-    assert_eq!(
-        rig.api.whats(),
-        s(&["status GatewayClass mimic", "status Gateway other/web"])
-    );
+    assert_eq!(rig.api.whats(), s(&["status GatewayClass mimic"]));
     let calls = rig.api.calls();
     assert_eq!(
         calls[0].body["status"]["conditions"][0]["status"], "True",
         "the class is accepted"
     );
-    let body = &calls[1].body;
-    assert_eq!(
-        conditions(body),
-        [
-            triple("Accepted", "False", "NamespaceNotAllowed"),
-            triple("Programmed", "False", "Invalid"),
-        ]
+    assert!(
+        rig.api.get("Gateway", "other", "web").unwrap()["status"].is_null(),
+        "no status"
     );
-    assert_eq!(
-        body["status"]["conditions"][0]["message"],
-        "namespace other is not in gateway.namespaces"
-    );
-    assert_eq!(
-        body["metadata"],
-        json!({"name": "web", "namespace": "other"})
-    );
+    assert_eq!(state(&rig.metrics[0], "not_accepted"), 0, "not counted");
 
-    // The cluster holds what was written: Keep, no request.
     rig.api.clear();
     rig.round(0).await;
     assert_eq!(rig.api.whats(), Vec::<String>::new());
@@ -114,7 +99,7 @@ fn no_objects(rig: &Rig) {
 async fn gw_15_no_pass_without_the_crd_or_a_full_list() {
     let rig = mimic_only();
     let r = &rig.replicas[0];
-    let refused = gateway("shop", "web", vec![listener("tcp", 9000, "TCP")]);
+    let refused = convert::GatewayEntry::Full(gateway("shop", "web", vec![listener("tcp", 9000, "TCP")]));
     no_objects(&rig);
     r.crd(true);
     r.feed_classes(Event::Init);
@@ -971,7 +956,7 @@ async fn gw_15_no_object_request_outside_the_listed_namespaces() {
         .put("Gateway", gateway_object("other", "web", http(80)));
     managed(&rig, "other", "ghost", "uid-x");
     rig.round(0).await;
-    assert_eq!(whats(&rig), s(&["status Gateway other/web"]));
+    assert_eq!(whats(&rig), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -1031,4 +1016,93 @@ async fn gw_17_states_results_and_programmed_lines() {
         .collect();
     assert_eq!(info.len(), 2);
     assert!(info.iter().all(|l| l.contains(r#""gateway":"shop/web""#)));
+}
+
+/// The Gateway `namespace/name` of `class` at `generation`, with one HTTP listener on `port`.
+fn gateway_at(namespace: &str, name: &str, class: &str, generation: i64, port: u16) -> Value {
+    let mut g = gateway_object(namespace, name, http(port));
+    g["spec"]["gatewayClassName"] = json!(class);
+    g["metadata"]["generation"] = json!(generation);
+    g["metadata"]["uid"] = json!(format!("uid-{namespace}-{name}"));
+    g
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gw_15_gateways_mimic_does_not_serve_do_not_delay_a_listed_one() {
+    let rig = mimic_only();
+    rig.api.put(
+        "GatewayClass",
+        class_object("istio", "istio.io/gateway-controller"),
+    );
+    let foreign: Vec<(String, String, String)> = (0..1000)
+        .flat_map(|i| {
+            [
+                ("shop".to_string(), format!("istio-{i}"), "istio".to_string()),
+                ("other".to_string(), format!("mimic-{i}"), "mimic".to_string()),
+            ]
+        })
+        .collect();
+    for (namespace, name, class) in &foreign {
+        rig.api
+            .put("Gateway", gateway_at(namespace, name, class, 1, 80));
+    }
+    rig.read(0);
+    let r = rig.replicas[0].clone();
+    tokio::spawn(r.clone().run());
+
+    // The 2000 change their spec in a loop, each change a watch event.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let (r, stop, foreign) = (r.clone(), stop.clone(), foreign.clone());
+        tokio::spawn(async move {
+            let mut generation = 1;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                generation += 1;
+                let port = 1000 + u16::try_from(generation % 1000).unwrap();
+                for (namespace, name, class) in &foreign {
+                    let value = gateway_at(namespace, name, class, generation, port);
+                    let object = serde_json::from_value(value).unwrap();
+                    if let Some((key, entry)) = convert::entry(&object, |n, c| r.serves(n, c)) {
+                        r.feed_gateways(Event::Apply(key, entry));
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            generation
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let created = std::time::Instant::now();
+    let web = gateway_at("shop", "web", "mimic", 1, 80);
+    rig.api.put("Gateway", web.clone());
+    let (key, entry) =
+        convert::entry(&serde_json::from_value(web).unwrap(), |n, c| r.serves(n, c)).unwrap();
+    r.feed_gateways(Event::Apply(key, entry));
+    let applied = loop {
+        if rig
+            .api
+            .whats()
+            .iter()
+            .any(|w| w == "apply Deployment shop/web-mimic")
+        {
+            break created.elapsed();
+        }
+        assert!(
+            created.elapsed() < Duration::from_secs(10),
+            "no apply of shop/web-mimic"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let generations = churn.await.unwrap();
+    assert!(generations > 2, "the loop ran: {generations}");
+    assert!(applied < Duration::from_secs(2), "first apply after {applied:?}");
+    let named: Vec<String> = rig
+        .api
+        .whats()
+        .into_iter()
+        .filter(|w| w.contains("istio-") || w.contains("mimic-") || w.contains("other/"))
+        .collect();
+    assert_eq!(named, Vec::<String>::new());
 }

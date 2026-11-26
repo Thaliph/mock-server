@@ -114,7 +114,7 @@ proptest! {
             prop_assert_eq!(&service_ports, &ports);
             for e in container["env"].as_array().into_iter().flatten() {
                 let n = e["name"].as_str().unwrap_or_default();
-                prop_assert!(["MIMIC_GATEWAY_PORTS", "MIMIC_LOG", "MIMIC_ROLE"].contains(&n), "env {n}");
+                prop_assert!(["MIMIC_GATEWAY_PORTS", "MIMIC_LOG", "MIMIC_MAX_CONNECTIONS", "MIMIC_ROLE"].contains(&n), "env {n}");
             }
             let mut shuffled = gw.clone();
             shuffled.listeners = shuffle(&gw.listeners, seed);

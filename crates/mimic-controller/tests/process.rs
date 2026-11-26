@@ -808,6 +808,16 @@ fn gw_16_invalid_gateway_variables_exit_2_naming_the_variable() {
             shop,
             ("MIMIC_GATEWAY_RESOURCES", r#"{"limits":{"cpu":"x"}}"#),
         ],
+        vec![shop, ("MIMIC_GATEWAY_MAX_CONNECTIONS", "0")],
+        // 2000 × 96 KiB + 32 MiB is more than the default 192 MiB limit.
+        vec![shop, ("MIMIC_GATEWAY_MAX_CONNECTIONS", "2000")],
+        vec![
+            shop,
+            (
+                "MIMIC_GATEWAY_RESOURCES",
+                r#"{"requests":{"memory":"128Mi"}}"#,
+            ),
+        ],
     ];
     for extra in cases {
         let (var, value) = *extra.last().unwrap();

@@ -1052,20 +1052,59 @@ added=$(diff <(all_rules "$tmp/gw-off.yaml") <(all_rules "$tmp/gw-on.yaml") | gr
   || fail "gw_21: the policy is not failurePolicy Fail with the controller's account and three resources on three operations"
 [[ $(yq -r 'select(.kind == "ValidatingAdmissionPolicyBinding" and .metadata.name == "mimic-gateway") | .spec.policyName + " " + (.spec.validationActions | join(","))' "$tmp/gw-on.yaml") == "mimic-gateway Deny" ]] \
   || fail "gw_21: the policy binding is not mimic-gateway with [Deny]"
-for want in "ghcr.io/thaliph/mimic@$digest" "['edge', 'shop']" "'ClusterIP'" "<= 10" '{"limits":{"memory":"128Mi"},"requests":{"cpu":"100m","memory":"64Mi"}}'; do
+for want in "ghcr.io/thaliph/mimic@$digest" "['edge', 'shop']" "'ClusterIP'" "<= 10" '{"limits":{"memory":"192Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}' \
+  "e.name == 'MIMIC_MAX_CONNECTIONS' && has(e.value) && e.value == '1024'"; do
   grep -qF -- "$want" <<<"$(gw_policy "$tmp/gw-on.yaml")" || fail "gw_21: the policy does not hold $want"
 done
+# #575: exact label sets, the annotation rule and the key allowlists, each a rule of its own (spec 7.10).
+gw_rule() { # gw_rule <render file> <message part>: the expression of the policy rule whose message holds the part
+  yq -r 'select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-gateway") | .spec.validations[] | select(.message | contains("'"$2"'")) | .expression' "$1"
+}
+gw_holds() { # gw_holds <render file> <message part> <expression part>...: that rule exists and holds each part
+  local file=$1 message=$2 rule; shift 2
+  rule=$(gw_rule "$file" "$message")
+  [[ -n $rule ]] || fail "gw_21: the policy has no rule '$message'"
+  for want in "$@"; do grep -qF -- "$want" <<<"$rule" || fail "gw_21: the rule '$message' does not hold $want"; done
+}
+gw_holds "$tmp/gw-on.yaml" "metadata.labels must be exactly" "variables.labels.all(k, k in ['app.kubernetes.io/managed-by', 'app.kubernetes.io/name', 'gateway.networking.k8s.io/gateway-class-name', 'gateway.networking.k8s.io/gateway-name', 'mimic.platform.io/gateway'])" "size(variables.labels) == 5"
+gw_holds "$tmp/gw-on.yaml" "metadata.finalizers" "!has(variables.target.metadata.finalizers)"
+gw_holds "$tmp/gw-on.yaml" "spec.template.metadata.labels must be exactly" "['app.kubernetes.io/name', 'mimic.platform.io/gateway', 'mimic.platform.io/inject']" "size(object.spec.template.metadata.labels) == 3"
+gw_holds "$tmp/gw-on.yaml" "spec.template.metadata keys" "object.spec.template.metadata.all(k, k in ['labels', 'annotations'])"
+gw_holds "$tmp/gw-on.yaml" "objects: metadata.annotations" "!has(object.metadata.annotations)" "request.operation == 'UPDATE'" "oldObject.metadata.annotations[k] == object.metadata.annotations[k]" "k in variables.admitted"
+gw_holds "$tmp/gw-on.yaml" "spec.template.metadata.annotations" "request.operation == 'UPDATE'" "oldObject.spec.template.metadata.annotations[k] == object.spec.template.metadata.annotations[k]" "k in variables.admitted"
+gw_holds "$tmp/gw-on.yaml" "deployment: spec keys" "object.spec.all(k, k in ['replicas', 'selector', 'strategy', 'template', 'revisionHistoryLimit', 'progressDeadlineSeconds'])"
+gw_holds "$tmp/gw-on.yaml" "deployment: pod spec keys" "variables.pod.all(k, k in ['containers', 'automountServiceAccountToken', 'enableServiceLinks', 'securityContext', 'topologySpreadConstraints', 'dnsPolicy', 'restartPolicy', 'terminationGracePeriodSeconds', 'schedulerName'])"
+gw_holds "$tmp/gw-on.yaml" "deployment: container keys" "variables.container.all(k, k in ['name', 'image', 'command', 'env', 'ports', 'readinessProbe', 'livenessProbe', 'resources', 'securityContext', 'imagePullPolicy', 'terminationMessagePath', 'terminationMessagePolicy'])"
+gw_holds "$tmp/gw-on.yaml" "deployment: env names" "['MIMIC_GATEWAY_PORTS', 'MIMIC_LOG', 'MIMIC_MAX_CONNECTIONS', 'MIMIC_ROLE']" "size(variables.container.env) == 4"
+gw_holds "$tmp/gw-on.yaml" "deployment: container port keys" "p.all(k, k in ['containerPort', 'name', 'protocol'])"
+gw_holds "$tmp/gw-on.yaml" "deployment: readinessProbe keys" "variables.container.readinessProbe.httpGet.all(k, k in ['path', 'port', 'scheme'])"
+gw_holds "$tmp/gw-on.yaml" "service: spec keys" "object.spec.all(k, k in ['type', 'selector', 'ports', 'sessionAffinity', 'internalTrafficPolicy', 'clusterIP', 'clusterIPs', 'ipFamilies', 'ipFamilyPolicy'])"
+gw_holds "$tmp/gw-on.yaml" "service: port keys" "p.all(k, k in ['name', 'port', 'targetPort', 'protocol', 'nodePort'])"
+gw_holds "$tmp/gw-on.yaml" "service: clusterIP" "request.operation == 'CREATE'" "oldObject.spec.clusterIP"
+gw_holds "$tmp/gw-on.yaml" "service: nodePort" "request.operation == 'CREATE'" "oldObject.spec.ports.all(o, o.port != p.port || !has(o.nodePort) || o.nodePort == p.nodePort)"
+gw_holds "$tmp/gw-on.yaml" "poddisruptionbudget: spec keys" "object.spec.all(k, k in ['selector', 'maxUnavailable'])"
+[[ $(yq -r 'select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-gateway") | .spec.variables[] | select(.name == "admitted") | .expression' "$tmp/gw-on.yaml") == '[]' ]] \
+  || fail "gw_21: the admitted annotations are not [] by default"
+gw_on --set 'gateway.admittedAnnotations={cloud.google.com/neg}' > "$tmp/gw-annotations.yaml"
+[[ $(yq -r 'select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-gateway") | .spec.variables[] | select(.name == "admitted") | .expression' "$tmp/gw-annotations.yaml") == "['cloud.google.com/neg']" ]] \
+  || fail "gw_21: the admitted annotations do not follow gateway.admittedAnnotations"
 [[ $(gw_env MIMIC_GATEWAY_NAMESPACES "$tmp/gw-on.yaml") == edge,shop ]] || fail "gw_21: MIMIC_GATEWAY_NAMESPACES is not edge,shop"
 [[ $(gw_env MIMIC_GATEWAY_SERVICE_TYPE "$tmp/gw-on.yaml") == ClusterIP ]] || fail "gw_21: MIMIC_GATEWAY_SERVICE_TYPE is not ClusterIP"
 [[ $(gw_env MIMIC_GATEWAY_MAX_REPLICAS "$tmp/gw-on.yaml") == 10 ]] || fail "gw_21: MIMIC_GATEWAY_MAX_REPLICAS is not 10"
-[[ $(gw_env MIMIC_GATEWAY_RESOURCES "$tmp/gw-on.yaml") == '{"limits":{"memory":"128Mi"},"requests":{"cpu":"100m","memory":"64Mi"}}' ]] \
+[[ $(gw_env MIMIC_GATEWAY_RESOURCES "$tmp/gw-on.yaml") == '{"limits":{"memory":"192Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}' ]] \
   || fail "gw_21: MIMIC_GATEWAY_RESOURCES is not the resources as JSON"
-gw_on --set gateway.serviceType=LoadBalancer --set gateway.maxReplicas=3 --set gateway.resources.limits.memory=256Mi > "$tmp/gw-vals.yaml"
+[[ $(gw_env MIMIC_GATEWAY_MAX_CONNECTIONS "$tmp/gw-on.yaml") == 1024 ]] || fail "gw_21: MIMIC_GATEWAY_MAX_CONNECTIONS is not 1024"
+gw_on --set gateway.serviceType=LoadBalancer --set gateway.maxReplicas=3 --set gateway.resources.limits.memory=256Mi \
+  --set gateway.maxConnections=2000 > "$tmp/gw-vals.yaml"
 [[ $(gw_env MIMIC_GATEWAY_SERVICE_TYPE "$tmp/gw-vals.yaml") == LoadBalancer && $(gw_env MIMIC_GATEWAY_MAX_REPLICAS "$tmp/gw-vals.yaml") == 3 \
-  && $(gw_env MIMIC_GATEWAY_RESOURCES "$tmp/gw-vals.yaml") == *'"memory":"256Mi"'* ]] || fail "gw_21: the controller variables do not follow the gateway values"
-for want in "'LoadBalancer'" "<= 3" "256Mi"; do
+  && $(gw_env MIMIC_GATEWAY_RESOURCES "$tmp/gw-vals.yaml") == *'"memory":"256Mi"'* && $(gw_env MIMIC_GATEWAY_MAX_CONNECTIONS "$tmp/gw-vals.yaml") == 2000 ]] \
+  || fail "gw_21: the controller variables do not follow the gateway values"
+for want in "'LoadBalancer'" "<= 3" "256Mi" "e.value == '2000'"; do
   grep -qF -- "$want" <<<"$(gw_policy "$tmp/gw-vals.yaml")" || fail "gw_21: the policy does not follow the gateway values ($want)"
 done
+gw_holds "$tmp/gw-vals.yaml" "service: spec keys" "object.spec.all(k, k in ['type', 'selector', 'ports', 'sessionAffinity', 'internalTrafficPolicy', 'externalTrafficPolicy', 'allocateLoadBalancerNodePorts', 'clusterIP', 'clusterIPs', 'ipFamilies', 'ipFamilyPolicy'])"
+gw_on --set gateway.serviceType=NodePort > "$tmp/gw-nodeport.yaml"
+gw_holds "$tmp/gw-nodeport.yaml" "service: spec keys" "object.spec.all(k, k in ['type', 'selector', 'ports', 'sessionAffinity', 'internalTrafficPolicy', 'externalTrafficPolicy', 'clusterIP', 'clusterIPs', 'ipFamilies', 'ipFamilyPolicy'])"
 echo "gw_21: default render without gateway objects; GatewayClass, namespaced RBAC, policy and variables with gateway.enabled"
 
 # refuse <message part> <helm flags...>: helm template of the gateway render with one fault fails with the message.
@@ -1082,6 +1121,15 @@ gw_refuse "Gateway API CRDs" render --set gateway.enabled=true --set image.diges
 gw_refuse "gateway.serviceType" gw_on --set gateway.serviceType=ExternalName
 gw_refuse "gateway.serviceType" gw_on --set gateway.serviceType=clusterip
 gw_refuse "needs mesh.enabled" gw_on --set mesh.enabled=false --set image.digest="" --set gateway.namespaces=null
-echo "gw_22: each missing prerequisite and a bad serviceType fail helm template, the first check in order"
+# #574: the memory budget, maxConnections x 96 KiB + 32 MiB, must fit limits.memory.
+gw_refuse "gateway.resources needs limits.memory" gw_on --set gateway.resources.limits=null
+gw_refuse "gateway.maxConnections 2000" gw_on --set gateway.maxConnections=2000
+gw_refuse "gateway.maxConnections 1025" gw_on --set gateway.maxConnections=1025 --set gateway.resources.limits.memory=128Mi
+gw_refuse "gateway.maxConnections" gw_on --set gateway.maxConnections=0
+gw_refuse "gateway.maxConnections" gw_on --set gateway.maxConnections=1000001 --set gateway.resources.limits.memory=1Ti
+gw_refuse "gateway.resources.limits.memory" gw_on --set gateway.resources.limits.memory=0.5Gi
+gw_on --set gateway.maxConnections=1024 --set gateway.resources.limits.memory=128Mi > /dev/null || fail "gw_22: 1024 connections in 128Mi, exactly the budget, fail"
+gw_on --set gateway.maxConnections=1706 > /dev/null || fail "gw_22: 1706 connections in the default 192Mi fail"
+echo "gw_22: each missing prerequisite, a bad serviceType and a cap over the memory budget fail helm template, the first check in order"
 
 echo "chart checks passed"

@@ -60,6 +60,10 @@
                 "value": "info"
               },
               {
+                "name": "MIMIC_MAX_CONNECTIONS",
+                "value": "1024"
+              },
+              {
                 "name": "MIMIC_ROLE",
                 "value": "gateway"
               }
@@ -95,11 +99,11 @@
             },
             "resources": {
               "limits": {
-                "memory": "128Mi"
+                "memory": "192Mi"
               },
               "requests": {
                 "cpu": "100m",
-                "memory": "64Mi"
+                "memory": "128Mi"
               }
             },
             "securityContext": {

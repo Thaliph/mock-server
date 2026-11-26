@@ -204,8 +204,38 @@ pub fn server_read_all(port: u16, client: &TcpStream) {
     });
 }
 
-fn wait_kernel(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+const ESTABLISHED: u8 = 0x01;
+
+/// Waits (at most `within`) until `n` connections to the IPv4 listener on `port` are accepted
+/// and open, and the server has read every byte their clients sent.
+pub fn server_holds(port: u16, n: usize, within: Duration) {
+    wait_kernel_within(&format!("{n} connections held on {port}"), within, || {
+        let sockets = tcp_sockets();
+        let listening = sockets
+            .iter()
+            .any(|&(l, _, state, rx)| l == port && state == LISTEN && rx == 0);
+        let held: Vec<_> = sockets
+            .iter()
+            .filter(|&&(l, _, state, _)| l == port && state == ESTABLISHED)
+            .collect();
+        listening && held.len() == n && held.iter().all(|&&(_, _, _, rx)| rx == 0)
+    });
+}
+
+/// The connections to `port` that the server holds open now.
+pub fn server_connections(port: u16) -> usize {
+    tcp_sockets()
+        .iter()
+        .filter(|&&(l, _, state, _)| l == port && state == ESTABLISHED)
+        .count()
+}
+
+fn wait_kernel(what: &str, cond: impl FnMut() -> bool) {
+    wait_kernel_within(what, Duration::from_secs(5), cond);
+}
+
+fn wait_kernel_within(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         if cond() {
             return;
