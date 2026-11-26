@@ -4108,13 +4108,18 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   - Each listener holds `name`, `hostname` and `routes`: the routes attached to it, in the
     order of §7.9 "Routes" (oldest first, then by key). Each route has the form of §7.9 "In the
     view" without `ports`, plus `hostnames`: its effective hostnames on that listener, sorted.
+  - A listener whose hostname is not a valid hostname (a lower-case DNS name of at most 253
+    bytes, with an optional `*.` prefix) is left out of the view. A route hostname that is not
+    valid matches no listener. A route with more than 16 `hostnames` matches no listener. The
+    CRD refuses these values, so the builder must check them only as a guard.
   - `services` holds only the Services that the attached routes name as valid backends or
     mirrors, under the consent rule of §7.9 "Routes", "Backends". It holds no other Service of
     any namespace. Each Service has the form of §7.9 "Content" without `routes`, with the
     policy of its winning `MimicConfig` (§7).
   - The view must not hold an endpoint whose address is unspecified, loopback, link-local or
     multicast (`0.0.0.0`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4`, `::`, `::1`,
-    `fe80::/10`, `ff00::/8`). The builder leaves such an endpoint out.
+    `fe80::/10`, `ff00::/8`). The builder leaves such an endpoint out. It also leaves out an
+    IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) whose IPv4 address is in one of these ranges.
   - `generations` holds the Gateway (`gateway/<namespace>/<name>@<uid>`) and each attached
     route (`httproute/<namespace>/<name>@<uid>`). Each Service holds its own `generations`, as
     §7.9.
@@ -4123,13 +4128,21 @@ UDPRoute, ListenerSets and mesh traffic management beyond the milestones of the 
   - **Bounds.** The bounds are the §10.2 defaults of `MIMIC_MESH_MAX_SERVICES`,
     `MIMIC_MESH_MAX_ENDPOINTS` and `MIMIC_MESH_MAX_VIEW_BYTES` (1024, 10 000, 4 MiB), whatever
     those variables say. The policy lets the controller give the gateway none of them. The
-    Services are tried in key order with the skip rule of §7.9 "Bounds". A route that names a
-    Service left out is left out of every listener and listed in `skippedRoutes`.
+    builder fills the bounds in this order:
+    1. The attached routes count in the 4 MiB before the Services. The builder tries them
+       oldest first, then by key. If a route does not fit the bytes that are left, the builder
+       leaves it out of every listener and lists it in `skippedRoutes`.
+    2. The builder tries the Services that the remaining routes name, in key order, with the
+       skip rule of §7.9 "Bounds".
+    3. A route that names a Service left out is left out of every listener and listed in
+       `skippedRoutes`.
   - **`GatewayView::from_json`** refuses an unknown field at any level, a `format` other than
     1, a port key outside 1 to 65535 or equal to 15100, more than 64 listeners in total, a
     listener `hostname` that is neither `*` nor a lower-case DNS name of at most 253 bytes with
-    an optional `*.` prefix, more than 16 `hostnames` in a route, each refusal of §7.9
-    "`View::from_json`" for routes and Services, and a document over the bounds.
+    an optional `*.` prefix, more than 16 `hostnames` in a route, a route hostname that is not
+    `*` or a valid hostname, a Service with `routes`, an endpoint that the builder leaves out
+    (above), each refusal of §7.9 "`View::from_json`" for routes and Services, and a document
+    over the bounds.
 - **Gateway data plane** (`mimic-sidecar` in the gateway role with `MIMIC_CONTROLLER_URL`,
   #457). The gateway is a caller of the mesh with the Gateway in place of a Service.
   - **View.** The gateway long-polls `GET /v1/gateways/<MIMIC_GATEWAY_NAME>/view?format=1`
@@ -7553,10 +7566,12 @@ backends (each answers its own name and the request fields that it received).
 12. Without `MIMIC_CONTROLLER_URL` the gateway role stays the #456 skeleton.
 13. A route that names a mimic Gateway in a namespace that is not listed gets no status entry,
     as the Gateway itself gets none (#576).
-14. The gateway removes every `x-mimic-*` response field and writes only its own
+14. Q1 of the step specs: the routes count in the 4 MiB of the view before the Services, oldest
+    first. A route that does not fit goes into `skippedRoutes`.
+15. The gateway removes every `x-mimic-*` response field and writes only its own
     `x-mimic-error`.
-15. A parent that names a mimic Gateway that is not accepted gets `NoMatchingParent`.
-16. The gateway view leaves out unspecified, loopback, link-local and multicast endpoints.
+16. A parent that names a mimic Gateway that is not accepted gets `NoMatchingParent`.
+17. The gateway view leaves out unspecified, loopback, link-local and multicast endpoints.
 
 | ID | Criterion |
 |---|---|
@@ -7565,7 +7580,7 @@ backends (each answers its own name and the request fields that it received).
 | GW-42 | **U** (`gateway::attach` and `gateway::host`, hostnames). Effective hostnames for (listener, route): (none, none) gives `*`; (none, `[a.com]`) gives `a.com`; (`a.com`, none) gives `a.com`; (`*.example.com`, `[a.example.com]`) gives `a.example.com`; (`a.example.com`, `[*.example.com]`) gives `a.example.com`; (`*.example.com`, `[*.a.example.com]`) gives `*.a.example.com`; (`*.example.com`, `[a.example.com, b.org]`) gives `a.example.com` only. (`*.example.com`, `[example.com]`) and (`a.com`, `[b.com]`) give `NoMatchingListenerHostname`. `*.example.com` matches `a.example.com` and `a.b.example.com`. It does not match `example.com` or `aexample.com`. The request host of `API.Example.COM:8080` is `api.example.com`, of `api.example.com.` is `api.example.com`, and of `[::1]:80` is the IP literal `::1`. An empty authority and an authority that is `(invalid)` give no host. |
 | GW-43 | **U** (`gateway::table`, selection). On port 80 the listeners are `exact` (`api.example.com`), `wild` (`*.example.com`) and `any` (no hostname). Host `api.example.com` selects `exact`, `x.example.com` selects `wild`, `other.org` and `10.0.0.1` select `any`. If `exact` has no route for `/x`, a request to `api.example.com/x` gets no entry, also when a route of `any` matches `/x`. Inside one listener without hostname, a route with `hostnames: [shop.example.com]` and path `/` wins over a route with `[*.example.com]` and path `/cart`, for host `shop.example.com` and path `/cart`. For host `a.example.com` the second route wins. If the exact route has no match for the request, the wildcard route wins. Equal entries go to the oldest route. Property (`proptest`): the same view with routes and listeners in any order gives the same choice for any host and path. |
 | GW-44 | **U** (`gateway::view::build`). The input has a Gateway `shop/web` with two listeners on port 80 (`api.example.com` and none) and one on port 8080. It has three attached routes, one of them in `other` with `from: All`. The view is the golden JSON byte for byte. `services` holds only the backends and mirrors of the attached routes. A Service of `shop` that no route names is absent. A backend in `risk` without a ReferenceGrant is `{"invalid":true,"weight":<w>}` and `risk/*` is absent. With the grant, the Service is present. Endpoints `0.0.0.0`, `127.0.0.1`, `169.254.1.1`, `224.0.0.1`, `::`, `::1`, `fe80::1` and `ff02::1` are absent; `10.244.1.17` is present. `generations` holds the Gateway and each route. There is no `mode`, `cluster`, `mesh` or `admission`. Permuted inputs give the same bytes and `ETag`. |
-| GW-45 | **U** (`gateway::view`, bounds and `from_json`). With `Limits` of 1 Service passed to the controller's mesh views, the gateway view still holds 1024 Services. A 1025th Service is left out, and a route that names it is in `skippedRoutes` and in no listener. `GatewayView::from_json` reads every view of GW-44 back to the same bytes. It refuses: an unknown field at each level, `format` 2, port keys `0`, `65536` and `15100`, 65 listeners, the hostnames `API.example.com`, `a.*.com` and a 254-byte name, 17 `hostnames` in a route, a backend naming a Service that the view does not hold, and a document over 4 MiB. |
+| GW-45 | **U** (`gateway::view`, bounds and `from_json`). With `Limits` of 1 Service passed to the controller's mesh views, the gateway view still holds 1024 Services. A 1025th Service is left out, and a route that names it is in `skippedRoutes` and in no listener. Routes that are larger than 4 MiB together: the youngest routes that do not fit are in `skippedRoutes`, and the view is at most 4 MiB. A route that fits only without its Services is left out and is in `skippedRoutes`. `GatewayView::from_json` reads every view of GW-44 back to the same bytes. It refuses: an unknown field at each level, `format` 2, port keys `0`, `65536` and `15100`, 65 listeners, the hostnames `API.example.com`, `a.*.com` and a 254-byte name, 17 `hostnames` in a route, a backend naming a Service that the view does not hold, a route hostname that is not valid, a Service with `routes`, an endpoint `::ffff:127.0.0.1`, and a document over 4 MiB. The builder leaves out a listener with an invalid hostname, gives no match to a route with an invalid hostname or with 17 `hostnames`, and leaves out the endpoints `::ffff:127.0.0.1` and `::ffff:169.254.1.1`. |
 | GW-46 | **U** (`gateway::attach`, route status). A route has a Service parent and two Gateway parents. Its mimic entries are the §7.9 entry (`mimic.platform.io/mesh`) and two entries with `controllerName: mimic.platform.io/gateway-controller`, in `parentRefs` order. Each entry has its `parentRef` as written, `Accepted` and `ResolvedRefs` as GW-40 to GW-42 say, and `observedGeneration`. The entries of other controllers stay first and unchanged. `lastTransitionTime` follows RTE-14. A route with 33 parent entries in total gives no patch. |
 | GW-47 | **U** (`gateway::edge`). Each of these gives `400` `invalid-request`: `Content-Length` with `Transfer-Encoding: chunked`; `Transfer-Encoding: gzip, chunked`; `Transfer-Encoding: chunked` in HTTP/1.0; two `Host` fields; no `Host` in HTTP/1.1; `Host: exa mple`; the target `http://a.example.com/` with `Host: b.example.com`; HTTP/2 `host: b.example.com` with `:authority: a.example.com`; the paths `/a/../b`, `/a/./b`, `/..`, `/a/%2e%2E/b`, `/a/%2E/b`, `/a\b`, `/a%5cb` and `/a#b`. `Upgrade: websocket`, `Upgrade: h2c` and the method `CONNECT` give `501` `unsupported`. The paths `/a%2Fb`, `/a//b`, `/a/.b` and `/a/..b` pass unchanged. The field names `X-Mimic-Error`, `x-mimic-endpoint` and `Mimic-Load-Run` are stripped; `x-mimicry` and `mimic-load` are kept. |
 | GW-48 | **I** (controller, one watch). The controller runs with the gateway on, against the scripted API server of the gateway watch tests. Each replica opens exactly one `httproutes` list and watch during the run. A route change reaches the gateway view and `attachedRoutes` from that watch, within one publication. The reconciler gives the hub the accepted Gateways and their accepted listeners. A change of a Gateway's `status` alone publishes no snapshot. |
