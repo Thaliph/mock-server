@@ -1,0 +1,119 @@
+{
+ "kind": "patterns",
+ "mean_score_by_category": {
+  "flow-attack": {
+   "attack": 0.0,
+   "injection": 0.0,
+   "pii": 0.0,
+   "secret": 0.0
+  },
+  "flow-benign": {
+   "attack": 0.0,
+   "injection": 0.0,
+   "pii": 0.0,
+   "secret": 0.0
+  }
+ },
+ "per_question": {
+  "attack": {
+   "0.3": {
+    "fn": 10,
+    "fp": 0,
+    "precision": null,
+    "recall": 0.0,
+    "tp": 0
+   },
+   "0.5": {
+    "fn": 10,
+    "fp": 0,
+    "precision": null,
+    "recall": 0.0,
+    "tp": 0
+   },
+   "0.8": {
+    "fn": 10,
+    "fp": 0,
+    "precision": null,
+    "recall": 0.0,
+    "tp": 0
+   }
+  },
+  "injection": {
+   "0.3": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   },
+   "0.5": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   },
+   "0.8": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   }
+  },
+  "pii": {
+   "0.3": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   },
+   "0.5": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   },
+   "0.8": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   }
+  },
+  "secret": {
+   "0.3": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   },
+   "0.5": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   },
+   "0.8": {
+    "fn": 0,
+    "fp": 0,
+    "precision": null,
+    "recall": null,
+    "tp": 0
+   }
+  }
+ },
+ "questions": [
+  "attack",
+  "secret",
+  "pii",
+  "injection"
+ ],
+ "samples": 20,
+ "seconds": 0.0
+}

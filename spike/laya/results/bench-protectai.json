@@ -1,0 +1,95 @@
+{
+ "cold_start_ms": {
+  "first_answer": 92.475,
+  "model_load": 4077.718,
+  "process_to_first_answer": 4171.187
+ },
+ "cpus": [
+  0,
+  1
+ ],
+ "kind": "protectai",
+ "offered_load": {
+  "q1_1rps": {
+   "queue64_drop_ratio": 0.0,
+   "queue64_p50_ms": 231.13,
+   "queue64_p99_ms": 397.35,
+   "unbounded_p50_ms": 231.13,
+   "unbounded_p99_ms": 397.35
+  },
+  "q1_200rps": {
+   "queue64_drop_ratio": 0.941,
+   "queue64_p50_ms": 10682.534,
+   "queue64_p99_ms": 12530.516,
+   "unbounded_p50_ms": 194906.952,
+   "unbounded_p99_ms": 391717.33
+  },
+  "q1_50rps": {
+   "queue64_drop_ratio": 0.764,
+   "queue64_p50_ms": 9812.534,
+   "queue64_p99_ms": 12521.864,
+   "unbounded_p50_ms": 42781.067,
+   "unbounded_p99_ms": 88899.107
+  },
+  "q5_1rps": {
+   "queue64_drop_ratio": 0.0,
+   "queue64_p50_ms": 198.497,
+   "queue64_p99_ms": 266.181,
+   "unbounded_p50_ms": 198.497,
+   "unbounded_p99_ms": 266.181
+  },
+  "q5_200rps": {
+   "queue64_drop_ratio": 0.939,
+   "queue64_p50_ms": 10287.183,
+   "queue64_p99_ms": 11055.675,
+   "unbounded_p50_ms": 161940.606,
+   "unbounded_p99_ms": 323976.078
+  },
+  "q5_50rps": {
+   "queue64_drop_ratio": 0.754,
+   "queue64_p50_ms": 9390.821,
+   "queue64_p99_ms": 10941.888,
+   "unbounded_p50_ms": 36732.929,
+   "unbounded_p99_ms": 71211.705
+  }
+ },
+ "rss_after_load_kb": {
+  "VmHWM": 1473464,
+  "VmRSS": 1473464
+ },
+ "rss_end_kb": {
+  "VmHWM": 1540192,
+  "VmRSS": 1540192
+ },
+ "service": {
+  "q1_long": {
+   "max_rps_one_worker": 0.7,
+   "mean_ms": 1477.112,
+   "n": 10,
+   "p50_ms": 1475.767,
+   "p99_ms": 1554.254
+  },
+  "q1_short": {
+   "max_rps_one_worker": 4.9,
+   "mean_ms": 204.075,
+   "n": 40,
+   "p50_ms": 201.424,
+   "p99_ms": 510.062
+  },
+  "q5_long": {
+   "max_rps_one_worker": 0.7,
+   "mean_ms": 1457.652,
+   "n": 10,
+   "p50_ms": 1452.562,
+   "p99_ms": 1518.159
+  },
+  "q5_short": {
+   "max_rps_one_worker": 5.9,
+   "mean_ms": 169.31,
+   "n": 40,
+   "p50_ms": 193.188,
+   "p99_ms": 272.305
+  }
+ },
+ "threads": "2"
+}

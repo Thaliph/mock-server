@@ -1,0 +1,155 @@
+{
+ "kind": "patterns",
+ "mean_score_by_category": {
+  "injection": {
+   "attack": 0.0,
+   "injection": 0.7,
+   "pii": 0.0,
+   "secret": 0.0
+  },
+  "log4shell": {
+   "attack": 1.0,
+   "injection": 0.0,
+   "pii": 0.0,
+   "secret": 0.0
+  },
+  "normal": {
+   "attack": 0.0,
+   "injection": 0.0,
+   "pii": 0.0,
+   "secret": 0.0
+  },
+  "pii": {
+   "attack": 0.1,
+   "injection": 0.0,
+   "pii": 0.7,
+   "secret": 0.0
+  },
+  "secret": {
+   "attack": 0.0,
+   "injection": 0.0,
+   "pii": 0.1,
+   "secret": 1.0
+  },
+  "sqli": {
+   "attack": 1.0,
+   "injection": 0.0,
+   "pii": 0.0,
+   "secret": 0.0
+  },
+  "traversal": {
+   "attack": 1.0,
+   "injection": 0.0,
+   "pii": 0.0,
+   "secret": 0.0
+  },
+  "tricky": {
+   "attack": 0.1,
+   "injection": 0.2,
+   "pii": 0.0,
+   "secret": 0.0
+  }
+ },
+ "per_question": {
+  "attack": {
+   "0.3": {
+    "fn": 0,
+    "fp": 2,
+    "precision": 0.94,
+    "recall": 1.0,
+    "tp": 30
+   },
+   "0.5": {
+    "fn": 0,
+    "fp": 2,
+    "precision": 0.94,
+    "recall": 1.0,
+    "tp": 30
+   },
+   "0.8": {
+    "fn": 0,
+    "fp": 2,
+    "precision": 0.94,
+    "recall": 1.0,
+    "tp": 30
+   }
+  },
+  "injection": {
+   "0.3": {
+    "fn": 3,
+    "fp": 2,
+    "precision": 0.78,
+    "recall": 0.7,
+    "tp": 7
+   },
+   "0.5": {
+    "fn": 3,
+    "fp": 2,
+    "precision": 0.78,
+    "recall": 0.7,
+    "tp": 7
+   },
+   "0.8": {
+    "fn": 3,
+    "fp": 2,
+    "precision": 0.78,
+    "recall": 0.7,
+    "tp": 7
+   }
+  },
+  "pii": {
+   "0.3": {
+    "fn": 3,
+    "fp": 1,
+    "precision": 0.88,
+    "recall": 0.7,
+    "tp": 7
+   },
+   "0.5": {
+    "fn": 3,
+    "fp": 1,
+    "precision": 0.88,
+    "recall": 0.7,
+    "tp": 7
+   },
+   "0.8": {
+    "fn": 3,
+    "fp": 1,
+    "precision": 0.88,
+    "recall": 0.7,
+    "tp": 7
+   }
+  },
+  "secret": {
+   "0.3": {
+    "fn": 0,
+    "fp": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "tp": 10
+   },
+   "0.5": {
+    "fn": 0,
+    "fp": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "tp": 10
+   },
+   "0.8": {
+    "fn": 0,
+    "fp": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "tp": 10
+   }
+  }
+ },
+ "questions": [
+  "attack",
+  "secret",
+  "pii",
+  "injection"
+ ],
+ "samples": 85,
+ "seconds": 0.0
+}

@@ -1,0 +1,20 @@
+{"cat": "flow-benign", "id": "redis-get", "labels": [], "scores": {"attack": 0.0225, "flow": 0.0169}}
+{"cat": "flow-benign", "id": "redis-hset", "labels": [], "scores": {"attack": 0.9806, "flow": 0.9564}}
+{"cat": "flow-attack", "id": "redis-config", "labels": ["attack", "flow"], "scores": {"attack": 0.0207, "flow": 0.0181}}
+{"cat": "flow-attack", "id": "redis-slaveof", "labels": ["attack", "flow"], "scores": {"attack": 0.98, "flow": 0.0208}}
+{"cat": "flow-attack", "id": "redis-eval", "labels": ["attack", "flow"], "scores": {"attack": 0.9834, "flow": 0.981}}
+{"cat": "flow-benign", "id": "pg-startup", "labels": [], "scores": {"attack": 0.0129, "flow": 0.0126}}
+{"cat": "flow-attack", "id": "pg-copy-prog", "labels": ["attack", "flow"], "scores": {"attack": 0.9802, "flow": 0.982}}
+{"cat": "flow-benign", "id": "tls-hello", "labels": [], "scores": {"attack": 0.9684, "flow": 0.9768}}
+{"cat": "flow-attack", "id": "tls-hello-odd", "labels": ["attack", "flow"], "scores": {"attack": 0.9797, "flow": 0.9828}}
+{"cat": "flow-benign", "id": "ssh-banner", "labels": [], "scores": {"attack": 0.0155, "flow": 0.0179}}
+{"cat": "flow-attack", "id": "revshell", "labels": ["attack", "flow"], "scores": {"attack": 0.9799, "flow": 0.9839}}
+{"cat": "flow-benign", "id": "smtp", "labels": [], "scores": {"attack": 0.9771, "flow": 0.9733}}
+{"cat": "flow-benign", "id": "dns-a", "labels": [], "scores": {"attack": 0.0122, "flow": 0.0129}}
+{"cat": "flow-benign", "id": "dns-aaaa", "labels": [], "scores": {"attack": 0.0136, "flow": 0.0136}}
+{"cat": "flow-attack", "id": "dns-tunnel", "labels": ["attack", "flow"], "scores": {"attack": 0.017, "flow": 0.0207}}
+{"cat": "flow-attack", "id": "dns-tunnel2", "labels": ["attack", "flow"], "scores": {"attack": 0.019, "flow": 0.0188}}
+{"cat": "flow-benign", "id": "ntp", "labels": [], "scores": {"attack": 0.0117, "flow": 0.013}}
+{"cat": "flow-attack", "id": "memcached-amp", "labels": ["attack", "flow"], "scores": {"attack": 0.012, "flow": 0.0122}}
+{"cat": "flow-benign", "id": "http-plain", "labels": [], "scores": {"attack": 0.0166, "flow": 0.0151}}
+{"cat": "flow-attack", "id": "smb-scan", "labels": ["attack", "flow"], "scores": {"attack": 0.9627, "flow": 0.9778}}

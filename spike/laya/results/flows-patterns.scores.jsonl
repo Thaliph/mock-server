@@ -1,0 +1,20 @@
+{"cat": "flow-benign", "id": "redis-get", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "redis-hset", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "redis-config", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "redis-slaveof", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "redis-eval", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "pg-startup", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "pg-copy-prog", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "tls-hello", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "tls-hello-odd", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "ssh-banner", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "revshell", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "smtp", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "dns-a", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "dns-aaaa", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "dns-tunnel", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "dns-tunnel2", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "ntp", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "memcached-amp", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-benign", "id": "http-plain", "labels": [], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}
+{"cat": "flow-attack", "id": "smb-scan", "labels": ["attack", "flow"], "scores": {"attack": 0.0, "injection": 0.0, "pii": 0.0, "secret": 0.0}}

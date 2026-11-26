@@ -1,0 +1,67 @@
+{
+ "kind": "laya-onnx",
+ "mean_score_by_category": {
+  "flow-attack": {
+   "attack": 0.59,
+   "flow": 0.5
+  },
+  "flow-benign": {
+   "attack": 0.3,
+   "flow": 0.3
+  }
+ },
+ "per_question": {
+  "attack": {
+   "0.3": {
+    "fn": 4,
+    "fp": 3,
+    "precision": 0.67,
+    "recall": 0.6,
+    "tp": 6
+   },
+   "0.5": {
+    "fn": 4,
+    "fp": 3,
+    "precision": 0.67,
+    "recall": 0.6,
+    "tp": 6
+   },
+   "0.8": {
+    "fn": 4,
+    "fp": 3,
+    "precision": 0.67,
+    "recall": 0.6,
+    "tp": 6
+   }
+  },
+  "flow": {
+   "0.3": {
+    "fn": 5,
+    "fp": 3,
+    "precision": 0.62,
+    "recall": 0.5,
+    "tp": 5
+   },
+   "0.5": {
+    "fn": 5,
+    "fp": 3,
+    "precision": 0.62,
+    "recall": 0.5,
+    "tp": 5
+   },
+   "0.8": {
+    "fn": 5,
+    "fp": 3,
+    "precision": 0.62,
+    "recall": 0.5,
+    "tp": 5
+   }
+  }
+ },
+ "questions": [
+  "flow",
+  "attack"
+ ],
+ "samples": 20,
+ "seconds": 48.3
+}

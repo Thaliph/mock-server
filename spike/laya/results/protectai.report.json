@@ -1,0 +1,173 @@
+{
+ "kind": "protectai",
+ "mean_score_by_category": {
+  "injection": {
+   "attack": 0.92,
+   "flow": 0.92,
+   "harmful": 0.92,
+   "injection": 0.92,
+   "pii": 0.92,
+   "secret": 0.92
+  },
+  "log4shell": {
+   "attack": 0.21,
+   "flow": 0.21,
+   "harmful": 0.21,
+   "injection": 0.21,
+   "pii": 0.21,
+   "secret": 0.21
+  },
+  "normal": {
+   "attack": 0.01,
+   "flow": 0.01,
+   "harmful": 0.01,
+   "injection": 0.01,
+   "pii": 0.01,
+   "secret": 0.01
+  },
+  "pii": {
+   "attack": 0.08,
+   "flow": 0.08,
+   "harmful": 0.08,
+   "injection": 0.08,
+   "pii": 0.08,
+   "secret": 0.08
+  },
+  "secret": {
+   "attack": 0.35,
+   "flow": 0.35,
+   "harmful": 0.35,
+   "injection": 0.35,
+   "pii": 0.35,
+   "secret": 0.35
+  },
+  "sqli": {
+   "attack": 0.03,
+   "flow": 0.03,
+   "harmful": 0.03,
+   "injection": 0.03,
+   "pii": 0.03,
+   "secret": 0.03
+  },
+  "traversal": {
+   "attack": 0.01,
+   "flow": 0.01,
+   "harmful": 0.01,
+   "injection": 0.01,
+   "pii": 0.01,
+   "secret": 0.01
+  },
+  "tricky": {
+   "attack": 0.21,
+   "flow": 0.21,
+   "harmful": 0.21,
+   "injection": 0.21,
+   "pii": 0.21,
+   "secret": 0.21
+  }
+ },
+ "per_question": {
+  "attack": {
+   "0.3": {
+    "fn": 27,
+    "fp": 15,
+    "precision": 0.17,
+    "recall": 0.1,
+    "tp": 3
+   },
+   "0.5": {
+    "fn": 28,
+    "fp": 14,
+    "precision": 0.12,
+    "recall": 0.07,
+    "tp": 2
+   },
+   "0.8": {
+    "fn": 29,
+    "fp": 14,
+    "precision": 0.07,
+    "recall": 0.03,
+    "tp": 1
+   }
+  },
+  "injection": {
+   "0.3": {
+    "fn": 1,
+    "fp": 9,
+    "precision": 0.5,
+    "recall": 0.9,
+    "tp": 9
+   },
+   "0.5": {
+    "fn": 1,
+    "fp": 7,
+    "precision": 0.56,
+    "recall": 0.9,
+    "tp": 9
+   },
+   "0.8": {
+    "fn": 1,
+    "fp": 6,
+    "precision": 0.6,
+    "recall": 0.9,
+    "tp": 9
+   }
+  },
+  "pii": {
+   "0.3": {
+    "fn": 9,
+    "fp": 17,
+    "precision": 0.06,
+    "recall": 0.1,
+    "tp": 1
+   },
+   "0.5": {
+    "fn": 10,
+    "fp": 16,
+    "precision": 0.0,
+    "recall": 0.0,
+    "tp": 0
+   },
+   "0.8": {
+    "fn": 10,
+    "fp": 15,
+    "precision": 0.0,
+    "recall": 0.0,
+    "tp": 0
+   }
+  },
+  "secret": {
+   "0.3": {
+    "fn": 7,
+    "fp": 15,
+    "precision": 0.17,
+    "recall": 0.3,
+    "tp": 3
+   },
+   "0.5": {
+    "fn": 7,
+    "fp": 13,
+    "precision": 0.19,
+    "recall": 0.3,
+    "tp": 3
+   },
+   "0.8": {
+    "fn": 7,
+    "fp": 12,
+    "precision": 0.2,
+    "recall": 0.3,
+    "tp": 3
+   }
+  }
+ },
+ "questions": [
+  "attack",
+  "secret",
+  "pii",
+  "injection",
+  "harmful",
+  "flow"
+ ],
+ "samples": 85,
+ "seconds": 13.5
+}

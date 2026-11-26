@@ -1,0 +1,20 @@
+{"cat": "flow-benign", "id": "redis-get", "labels": [], "scores": {"attack": 0.7885, "flow": 0.69}}
+{"cat": "flow-benign", "id": "redis-hset", "labels": [], "scores": {"attack": 1.0, "flow": 0.9315}}
+{"cat": "flow-attack", "id": "redis-config", "labels": ["attack", "flow"], "scores": {"attack": 0.4648, "flow": 0.0326}}
+{"cat": "flow-attack", "id": "redis-slaveof", "labels": ["attack", "flow"], "scores": {"attack": 0.9507, "flow": 0.6786}}
+{"cat": "flow-attack", "id": "redis-eval", "labels": ["attack", "flow"], "scores": {"attack": 0.8522, "flow": 0.7404}}
+{"cat": "flow-benign", "id": "pg-startup", "labels": [], "scores": {"attack": 0.2856, "flow": 0.277}}
+{"cat": "flow-attack", "id": "pg-copy-prog", "labels": ["attack", "flow"], "scores": {"attack": 0.8974, "flow": 0.8891}}
+{"cat": "flow-benign", "id": "tls-hello", "labels": [], "scores": {"attack": 1.0, "flow": 1.0}}
+{"cat": "flow-attack", "id": "tls-hello-odd", "labels": ["attack", "flow"], "scores": {"attack": 1.0, "flow": 1.0}}
+{"cat": "flow-benign", "id": "ssh-banner", "labels": [], "scores": {"attack": 0.4795, "flow": 0.7262}}
+{"cat": "flow-attack", "id": "revshell", "labels": ["attack", "flow"], "scores": {"attack": 0.9495, "flow": 0.7839}}
+{"cat": "flow-benign", "id": "smtp", "labels": [], "scores": {"attack": 0.8879, "flow": 0.7735}}
+{"cat": "flow-benign", "id": "dns-a", "labels": [], "scores": {"attack": 0.112, "flow": 0.0659}}
+{"cat": "flow-benign", "id": "dns-aaaa", "labels": [], "scores": {"attack": 0.826, "flow": 0.2606}}
+{"cat": "flow-attack", "id": "dns-tunnel", "labels": ["attack", "flow"], "scores": {"attack": 1.0, "flow": 0.9135}}
+{"cat": "flow-attack", "id": "dns-tunnel2", "labels": ["attack", "flow"], "scores": {"attack": 0.9451, "flow": 0.7795}}
+{"cat": "flow-benign", "id": "ntp", "labels": [], "scores": {"attack": 0.3503, "flow": 0.4137}}
+{"cat": "flow-attack", "id": "memcached-amp", "labels": ["attack", "flow"], "scores": {"attack": 0.1952, "flow": 0.0843}}
+{"cat": "flow-benign", "id": "http-plain", "labels": [], "scores": {"attack": 0.1859, "flow": 0.1753}}
+{"cat": "flow-attack", "id": "smb-scan", "labels": ["attack", "flow"], "scores": {"attack": 0.3157, "flow": 0.7386}}

@@ -1,0 +1,95 @@
+{
+ "cold_start_ms": {
+  "first_answer": 3852.187,
+  "model_load": 11422.794,
+  "process_to_first_answer": 15275.742
+ },
+ "cpus": [
+  0,
+  1
+ ],
+ "kind": "laya-onnx",
+ "offered_load": {
+  "q1_1rps": {
+   "queue64_drop_ratio": 0.0,
+   "queue64_p50_ms": 12611.27,
+   "queue64_p99_ms": 22323.392,
+   "unbounded_p50_ms": 12611.27,
+   "unbounded_p99_ms": 22323.392
+  },
+  "q1_200rps": {
+   "queue64_drop_ratio": 0.967,
+   "queue64_p50_ms": 130322.406,
+   "queue64_p99_ms": 241105.596,
+   "unbounded_p50_ms": 3727768.381,
+   "unbounded_p99_ms": 7372072.154
+  },
+  "q1_50rps": {
+   "queue64_drop_ratio": 0.866,
+   "queue64_p50_ms": 129827.406,
+   "queue64_p99_ms": 240616.455,
+   "unbounded_p50_ms": 946367.686,
+   "unbounded_p99_ms": 1843647.953
+  },
+  "q5_1rps": {
+   "queue64_drop_ratio": 0.0,
+   "queue64_p50_ms": 18816.721,
+   "queue64_p99_ms": 39679.858,
+   "unbounded_p50_ms": 18816.721,
+   "unbounded_p99_ms": 39679.858
+  },
+  "q5_200rps": {
+   "queue64_drop_ratio": 0.967,
+   "queue64_p50_ms": 180039.297,
+   "queue64_p99_ms": 356190.701,
+   "unbounded_p50_ms": 5521670.557,
+   "unbounded_p99_ms": 10953172.806
+  },
+  "q5_50rps": {
+   "queue64_drop_ratio": 0.866,
+   "queue64_p50_ms": 179544.297,
+   "queue64_p99_ms": 356190.701,
+   "unbounded_p50_ms": 1392877.089,
+   "unbounded_p99_ms": 2716688.351
+  }
+ },
+ "rss_after_load_kb": {
+  "VmHWM": 1829296,
+  "VmRSS": 1825928
+ },
+ "rss_end_kb": {
+  "VmHWM": 4813276,
+  "VmRSS": 4813276
+ },
+ "service": {
+  "q1_long": {
+   "max_rps_one_worker": 0.1,
+   "mean_ms": 19674.161,
+   "n": 3,
+   "p50_ms": 14900.654,
+   "p99_ms": 32078.68
+  },
+  "q1_short": {
+   "max_rps_one_worker": 0.3,
+   "mean_ms": 3711.832,
+   "n": 10,
+   "p50_ms": 3250.886,
+   "p99_ms": 6180.096
+  },
+  "q5_long": {
+   "max_rps_one_worker": 0.0,
+   "mean_ms": 55804.636,
+   "n": 3,
+   "p50_ms": 55445.719,
+   "p99_ms": 56746.089
+  },
+  "q5_short": {
+   "max_rps_one_worker": 0.2,
+   "mean_ms": 5466.364,
+   "n": 10,
+   "p50_ms": 4841.043,
+   "p99_ms": 8608.711
+  }
+ },
+ "threads": "2"
+}
